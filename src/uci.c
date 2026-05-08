@@ -137,7 +137,7 @@ static SearchLimits g_limits;  /* allocated once, avoids stack VLA */
 static void handle_go(Board *b, const char *line) {
     memset(&g_limits, 0, sizeof(g_limits));
 
-    g_limits.depth = 3; // baby mode
+    g_limits.depth = 32; // default search limit to prevent overcomputation
 
     const char *p = line;
     while (*p) {

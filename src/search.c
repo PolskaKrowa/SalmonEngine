@@ -21,19 +21,6 @@
  *  • quiesce() — quiescence search, SEE pruning of losing caps
  *  • SEE (static exchange evaluation)
  *  • Time management: check every 2048 nodes; stop when budget exceeded
- *
- * ── Required additions to search.h / SearchInfo struct ──────────────────
- *
- *   In your SearchInfo struct, add these three fields:
- *
- *       int   eval_stack[MAX_PLY];    // cached static eval at each ply
- *       Move  countermove[64][64];    // countermove[from][to] refutation table
- *       Move  move_stack[MAX_PLY];    // the move played to reach ply N
- *
- *   In search.h, also declare:
- *       int see(const Board *b, Move m);
- *
- * ────────────────────────────────────────────────────────────────────────
  */
 
 #include "search.h"

@@ -27,11 +27,8 @@ src/
 ## Building
 
 ```bash
-cd src
-gcc -O3 -o salmon *.c -lm
+make -j$(nproc)
 ```
-
-Or use the provided Makefile if available.
 
 ## Usage
 

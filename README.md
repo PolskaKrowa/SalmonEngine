@@ -1,6 +1,6 @@
 # SalmonEngine
 
-A traditional chess engine built in C, designed to be **understandable, transparent, and easy to learn from**. No neural networks, no black boxes—just pure chess logic you can understand and modify.
+A traditional chess engine built in C, designed to be **understandable, transparent, and easy to learn from**. No neural networks, no black boxes, no "Johan rubenszchoffenbach XVII king heuristic" bullsh\*\*tery. Just pure chess logic you can understand and modify.
 
 ## Features
 

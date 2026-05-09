@@ -1,5 +1,5 @@
 /*
- * eval.c — Static evaluation
+ * eval.c — Static evaluation (improved)
  *
  * Scoring convention: always from the perspective of the side to move
  * (positive = good for side to move).
@@ -8,10 +8,20 @@
  *   • Material balance
  *   • Piece-square tables — separate MG and EG tables, blended by game phase
  *   • Mobility (approximate: popcount of attack set minus own pieces)
- *   • Pawn structure: doubled-pawn penalty, isolated-pawn penalty, passed-pawn bonus
- *   • Basic king safety: pawn shield bonus, open-file penalty near king
+ *   • Pawn structure:
+ *       – Doubled-pawn penalty
+ *       – Isolated-pawn penalty
+ *       – Backward-pawn penalty
+ *       – Passed-pawn bonus
+ *   • Outpost squares for knights and bishops
+ *   • King safety:
+ *       – Pawn shield bonus
+ *       – Open-file penalty near king
+ *       – Weighted enemy-piece attack count
  *   • Bishop pair bonus
  *   • Rook on open / semi-open file bonus
+ *   • Rook on seventh rank bonus
+ *   • Tempo bonus (side to move)
  */
 
 #include "eval.h"
@@ -130,7 +140,7 @@ static const int PST_QUEEN_MG[64] = {
       -9, -26,  -9, -10,  -2,  -4,   3,  -3,
      -14,   2, -11,  -2,  -5,   2,  14,   5,
      -35,  -8,  11,   2,   8,  15,  -3,   1,
-      -1, -18,  -9,  10, -15, -25, -31, -50,
+       -1, -18,  -9,  10, -15, -25, -31, -50,
 };
 static const int PST_QUEEN_EG[64] = {
       -9,  22,  22,  27,  27,  19,  10,  20,
@@ -202,16 +212,20 @@ static inline int taper(int mg, int eg, int phase) {
 }
 
 /* ──────────────────────────────────────────────
- *  Pawn structure helpers
+ *  Pawn structure constants
  * ────────────────────────────────────────────── */
-static const int DOUBLED_PAWN_PENALTY_MG = -11;
-static const int DOUBLED_PAWN_PENALTY_EG = -56;
+static const int DOUBLED_PAWN_PENALTY_MG  = -11;
+static const int DOUBLED_PAWN_PENALTY_EG  = -56;
 static const int ISOLATED_PAWN_PENALTY_MG = -15;
 static const int ISOLATED_PAWN_PENALTY_EG = -15;
-static const int PASSED_PAWN_BONUS_MG[8] = { 0,  5, 10, 20, 35, 60, 90,  0 };
-static const int PASSED_PAWN_BONUS_EG[8] = { 0, 10, 20, 40, 65, 95,140,  0 };
+static const int BACKWARD_PAWN_PENALTY_MG =  -9;  /* [NEW] */
+static const int BACKWARD_PAWN_PENALTY_EG = -22;  /* [NEW] */
+static const int PASSED_PAWN_BONUS_MG[8]  = { 0,  5, 10, 20, 35, 60, 90,  0 };
+static const int PASSED_PAWN_BONUS_EG[8]  = { 0, 10, 20, 40, 65, 95,140,  0 };
 
-/* Evaluate pawn structure for one side */
+/* ──────────────────────────────────────────────
+ *  Pawn structure evaluation (one side)
+ * ────────────────────────────────────────────── */
 static void eval_pawns(const Board *b, Color us, int *mg, int *eg) {
     Color them = us ^ 1;
     Bitboard our_pawns   = b->pieces[us][PAWN];
@@ -219,39 +233,82 @@ static void eval_pawns(const Board *b, Color us, int *mg, int *eg) {
     Bitboard pawns_copy  = our_pawns;
 
     while (pawns_copy) {
-        int sq = bb_pop(&pawns_copy);
+        int sq   = bb_pop(&pawns_copy);
         int file = sq & 7;
         int rank = sq >> 3;
 
-        /* Doubled: more than one pawn on this file */
+        /* Adjacent file masks */
+        Bitboard adj_files = 0;
+        if (file > 0) adj_files |= FILE_BB[file - 1];
+        if (file < 7) adj_files |= FILE_BB[file + 1];
+
+        /* ── Doubled pawn ── */
         if (bb_popcount(our_pawns & FILE_BB[file]) > 1) {
             *mg += DOUBLED_PAWN_PENALTY_MG;
             *eg += DOUBLED_PAWN_PENALTY_EG;
         }
 
-        /* Isolated: no friendly pawns on adjacent files */
-        Bitboard adj_files = 0;
-        if (file > 0) adj_files |= FILE_BB[file - 1];
-        if (file < 7) adj_files |= FILE_BB[file + 1];
-        if (!(our_pawns & adj_files)) {
+        /* ── Isolated pawn ── */
+        bool is_isolated = !(our_pawns & adj_files);
+        if (is_isolated) {
             *mg += ISOLATED_PAWN_PENALTY_MG;
             *eg += ISOLATED_PAWN_PENALTY_EG;
         }
 
-        /* Passed: no enemy pawns ahead on same or adjacent files */
+        /* ── Passed pawn ──
+         * No enemy pawns on same or adjacent files ahead of this pawn.        */
         Bitboard ahead_mask = 0;
         if (us == WHITE) {
-            for (int r = rank + 1; r < 8; r++)
-                ahead_mask |= RANK_BB[r];
+            for (int r = rank + 1; r < 8; r++) ahead_mask |= RANK_BB[r];
         } else {
-            for (int r = 0; r < rank; r++)
-                ahead_mask |= RANK_BB[r];
+            for (int r = 0; r < rank; r++)      ahead_mask |= RANK_BB[r];
         }
-        Bitboard enemy_span = (their_pawns & (FILE_BB[file] | adj_files)) & ahead_mask;
-        if (!enemy_span) {
+        Bitboard enemy_span = (their_pawns & (FILE_BB[file] | adj_files))
+                              & ahead_mask;
+        bool is_passed = !enemy_span;
+        if (is_passed) {
             int bonus_rank = (us == WHITE) ? rank : (7 - rank);
             *mg += PASSED_PAWN_BONUS_MG[bonus_rank];
             *eg += PASSED_PAWN_BONUS_EG[bonus_rank];
+        }
+
+        /*
+         * ── Backward pawn [NEW] ──
+         *
+         * A pawn is backward when:
+         *   1. Its stop square (one step forward) is controlled by an enemy
+         *      pawn — it cannot safely advance.
+         *   2. It has no friendly pawn support from behind on adjacent files
+         *      (so it cannot be "pushed" by a lever).
+         *   3. It is not already passed.
+         *
+         * We detect enemy pawn control of the stop square by checking
+         * PAWN_ATTACKS[us][stop_sq] & their_pawns:
+         *   For us=WHITE, stop_sq = sq+8, PAWN_ATTACKS[WHITE][stop_sq] gives
+         *   the squares diagonally ahead of stop_sq — exactly where a BLACK
+         *   pawn would need to be to attack stop_sq from behind (its forward).
+         *   The same formula works symmetrically for BLACK.
+         */
+        if (!is_passed) {
+            int stop = (us == WHITE) ? sq + 8 : sq - 8;
+            if (stop >= 0 && stop < 64) {
+                bool stop_attacked = (PAWN_ATTACKS[us][stop] & their_pawns) != 0;
+
+                if (stop_attacked) {
+                    /* Squares on adjacent files BEHIND this pawn */
+                    Bitboard below_sq   = SQUARE_BB[sq] - 1; /* bits 0..sq-1 */
+                    Bitboard above_sq   = ~SQUARE_BB[sq] & ~below_sq; /* bits sq+1..63 */
+                    Bitboard behind_span = ((us == WHITE) ? below_sq : above_sq)
+                                          & adj_files
+                                          & ~RANK_BB[rank];
+
+                    bool has_support = (our_pawns & behind_span) != 0;
+                    if (!has_support) {
+                        *mg += BACKWARD_PAWN_PENALTY_MG;
+                        *eg += BACKWARD_PAWN_PENALTY_EG;
+                    }
+                }
+            }
         }
     }
 }
@@ -263,8 +320,8 @@ static const int MOBILITY_MG[6] = {  0,  4,  3,  2,  1, 0 };
 static const int MOBILITY_EG[6] = {  0,  4,  3,  3,  2, 0 };
 
 static void eval_mobility(const Board *b, Color us, int *mg, int *eg) {
-    Bitboard occ     = b->occ[2];
-    Bitboard not_us  = ~b->occ[us];
+    Bitboard occ    = b->occ[2];
+    Bitboard not_us = ~b->occ[us];
 
     for (int pt = KNIGHT; pt <= QUEEN; pt++) {
         Bitboard pieces = b->pieces[us][pt];
@@ -286,25 +343,33 @@ static void eval_mobility(const Board *b, Color us, int *mg, int *eg) {
 }
 
 /* ──────────────────────────────────────────────
- *  Rook open / semi-open file bonus
+ *  Rook evaluation: open/semi-open files + 7th rank [IMPROVED]
  * ────────────────────────────────────────────── */
-static const int ROOK_OPEN_FILE_MG   =  23;
-static const int ROOK_OPEN_FILE_EG   =  15;
-static const int ROOK_SEMIOPEN_MG    =  12;
-static const int ROOK_SEMIOPEN_EG    =   7;
+static const int ROOK_OPEN_FILE_MG    =  23;
+static const int ROOK_OPEN_FILE_EG    =  15;
+static const int ROOK_SEMIOPEN_MG     =  12;
+static const int ROOK_SEMIOPEN_EG     =   7;
+static const int ROOK_ON_SEVENTH_MG   =  20;   /* [NEW] */
+static const int ROOK_ON_SEVENTH_EG   =  32;   /* [NEW] */
 
 static void eval_rooks(const Board *b, Color us, int *mg, int *eg) {
-    Bitboard our_pawns   = b->pieces[us][PAWN];
-    Bitboard their_pawns = b->pieces[us ^ 1][PAWN];
-    Bitboard rooks       = b->pieces[us][ROOK];
+    Color them           = us ^ 1;
+    Bitboard our_pawns   = b->pieces[us  ][PAWN];
+    Bitboard their_pawns = b->pieces[them][PAWN];
+    Bitboard rooks       = b->pieces[us  ][ROOK];
+
+    /* Rank index for the "7th rank" (relative to the side being evaluated) */
+    int rank7 = (us == WHITE) ? 6 : 1;   /* rank index 0-based */
+    int rank8 = (us == WHITE) ? 7 : 0;   /* enemy back rank     */
 
     while (rooks) {
         int sq   = bb_pop(&rooks);
         int file = sq & 7;
+        int rank = sq >> 3;
         Bitboard file_bb = FILE_BB[file];
 
-        bool no_own_pawn    = !(our_pawns   & file_bb);
-        bool no_enemy_pawn  = !(their_pawns & file_bb);
+        bool no_own_pawn   = !(our_pawns   & file_bb);
+        bool no_enemy_pawn = !(their_pawns & file_bb);
 
         if (no_own_pawn && no_enemy_pawn) {
             *mg += ROOK_OPEN_FILE_MG;
@@ -312,6 +377,22 @@ static void eval_rooks(const Board *b, Color us, int *mg, int *eg) {
         } else if (no_own_pawn) {
             *mg += ROOK_SEMIOPEN_MG;
             *eg += ROOK_SEMIOPEN_EG;
+        }
+
+        /*
+         * Rook on the 7th rank [NEW]:
+         * Valuable when the enemy king is on the 8th rank or there are
+         * enemy pawns on the 7th rank to harass.
+         */
+        if (rank == rank7) {
+            int enemy_king_sq = bb_lsb(b->pieces[them][KING]);
+            bool enemy_king_on_8th = ((enemy_king_sq >> 3) == rank8);
+            bool pawns_on_7th      = (their_pawns & RANK_BB[rank7]) != 0;
+
+            if (enemy_king_on_8th || pawns_on_7th) {
+                *mg += ROOK_ON_SEVENTH_MG;
+                *eg += ROOK_ON_SEVENTH_EG;
+            }
         }
     }
 }
@@ -323,19 +404,120 @@ static const int BISHOP_PAIR_MG = 30;
 static const int BISHOP_PAIR_EG = 60;
 
 /* ──────────────────────────────────────────────
- *  King safety (pawn shield + open files)
+ *  Outpost evaluation [NEW]
+ *
+ *  An outpost square is:
+ *    • On ranks 4–6 from the piece's own perspective (rank 3–5 from index 0)
+ *    • Supported by a friendly pawn (pawn attacks that square)
+ *    • Cannot be attacked by an enemy pawn (no enemy pawn on adjacent files
+ *      with a rank that could advance and attack it)
+ *
+ *  Knights and bishops on outposts receive bonuses.
  * ────────────────────────────────────────────── */
-static const int KING_SHIELD_BONUS    =  7;
-static const int KING_OPEN_FILE_PENALTY = -25;
+static const int OUTPOST_KNIGHT_MG = 22;
+static const int OUTPOST_KNIGHT_EG = 14;
+static const int OUTPOST_BISHOP_MG = 12;
+static const int OUTPOST_BISHOP_EG =  8;
+
+static void eval_outposts(const Board *b, Color us, int *mg, int *eg) {
+    Color them        = us ^ 1;
+    Bitboard our_pawns   = b->pieces[us  ][PAWN];
+    Bitboard their_pawns = b->pieces[them][PAWN];
+
+    /*
+     * Build "outpost mask": squares on ranks 4–6 (relative) that are
+     *   - Supported by at least one friendly pawn
+     *   - Not attackable by any enemy pawn now or in the future
+     *     (no enemy pawn on adjacent files with a rank that could advance).
+     *
+     * "Pawn attack span" of the enemy: all squares an enemy pawn can
+     * eventually attack, going forward.  A simplified version: for each
+     * enemy pawn, the files ±1 ahead of it are forever controlled.
+     *
+     * We approximate this with the forward-fill of enemy pawn attacks.
+     */
+
+    /* Enemy pawn attack spans: squares on adjacent files, at ranks
+       in front of each enemy pawn (towards our side).             */
+    Bitboard enemy_pawn_attack_span = 0;
+    {
+        Bitboard ep = their_pawns;
+        while (ep) {
+            int sq   = bb_pop(&ep);
+            int file = sq & 7;
+            int rank = sq >> 3;
+            Bitboard adj = 0;
+            if (file > 0) adj |= FILE_BB[file - 1];
+            if (file < 7) adj |= FILE_BB[file + 1];
+
+            /* Ranks between the enemy pawn and our back rank */
+            if (them == BLACK) { /* them=BLACK means their pawns go down; our back rank is rank 0 */
+                for (int r = rank - 1; r >= 0; r--) enemy_pawn_attack_span |= RANK_BB[r] & adj;
+            } else {
+                for (int r = rank + 1; r < 8; r++) enemy_pawn_attack_span |= RANK_BB[r] & adj;
+            }
+        }
+    }
+
+    /* Outpost ranks: ranks 4–6 from our perspective (0-indexed) */
+    int r_min = (us == WHITE) ? 3 : 2;  /* 0-based rank 4 for WHITE, rank 3 for BLACK */
+    int r_max = (us == WHITE) ? 5 : 4;  /* 0-based rank 6 for WHITE, rank 5 for BLACK */
+    Bitboard outpost_rank_mask = 0;
+    for (int r = r_min; r <= r_max; r++) outpost_rank_mask |= RANK_BB[r];
+
+    /* Evaluate knights on outposts */
+    Bitboard knights = b->pieces[us][KNIGHT];
+    while (knights) {
+        int sq = bb_pop(&knights);
+        if (!((SQUARE_BB[sq]) & outpost_rank_mask)) continue;
+        if (enemy_pawn_attack_span & SQUARE_BB[sq])  continue; /* can be chased */
+        /* Must be supported by a friendly pawn */
+        if (!(PAWN_ATTACKS[them][sq] & our_pawns))   continue; /* not supported */
+
+        *mg += OUTPOST_KNIGHT_MG;
+        *eg += OUTPOST_KNIGHT_EG;
+    }
+
+    /* Evaluate bishops on outposts (less valuable — bishops can be longer-range) */
+    Bitboard bishops = b->pieces[us][BISHOP];
+    while (bishops) {
+        int sq = bb_pop(&bishops);
+        if (!((SQUARE_BB[sq]) & outpost_rank_mask)) continue;
+        if (enemy_pawn_attack_span & SQUARE_BB[sq])  continue;
+        if (!(PAWN_ATTACKS[them][sq] & our_pawns))   continue;
+
+        *mg += OUTPOST_BISHOP_MG;
+        *eg += OUTPOST_BISHOP_EG;
+    }
+}
+
+/* ──────────────────────────────────────────────
+ *  King safety [IMPROVED]
+ *
+ *  Combines:
+ *    1. Pawn shield: pawns directly in front of the king are rewarded.
+ *    2. Open-file penalty: files near the king without own pawns.
+ *    3. Enemy piece attack count on the king zone [NEW]: each enemy
+ *       piece type attacking squares adjacent to the king contributes
+ *       a weighted penalty.  Two or more attackers trigger a quadratic
+ *       scaling, modelling the danger of coordinated attacks.
+ * ────────────────────────────────────────────── */
+static const int KING_SHIELD_BONUS        =   7;
+static const int KING_OPEN_FILE_PENALTY   = -25;
+
+/* Per-piece-type attack weight for king danger */
+static const int KING_ATTACKER_WEIGHT[6] = { 0, 20, 20, 40, 80, 0 };
+/*                                            P   N   B   R   Q   K  */
 
 static void eval_king_safety(const Board *b, Color us, int *mg) {
-    int king_sq = bb_lsb(b->pieces[us][KING]);
+    Color them = us ^ 1;
+    int king_sq   = bb_lsb(b->pieces[us][KING]);
     int king_file = king_sq & 7;
     int king_rank = king_sq >> 3;
 
     Bitboard our_pawns = b->pieces[us][PAWN];
 
-    /* Check the three files around the king (clamped) */
+    /* ── 1. Pawn shield + open-file penalty ── */
     for (int f = king_file - 1; f <= king_file + 1; f++) {
         if (f < 0 || f > 7) continue;
         Bitboard file_pawns = our_pawns & FILE_BB[f];
@@ -343,18 +525,65 @@ static void eval_king_safety(const Board *b, Color us, int *mg) {
         if (!file_pawns) {
             *mg += KING_OPEN_FILE_PENALTY;
         } else {
-            /* Check if the nearest pawn is one or two ranks ahead */
-            int shield_rank = (us == WHITE) ? king_rank + 1 : king_rank - 1;
-            int shield2     = (us == WHITE) ? king_rank + 2 : king_rank - 2;
-            if (shield_rank >= 0 && shield_rank < 8 &&
-                (file_pawns & RANK_BB[shield_rank]))
+            int shield1 = (us == WHITE) ? king_rank + 1 : king_rank - 1;
+            int shield2 = (us == WHITE) ? king_rank + 2 : king_rank - 2;
+            if (shield1 >= 0 && shield1 < 8 && (file_pawns & RANK_BB[shield1]))
                 *mg += KING_SHIELD_BONUS * 2;
-            else if (shield2 >= 0 && shield2 < 8 &&
-                     (file_pawns & RANK_BB[shield2]))
+            else if (shield2 >= 0 && shield2 < 8 && (file_pawns & RANK_BB[shield2]))
                 *mg += KING_SHIELD_BONUS;
         }
     }
+
+    /*
+     * ── 2. Enemy piece attacks on king zone [NEW] ──
+     *
+     * King zone = king square + all king-move squares.
+     * For each enemy piece, if any of its attacks land in the king zone,
+     * add the piece's attack weight to a running total.
+     * The final penalty is quadratic when 2+ pieces are involved, because
+     * coordinated attacks are much more dangerous than isolated probes.
+     */
+    Bitboard king_zone = KING_ATTACKS[king_sq] | SQUARE_BB[king_sq];
+    Bitboard occ       = b->occ[2];
+
+    int attack_count  = 0;
+    int attack_weight = 0;
+
+    for (int pt = KNIGHT; pt < KING; pt++) {
+        Bitboard pieces = b->pieces[them][pt];
+        while (pieces) {
+            int sq = bb_pop(&pieces);
+            Bitboard atk;
+            switch (pt) {
+                case KNIGHT: atk = KNIGHT_ATTACKS[sq]; break;
+                case BISHOP: atk = bishop_attacks((Square)sq, occ); break;
+                case ROOK:   atk = rook_attacks  ((Square)sq, occ); break;
+                case QUEEN:  atk = queen_attacks  ((Square)sq, occ); break;
+                default:     atk = 0; break;
+            }
+            if (atk & king_zone) {
+                attack_count++;
+                attack_weight += KING_ATTACKER_WEIGHT[pt];
+            }
+        }
+    }
+
+    /* Quadratic penalty when 2+ pieces join the attack */
+    if (attack_count >= 2) {
+        int danger = attack_weight * attack_weight / 200;
+        *mg -= danger;
+    }
 }
+
+/* ──────────────────────────────────────────────
+ *  Tempo bonus [NEW]
+ *
+ *  A small bonus for the side to move.  The engine already has an
+ *  implicit tempo advantage through move generation, but an explicit
+ *  bonus improves practical play in dynamically balanced positions.
+ * ────────────────────────────────────────────── */
+#define TEMPO_BONUS_MG 14
+#define TEMPO_BONUS_EG  8
 
 /* ──────────────────────────────────────────────
  *  Main evaluation
@@ -371,21 +600,24 @@ int evaluate(const Board *b) {
         for (int pt = 0; pt < 6; pt++) {
             Bitboard bb = b->pieces[c][pt];
             while (bb) {
-                int sq = bb_pop(&bb);
+                int sq  = bb_pop(&bb);
                 int psq = pst_sq((Color)c, (Square)sq);
                 c_mg += MATERIAL_MG[pt] + PST_MG[pt][psq];
                 c_eg += MATERIAL_EG[pt] + PST_EG[pt][psq];
             }
         }
 
-        /* Pawn structure */
+        /* Pawn structure (doubled, isolated, backward, passed) */
         eval_pawns(b, (Color)c, &c_mg, &c_eg);
 
-        /* Mobility */
+        /* Piece mobility */
         eval_mobility(b, (Color)c, &c_mg, &c_eg);
 
-        /* Rook files */
+        /* Rook bonuses */
         eval_rooks(b, (Color)c, &c_mg, &c_eg);
+
+        /* Outpost bonuses */
+        eval_outposts(b, (Color)c, &c_mg, &c_eg);
 
         /* Bishop pair */
         if (bb_popcount(b->pieces[c][BISHOP]) >= 2) {
@@ -393,7 +625,7 @@ int evaluate(const Board *b) {
             c_eg += BISHOP_PAIR_EG;
         }
 
-        /* King safety (only relevant in MG) */
+        /* King safety (shield + open files + enemy attacks) */
         eval_king_safety(b, (Color)c, &c_mg);
 
         mg += sign * c_mg;
@@ -402,6 +634,13 @@ int evaluate(const Board *b) {
 
     /* Taper MG/EG blend */
     int score = taper(mg, eg, phase);
+
+    /*
+     * Tempo bonus [NEW]:
+     * The side to move gets a small bonus in both MG and EG.
+     * Tapered here to blend naturally with the rest of the eval.
+     */
+    score += taper(TEMPO_BONUS_MG, TEMPO_BONUS_EG, phase);
 
     /* Return from side-to-move perspective */
     return (b->side == WHITE) ? score : -score;

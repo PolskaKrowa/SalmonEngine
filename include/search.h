@@ -22,13 +22,16 @@ typedef struct {
 #define MAX_KILLERS 2
 
 typedef struct {
-    uint64_t nodes;                         /* nodes visited this search  */
-    int      seldepth;                      /* max selective depth reached */
-    Move     killers[MAX_PLY][MAX_KILLERS]; /* killer moves               */
-    int      history[2][64][64];            /* [color][from][to] history  */
-    clock_t  start_time;                    /* when search began          */
-    int      allotted_ms;                   /* time budget in ms          */
+    uint64_t nodes;                         /* nodes visited this search              */
+    int      seldepth;                      /* max selective depth reached            */
+    Move     killers[MAX_PLY][MAX_KILLERS]; /* killer moves                           */
+    int      history[2][64][64];            /* [color][from][to] history              */
+    clock_t  start_time;                    /* when search began                      */
+    int      allotted_ms;                   /* time budget in ms                      */
     SearchLimits *limits;
+    int   eval_stack[MAX_PLY];              /* cached static eval at each ply         */
+    Move  countermove[64][64];              /* countermove[from][to] refutation table */
+    Move  move_stack[MAX_PLY];              /* the move played to reach ply N         */
 } SearchInfo;
 
 /* ──────────────────────────────────────────────
@@ -55,3 +58,5 @@ int  quiesce(Board *b, int alpha, int beta, int ply, SearchInfo *si);
 
 /* Time check (checked every 2048 nodes) */
 bool time_up(SearchInfo *si);
+
+int see(const Board *b, Move m);

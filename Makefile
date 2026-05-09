@@ -5,6 +5,7 @@
 #    make              — release build  (bin/engine)
 #    make debug        — debug build with symbols
 #    make sanitize     — ASan + UBSan build
+#    make tuner        — build the tuner (bin/tuna)
 #    make perft        — run a quick built-in perft test
 #    make clean        — remove build artefacts
 #
@@ -18,14 +19,18 @@
 
 CC      := gcc
 TARGET  := bin/engine
+TUNER   := bin/tuna
 
 SRC_DIR := src
 INC_DIR := include
 BIN_DIR := bin
 OBJ_DIR := build
 
-SRCS := $(wildcard $(SRC_DIR)/*.c)
+SRCS := $(filter-out $(SRC_DIR)/tune.c, $(wildcard $(SRC_DIR)/*.c))
 OBJS := $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(SRCS))
+
+TUNER_SRCS := $(SRC_DIR)/tune.c $(SRC_DIR)/bitboard.c $(SRC_DIR)/board.c
+TUNER_OBJS := $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(TUNER_SRCS))
 
 # ── Common flags ─────────────────────────────────────────────
 CFLAGS_COMMON := \
@@ -68,7 +73,7 @@ CFLAGS  := $(CFLAGS_RELEASE)
 LDFLAGS := $(LDFLAGS_RELEASE)
 
 # ─────────────────────────────────────────────────────────────
-.PHONY: all debug sanitize perft clean
+.PHONY: all debug sanitize tuner perft clean
 
 all: $(BIN_DIR)/$(notdir $(TARGET))
 
@@ -94,6 +99,15 @@ $(BIN_DIR)/engine_debug: $(SRCS) | $(BIN_DIR)
 sanitize: $(SRCS) | $(BIN_DIR)
 	$(CC) $(CFLAGS_SANITIZE) $(LDFLAGS_SANITIZE) -o $(BIN_DIR)/engine_san $^
 	@echo "Built sanitized: $(BIN_DIR)/engine_san"
+
+# Tuner
+tuner: CFLAGS := $(CFLAGS_RELEASE) -DTUNE_STANDALONE
+tuner: LDFLAGS := $(LDFLAGS_RELEASE)
+tuner: $(BIN_DIR)/tuna
+
+$(BIN_DIR)/tuna: $(TUNER_OBJS) | $(BIN_DIR)
+	$(CC) $(LDFLAGS) -o $@ $^
+	@echo "Built tuner: $@"
 
 # Create directories
 $(BIN_DIR) $(OBJ_DIR):

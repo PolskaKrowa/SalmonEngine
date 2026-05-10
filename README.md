@@ -21,13 +21,20 @@ src/
 ├── movegen.c       - Legal move generation
 ├── search.c        - Search algorithm (minimax/alpha-beta)
 ├── tt.c            - Transposition table (hash table)
+├── tune.c          - Texel-style multithreaded evaluation tuner
 └── uci.c           - UCI protocol implementation
 ```
 
 ## Building
 
+To build the engine binary:
 ```bash
 make -j$(nproc)
+```
+
+To build the tuner (Tuna) binary:
+```bash
+make tuner -j$(nproc)
 ```
 
 ## Usage

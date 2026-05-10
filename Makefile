@@ -29,7 +29,7 @@ OBJ_DIR := build
 SRCS := $(filter-out $(SRC_DIR)/tune.c, $(wildcard $(SRC_DIR)/*.c))
 OBJS := $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(SRCS))
 
-TUNER_SRCS := $(SRC_DIR)/tune.c $(SRC_DIR)/bitboard.c $(SRC_DIR)/board.c
+TUNER_SRCS := $(SRC_DIR)/tune.c $(SRC_DIR)/bitboard.c $(SRC_DIR)/board.c $(SRC_DIR)/movegen.c
 TUNER_OBJS := $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(TUNER_SRCS))
 
 # ── Common flags ─────────────────────────────────────────────

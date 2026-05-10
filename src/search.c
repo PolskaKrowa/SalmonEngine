@@ -1,5 +1,5 @@
 /*
- * search.c — Move searching
+ * search.c — Move searching (improved)
  *
  * Architecture:
  *  • Iterative deepening (ID) driver in search()
@@ -26,6 +26,7 @@
 #include "search.h"
 #include "movegen.h"
 #include "eval.h"
+#include "book.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -165,12 +166,24 @@ int see(const Board *b, Move m) {
 /* ──────────────────────────────────────────────
  *  Move scoring for ordering
  * ────────────────────────────────────────────── */
-#define SCORE_TT_MOVE    1000000
-#define SCORE_GOOD_CAP    900000
-#define SCORE_KILLER1     800000
-#define SCORE_KILLER2     790000
-#define SCORE_COUNTER     780000   /* countermove bonus */
-#define SCORE_QUIET_BASE        0  /* + history score   */
+/*
+ * Move ordering score tiers (highest = searched first).
+ *
+ * SCORE_TACTICAL_CAP is intentionally placed ABOVE SCORE_TT_MOVE.
+ * This guarantees that a clearly winning capture (SEE >= 150 cp —
+ * roughly "gain at least a pawn free") is always tried before even
+ * the TT move.  The TT move comes from a previous, possibly shallower
+ * iteration that may not have seen the hanging piece; putting winning
+ * captures first ensures we never miss a free piece because an old
+ * quiet TT move happened to cause a beta cutoff first.
+ */
+#define SCORE_TACTICAL_CAP 1050000   /* SEE >= 150 — above TT move          */
+#define SCORE_TT_MOVE      1000000
+#define SCORE_GOOD_CAP      900000   /* 0 <= SEE < 150 — even / slight gain */
+#define SCORE_KILLER1       800000
+#define SCORE_KILLER2       790000
+#define SCORE_COUNTER       780000   /* countermove bonus */
+#define SCORE_QUIET_BASE          0  /* + history score   */
 
 static int score_move(const Board *b, Move m, Move tt_move,
                       const Move *killers, Move countermove,
@@ -184,13 +197,25 @@ static int score_move(const Board *b, Move m, Move tt_move,
                        ? (int)PAWN
                        : (int)piece_type(b->mailbox[to]);
 
-        /* Use SEE to separate winning/losing captures */
+        /* Separate captures into three tiers by SEE:
+         *
+         *  >= 150 cp  → SCORE_TACTICAL_CAP  (clearly winning — above TT move)
+         *     0..149  → SCORE_GOOD_CAP      (even or slight gain)
+         *  < 0        → raw SEE score        (losing capture, tried last)
+         *
+         * The 150 cp threshold catches any capture of a piece that is either
+         * completely undefended or defended only by a more-expensive piece.
+         * Examples that go to SCORE_TACTICAL_CAP:
+         *   PxN undefended (SEE=320), PxR undefended (SEE=500),
+         *   NxR undefended (SEE=180), PxB undefended (SEE=230).
+         */
         int see_score = see(b, m);
-        if (see_score >= 0)
+        if (see_score >= 150)
+            return SCORE_TACTICAL_CAP + MVV_LVA[attacker][victim];
+        else if (see_score >= 0)
             return SCORE_GOOD_CAP + MVV_LVA[attacker][victim];
         else
-            /* Losing captures scored below quiets, ordered by MVV-LVA */
-            return see_score;
+            return see_score; /* losing capture — below quiet moves */
     }
 
     if (MOVE_IS_PROMO(m)) return SCORE_GOOD_CAP - 1;
@@ -681,6 +706,27 @@ void search(Board *b, SearchLimits *lim) {
     Move best_move = NULL_MOVE;
     int  prev_score = 0;
 
+    /* ── Opening book probe ──
+     *
+     * If the current position has a book entry, play it immediately
+     * without searching.  This saves the full search budget for the
+     * middlegame and guarantees solid, well-tested opening moves.
+     * book_probe() validates legality internally, so a hash collision
+     * cannot cause an illegal move to be returned.
+     */
+    {
+        Move bm = book_probe(b);
+        if (bm != NULL_MOVE) {
+            char mv_str[6];
+            move_to_str(bm, mv_str);
+            printf("info depth 0 seldepth 0 score cp 30 nodes 0 nps 0 time 0 pv %s\n",
+                   mv_str);
+            printf("bestmove %s\n", mv_str);
+            fflush(stdout);
+            return;
+        }
+    }
+
     /* Reset root-move seed for this search */
     s_root_best_move = NULL_MOVE;
 
@@ -783,4 +829,5 @@ done:
 void search_init(void) {
     init_mvv_lva();
     init_lmr_table();
+    book_init();
 }

@@ -484,7 +484,12 @@ static void eval_rooks(const Board *b, Color us, int *mg, int *eg) {
 /*
  * eval_outposts — Clean per-piece front-span / attack-mask approach.
  *
- * for each candidate piece check directly:
+ * OLD approach: precomputed enemy_pawn_attack_span by looping over every
+ * enemy pawn and filling whole ranks ahead of it on adjacent files.  This
+ * was an over-approximation (it could flag squares unreachable due to
+ * blockades) and the fill direction was easy to mis-index.
+ *
+ * NEW approach: for each candidate piece check directly:
  *   1. Is the square in the outpost rank range (ranks 4–6 from our side)?
  *   2. Is it pawn-supported?  A friendly pawn attacks this square when
  *      PAWN_ATTACKS[them][sq] & our_pawns is non-zero (by symmetry of
@@ -673,6 +678,159 @@ static void eval_king_safety(const Board *b, Color us, int *mg, int *eg) {
 }
 
 /* ──────────────────────────────────────────────
+ *  Tactical threat evaluation
+ *
+ *  Three terms evaluated for the side `us`:
+ *
+ *  1. Hanging piece penalty
+ *     A piece is "hanging" if it is attacked by the opponent and either:
+ *       a) has no friendly defender at all — full penalty (≈ 50 % of piece
+ *          value, the rest comes from the search finding the capture), or
+ *       b) is attacked by a cheaper enemy piece — partial penalty scaled
+ *          by the value difference.
+ *     This term fills the gap when pruning prevents the search from
+ *     reaching the capturing move: even at the leaf node, the eval will
+ *     reflect the material danger, pushing the engine away from leaving
+ *     pieces en prise in favour of superficially attractive positional
+ *     moves (open files, outposts, etc.).
+ *
+ *  2. Knight fork bonus
+ *     A knight that attacks 2+ enemy pieces worth at least a bishop in the
+ *     same move has immediate forking potential.  Rewarding this in the
+ *     eval nudges the engine to seek out fork squares even when the fork
+ *     itself is a move or two away.
+ *
+ *  3. Sliding piece battery / skewer bonus
+ *     A rook or queen that attacks 2+ valuable enemy pieces along a rank
+ *     or file (or a bishop/queen on a diagonal) represents a latent skewer
+ *     or battery threat.  A small bonus encourages the engine to establish
+ *     such alignments proactively.
+ *
+ *  All terms are tapered automatically through the mg/eg blend in
+ *  evaluate().  sq_attackers() is a local duplicate of the homonymous
+ *  function in search.c, kept static here to avoid adding a cross-file
+ *  dependency on internal search machinery.
+ * ────────────────────────────────────────────── */
+
+static Bitboard sq_attackers(const Board *b, int sq, Bitboard occ) {
+    return (PAWN_ATTACKS[WHITE][sq]  & b->pieces[BLACK][PAWN])
+         | (PAWN_ATTACKS[BLACK][sq]  & b->pieces[WHITE][PAWN])
+         | (KNIGHT_ATTACKS[sq]       & (b->pieces[WHITE][KNIGHT] | b->pieces[BLACK][KNIGHT]))
+         | (bishop_attacks((Square)sq, occ)
+                           & (  b->pieces[WHITE][BISHOP] | b->pieces[BLACK][BISHOP]
+                               | b->pieces[WHITE][QUEEN]  | b->pieces[BLACK][QUEEN]))
+         | (rook_attacks((Square)sq, occ)
+                         & (  b->pieces[WHITE][ROOK]   | b->pieces[BLACK][ROOK]
+                             | b->pieces[WHITE][QUEEN]  | b->pieces[BLACK][QUEEN]))
+         | (KING_ATTACKS[sq]         & (b->pieces[WHITE][KING]   | b->pieces[BLACK][KING]));
+}
+
+/* Hanging-piece penalty table: roughly 50 % of the piece's material value. */
+static const int HANG_PENALTY_MG[6] = {  40, 170, 175, 250, 500, 0 };
+static const int HANG_PENALTY_EG[6] = {  50, 165, 160, 270, 460, 0 };
+
+static void eval_threats(const Board *b, Color us, int *mg, int *eg) {
+    Color    them = us ^ 1;
+    Bitboard occ  = b->occ[2];
+
+    /* ── 1. Hanging / en-prise pieces ── */
+    for (int pt = PAWN; pt < KING; pt++) {
+        Bitboard pieces = b->pieces[us][pt];
+        while (pieces) {
+            int sq = bb_pop(&pieces);
+
+            Bitboard enemy_atk = sq_attackers(b, sq, occ) & b->occ[them];
+            if (!enemy_atk) continue;   /* not attacked at all — safe */
+
+            Bitboard friendly_def = sq_attackers(b, sq, occ) & b->occ[us];
+            /* (the piece on 'sq' itself doesn't appear in sq_attackers output,
+               so no need to mask it out.) */
+
+            if (!friendly_def) {
+                /* Completely undefended: apply the full hanging penalty. */
+                *mg -= HANG_PENALTY_MG[pt];
+                *eg -= HANG_PENALTY_EG[pt];
+            } else {
+                /*
+                 * Defended, but attacked by a cheaper piece.  Walk the enemy
+                 * attackers from cheapest (PAWN) upward; the first hit is the
+                 * minimum-value attacker.
+                 */
+                int min_atk_mg = 30000;
+                for (int apt = PAWN; apt <= QUEEN; apt++) {
+                    if (b->pieces[them][apt] & enemy_atk) {
+                        min_atk_mg = MATERIAL_MG[apt];
+                        break;
+                    }
+                }
+                int piece_mg = MATERIAL_MG[pt];
+                if (min_atk_mg < piece_mg) {
+                    /* Partial penalty: proportional to value difference. */
+                    *mg -= (piece_mg - min_atk_mg) / 6;
+                    *eg -= (piece_mg - min_atk_mg) / 6;
+                }
+            }
+        }
+    }
+
+    /* ── 2. Knight fork bonus ── */
+    {
+        /*
+         * Any square a knight can reach that hits 2+ enemy pieces worth at
+         * least a minor piece represents a fork threat.  We reward the
+         * current presence of knights that already attack multiple targets;
+         * the eval gradient encourages the engine to manoeuvre toward such
+         * squares one move before the fork fires.
+         */
+        Bitboard valuable_enemy = b->pieces[them][BISHOP]
+                                | b->pieces[them][ROOK]
+                                | b->pieces[them][QUEEN]
+                                | b->pieces[them][KING];
+        Bitboard knights = b->pieces[us][KNIGHT];
+        while (knights) {
+            int sq   = bb_pop(&knights);
+            int hits = bb_popcount(KNIGHT_ATTACKS[sq] & valuable_enemy);
+            if (hits >= 2) {
+                /* Base bonus + extra for each additional piece hit. */
+                *mg += 45 + 20 * (hits - 2);
+                *eg += 35 + 15 * (hits - 2);
+            }
+        }
+    }
+
+    /* ── 3. Sliding piece battery / skewer bonus ── */
+    {
+        /*
+         * A rook or queen that sees 2+ valuable enemy pieces along its attack
+         * ray has a latent battery or skewer threat even if not immediately
+         * executable (the intermediate piece may be capturable or moveable).
+         * Same logic for bishops on diagonals through the royal pair.
+         */
+        Bitboard royal      = b->pieces[them][QUEEN] | b->pieces[them][KING];
+        Bitboard valuable_r = royal | b->pieces[them][ROOK];   /* rook targets */
+        Bitboard valuable_b = royal;                            /* bishop targets */
+
+        Bitboard rq = b->pieces[us][ROOK] | b->pieces[us][QUEEN];
+        while (rq) {
+            int sq = bb_pop(&rq);
+            if (bb_popcount(rook_attacks((Square)sq, occ) & valuable_r) >= 2) {
+                *mg += 20;
+                *eg += 15;
+            }
+        }
+
+        Bitboard bq = b->pieces[us][BISHOP] | b->pieces[us][QUEEN];
+        while (bq) {
+            int sq = bb_pop(&bq);
+            if (bb_popcount(bishop_attacks((Square)sq, occ) & valuable_b) >= 2) {
+                *mg += 15;
+                *eg += 10;
+            }
+        }
+    }
+}
+
+/* ──────────────────────────────────────────────
  *  Main evaluation
  * ────────────────────────────────────────────── */
 int evaluate(const Board *b) {
@@ -718,6 +876,9 @@ int evaluate(const Board *b) {
          * Both *mg and *eg are passed so the EG term is tapered correctly.
          */
         eval_king_safety(b, (Color)c, &c_mg, &c_eg);
+
+        /* Tactical threats: hanging pieces, fork potential, skewers. */
+        eval_threats(b, (Color)c, &c_mg, &c_eg);
 
         mg += sign * c_mg;
         eg += sign * c_eg;

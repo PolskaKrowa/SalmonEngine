@@ -101,8 +101,8 @@ typedef enum {
 /* ──────────────────────────────────────────────
  *  Move list
  * ────────────────────────────────────────────── */
-#define MAX_MOVES 256
-#define MAX_PLY   128
+#define MAX_MOVES 512
+#define MAX_PLY   256
 
 typedef struct { Move moves[MAX_MOVES]; int count; } MoveList;
 

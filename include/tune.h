@@ -72,6 +72,7 @@ typedef struct {
     int backward_pawn_mg, backward_pawn_eg;
     int passed_pawn_mg[8];   /* indexed by bonus_rank (0=back rank, 7=promo) */
     int passed_pawn_eg[8];
+    int passed_pawn_king_dist_mult[8];
 
     /* ── Mobility (per reachable square) ── */
     int mobility_mg[6];
@@ -83,7 +84,7 @@ typedef struct {
     int rook_seventh_mg, rook_seventh_eg;
 
     /* ── Bishop pair ── */
-    int bishop_pair_mg, bishop_pair_eg;
+    int bishop_pair_mg, bishop_pair_eg, bishop_pair_open_bonus;
 
     /* ── Outposts ── */
     int outpost_knight_mg, outpost_knight_eg;
@@ -93,6 +94,8 @@ typedef struct {
     int king_shield;            /* pawn-shield bonus per pawn      */
     int king_open_file;         /* open-file penalty (negative)    */
     int king_attacker_weight[6];/* indexed by piece type           */
+    int king_danger_quadratic_scale;
+    int king_pawn_storm_penalty;
 
     /* ── Tempo ── */
     int tempo_mg, tempo_eg;

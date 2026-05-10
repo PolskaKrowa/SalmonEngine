@@ -11,13 +11,14 @@
  *   • Pawn structure:
  *       – Doubled-pawn penalty
  *       – Isolated-pawn penalty
- *       – Backward-pawn penalty
+ *       – Backward-pawn penalty  [simplified: rank-loop behind-span]
  *       – Passed-pawn bonus
- *   • Outpost squares for knights and bishops
+ *   • Outpost squares for knights and bishops  [simplified: per-piece front-span]
  *   • King safety:
  *       – Pawn shield bonus
  *       – Open-file penalty near king
- *       – Weighted enemy-piece attack count
+ *       – Distance-weighted enemy-piece attack count  [improved from flat weight]
+ *       – Endgame king-activity term (king-to-king proximity bonus)  [new]
  *   • Bishop pair bonus
  *   • Rook on open / semi-open file bonus
  *   • Rook on seventh rank bonus
@@ -27,6 +28,7 @@
 #include "eval.h"
 #include "bitboard.h"
 #include <string.h>
+#include <stdint.h>
 
 static const int MATERIAL_MG[6] = { 82, 344, 358, 480, 1022, 0 };
 static const int MATERIAL_EG[6] = { 94, 338, 329, 546, 924, 0 };
@@ -188,6 +190,14 @@ static const int KING_SHIELD_BONUS        = 7;
 static const int KING_OPEN_FILE_PENALTY   = -25;
 static const int KING_ATTACKER_WEIGHT[6]  = { 0, 20, 20, 40, 80, 0, };
 
+/*
+ * King endgame activity: per-Chebyshev-step penalty for being far from the
+ * enemy king.  PST_KING_EG rewards centrality; this term rewards king-to-king
+ * proximity (boxing-in bonus), which the PST cannot express because it only
+ * sees one king's position.  Range: [4 cp at dist 1] to [28 cp at dist 7].
+ */
+static const int KING_EG_DISTANCE_PENALTY = 4;
+
 #define TEMPO_BONUS_MG 16
 #define TEMPO_BONUS_EG 0
 
@@ -204,6 +214,17 @@ static const int * const PST_EG[6] = {
 /* Flip square for Black (mirror vertically) */
 static inline int pst_sq(Color c, Square sq) {
     return (c == WHITE) ? (int)sq : ((int)sq ^ 56);
+}
+
+/*
+ * Chebyshev (king-move) distance between two squares.
+ * = max(|file_delta|, |rank_delta|)
+ * Used by the king-safety model to weight attacks by proximity.
+ */
+static inline int chebyshev(int sq1, int sq2) {
+    int df = (sq1 & 7) - (sq2 & 7); if (df < 0) df = -df;
+    int dr = (sq1 >> 3) - (sq2 >> 3); if (dr < 0) dr = -dr;
+    return (df > dr) ? df : dr;
 }
 
 /* ──────────────────────────────────────────────
@@ -228,9 +249,61 @@ static inline int taper(int mg, int eg, int phase) {
 }
 
 /* ──────────────────────────────────────────────
+ *  Pawn hash cache
+ *
+ *  Pawn structure evaluation is expensive and depends only on the two pawn
+ *  bitboards plus the colour being evaluated. A small direct-mapped cache
+ *  avoids recomputing doubled / isolated / passed / backward pawn terms for
+ *  positions that recur through transpositions or iterative deepening.
+ * ────────────────────────────────────────────── */
+#define PAWN_CACHE_SIZE 2048
+
+typedef struct {
+    Bitboard wp;
+    Bitboard bp;
+    Color    us;
+    int      mg;
+    int      eg;
+    bool     valid;
+} PawnCacheEntry;
+
+static PawnCacheEntry pawn_cache[PAWN_CACHE_SIZE];
+
+static inline unsigned pawn_cache_idx(Bitboard wp, Bitboard bp, Color us) {
+    uint64_t key = (uint64_t)wp
+                 ^ ((uint64_t)bp << 1)
+                 ^ ((uint64_t)us << 63)
+                 ^ ((uint64_t)wp >> 17)
+                 ^ ((uint64_t)bp >> 29);
+    key ^= key >> 32;
+    key ^= key >> 16;
+    return (unsigned)key & (PAWN_CACHE_SIZE - 1);
+}
+
+static bool pawn_cache_probe(Bitboard wp, Bitboard bp, Color us, int *mg, int *eg) {
+    PawnCacheEntry *e = &pawn_cache[pawn_cache_idx(wp, bp, us)];
+    if (e->valid && e->wp == wp && e->bp == bp && e->us == us) {
+        *mg = e->mg;
+        *eg = e->eg;
+        return true;
+    }
+    return false;
+}
+
+static void pawn_cache_store(Bitboard wp, Bitboard bp, Color us, int mg, int eg) {
+    PawnCacheEntry *e = &pawn_cache[pawn_cache_idx(wp, bp, us)];
+    e->wp = wp;
+    e->bp = bp;
+    e->us = us;
+    e->mg = mg;
+    e->eg = eg;
+    e->valid = true;
+}
+
+/* ──────────────────────────────────────────────
  *  Pawn structure evaluation (one side)
  * ────────────────────────────────────────────── */
-static void eval_pawns(const Board *b, Color us, int *mg, int *eg) {
+static void eval_pawns_uncached(const Board *b, Color us, int *mg, int *eg) {
     Color them = us ^ 1;
     Bitboard our_pawns   = b->pieces[us][PAWN];
     Bitboard their_pawns = b->pieces[them][PAWN];
@@ -260,7 +333,7 @@ static void eval_pawns(const Board *b, Color us, int *mg, int *eg) {
         }
 
         /* ── Passed pawn ──
-         * No enemy pawns on same or adjacent files ahead of this pawn.        */
+         * No enemy pawns on same or adjacent files ahead of this pawn. */
         Bitboard ahead_mask = 0;
         if (us == WHITE) {
             for (int r = rank + 1; r < 8; r++) ahead_mask |= RANK_BB[r];
@@ -277,21 +350,22 @@ static void eval_pawns(const Board *b, Color us, int *mg, int *eg) {
         }
 
         /*
-         * ── Backward pawn [NEW] ──
+         * ── Backward pawn ──
          *
          * A pawn is backward when:
          *   1. Its stop square (one step forward) is controlled by an enemy
          *      pawn — it cannot safely advance.
-         *   2. It has no friendly pawn support from behind on adjacent files
-         *      (so it cannot be "pushed" by a lever).
+         *   2. It has no friendly pawn support from behind on adjacent files.
          *   3. It is not already passed.
          *
-         * We detect enemy pawn control of the stop square by checking
-         * PAWN_ATTACKS[us][stop_sq] & their_pawns:
-         *   For us=WHITE, stop_sq = sq+8, PAWN_ATTACKS[WHITE][stop_sq] gives
-         *   the squares diagonally ahead of stop_sq — exactly where a BLACK
-         *   pawn would need to be to attack stop_sq from behind (its forward).
-         *   The same formula works symmetrically for BLACK.
+         * Stop-square control uses PAWN_ATTACKS[us][stop] & their_pawns:
+         *   PAWN_ATTACKS[WHITE][stop] = squares diagonally ahead of stop
+         *   from WHITE's perspective — exactly where a BLACK pawn would need
+         *   to sit to attack stop.  The formula is symmetric for BLACK.
+         *
+         * The behind-span uses clean rank-loop iteration instead of
+         * full-board bit arithmetic (SQUARE_BB[sq]-1 etc.), which is both
+         * easier to read and avoids edge-case surprises at sq==0 or sq==63.
          */
         if (!is_passed) {
             int stop = (us == WHITE) ? sq + 8 : sq - 8;
@@ -299,15 +373,18 @@ static void eval_pawns(const Board *b, Color us, int *mg, int *eg) {
                 bool stop_attacked = (PAWN_ATTACKS[us][stop] & their_pawns) != 0;
 
                 if (stop_attacked) {
-                    /* Squares on adjacent files BEHIND this pawn */
-                    Bitboard below_sq   = SQUARE_BB[sq] - 1; /* bits 0..sq-1 */
-                    Bitboard above_sq   = ~SQUARE_BB[sq] & ~below_sq; /* bits sq+1..63 */
-                    Bitboard behind_span = ((us == WHITE) ? below_sq : above_sq)
-                                          & adj_files
-                                          & ~RANK_BB[rank];
+                    /* All squares on adjacent files strictly behind this pawn */
+                    Bitboard behind_span = 0;
+                    if (us == WHITE) {
+                        for (int r = 0; r < rank; r++)
+                            behind_span |= RANK_BB[r];
+                    } else {
+                        for (int r = rank + 1; r < 8; r++)
+                            behind_span |= RANK_BB[r];
+                    }
+                    behind_span &= adj_files;
 
-                    bool has_support = (our_pawns & behind_span) != 0;
-                    if (!has_support) {
+                    if (!(our_pawns & behind_span)) {
                         *mg += BACKWARD_PAWN_PENALTY_MG;
                         *eg += BACKWARD_PAWN_PENALTY_EG;
                     }
@@ -315,6 +392,26 @@ static void eval_pawns(const Board *b, Color us, int *mg, int *eg) {
             }
         }
     }
+}
+
+static void eval_pawns(const Board *b, Color us, int *mg, int *eg) {
+    Bitboard wp = b->pieces[WHITE][PAWN];
+    Bitboard bp = b->pieces[BLACK][PAWN];
+
+    int cached_mg, cached_eg;
+    if (pawn_cache_probe(wp, bp, us, &cached_mg, &cached_eg)) {
+        *mg += cached_mg;
+        *eg += cached_eg;
+        return;
+    }
+
+    int local_mg = 0;
+    int local_eg = 0;
+    eval_pawns_uncached(b, us, &local_mg, &local_eg);
+
+    pawn_cache_store(wp, bp, us, local_mg, local_eg);
+    *mg += local_mg;
+    *eg += local_eg;
 }
 
 static void eval_mobility(const Board *b, Color us, int *mg, int *eg) {
@@ -347,9 +444,8 @@ static void eval_rooks(const Board *b, Color us, int *mg, int *eg) {
     Bitboard their_pawns = b->pieces[them][PAWN];
     Bitboard rooks       = b->pieces[us  ][ROOK];
 
-    /* Rank index for the "7th rank" (relative to the side being evaluated) */
-    int rank7 = (us == WHITE) ? 6 : 1;   /* rank index 0-based */
-    int rank8 = (us == WHITE) ? 7 : 0;   /* enemy back rank     */
+    int rank7 = (us == WHITE) ? 6 : 1;
+    int rank8 = (us == WHITE) ? 7 : 0;
 
     while (rooks) {
         int sq   = bb_pop(&rooks);
@@ -369,9 +465,8 @@ static void eval_rooks(const Board *b, Color us, int *mg, int *eg) {
         }
 
         /*
-         * Rook on the 7th rank [NEW]:
-         * Valuable when the enemy king is on the 8th rank or there are
-         * enemy pawns on the 7th rank to harass.
+         * Rook on the 7th rank: valuable when the enemy king is on the 8th
+         * rank or there are enemy pawns on the 7th rank to harass.
          */
         if (rank == rank7) {
             int enemy_king_sq = bb_lsb(b->pieces[them][KING]);
@@ -386,79 +481,109 @@ static void eval_rooks(const Board *b, Color us, int *mg, int *eg) {
     }
 }
 
+/*
+ * eval_outposts — Clean per-piece front-span / attack-mask approach.
+ *
+ * OLD approach: precomputed enemy_pawn_attack_span by looping over every
+ * enemy pawn and filling whole ranks ahead of it on adjacent files.  This
+ * was an over-approximation (it could flag squares unreachable due to
+ * blockades) and the fill direction was easy to mis-index.
+ *
+ * NEW approach: for each candidate piece check directly:
+ *   1. Is the square in the outpost rank range (ranks 4–6 from our side)?
+ *   2. Is it pawn-supported?  A friendly pawn attacks this square when
+ *      PAWN_ATTACKS[them][sq] & our_pawns is non-zero (by symmetry of
+ *      pawn-attack geometry).
+ *   3. Is there NO enemy pawn on adjacent files that could advance to
+ *      attack it in the future? — the "future-threat span".
+ *
+ * Future-threat span:
+ *   For us=WHITE: BLACK pawns advance downward.  Any BLACK pawn on an
+ *   adjacent file at rank > sq_rank can advance to sq_rank+1 and attack
+ *   sq diagonally, so the span is adj_files & {ranks > sq_rank}.
+ *
+ *   For us=BLACK: WHITE pawns advance upward.  Any WHITE pawn on an
+ *   adjacent file at rank < sq_rank threatens sq, so the span is
+ *   adj_files & {ranks < sq_rank}.
+ *
+ * This is explicit, symmetric, and correct at every file and rank.
+ */
 static void eval_outposts(const Board *b, Color us, int *mg, int *eg) {
-    Color them        = us ^ 1;
-    Bitboard our_pawns   = b->pieces[us  ][PAWN];
+    Color them = us ^ 1;
+    Bitboard our_pawns   = b->pieces[us][PAWN];
     Bitboard their_pawns = b->pieces[them][PAWN];
 
-    /*
-     * Build "outpost mask": squares on ranks 4–6 (relative) that are
-     *   - Supported by at least one friendly pawn
-     *   - Not attackable by any enemy pawn now or in the future
-     *     (no enemy pawn on adjacent files with a rank that could advance).
-     *
-     * "Pawn attack span" of the enemy: all squares an enemy pawn can
-     * eventually attack, going forward.  A simplified version: for each
-     * enemy pawn, the files ±1 ahead of it are forever controlled.
-     *
-     * We approximate this with the forward-fill of enemy pawn attacks.
-     */
-
-    /* Enemy pawn attack spans: squares on adjacent files, at ranks
-       in front of each enemy pawn (towards our side).             */
-    Bitboard enemy_pawn_attack_span = 0;
-    {
-        Bitboard ep = their_pawns;
-        while (ep) {
-            int sq   = bb_pop(&ep);
-            int file = sq & 7;
-            int rank = sq >> 3;
-            Bitboard adj = 0;
-            if (file > 0) adj |= FILE_BB[file - 1];
-            if (file < 7) adj |= FILE_BB[file + 1];
-
-            /* Ranks between the enemy pawn and our back rank */
-            if (them == BLACK) { /* them=BLACK means their pawns go down; our back rank is rank 0 */
-                for (int r = rank - 1; r >= 0; r--) enemy_pawn_attack_span |= RANK_BB[r] & adj;
-            } else {
-                for (int r = rank + 1; r < 8; r++) enemy_pawn_attack_span |= RANK_BB[r] & adj;
-            }
-        }
-    }
-
-    /* Outpost ranks: ranks 4–6 from our perspective (0-indexed) */
-    int r_min = (us == WHITE) ? 3 : 2;  /* 0-based rank 4 for WHITE, rank 3 for BLACK */
-    int r_max = (us == WHITE) ? 5 : 4;  /* 0-based rank 6 for WHITE, rank 5 for BLACK */
+    /* Outpost ranks: 4–6 from our perspective (0-indexed). */
+    int r_min = (us == WHITE) ? 3 : 2;
+    int r_max = (us == WHITE) ? 5 : 4;
     Bitboard outpost_rank_mask = 0;
     for (int r = r_min; r <= r_max; r++) outpost_rank_mask |= RANK_BB[r];
 
-    /* Evaluate knights on outposts */
-    Bitboard knights = b->pieces[us][KNIGHT];
-    while (knights) {
-        int sq = bb_pop(&knights);
-        if (!((SQUARE_BB[sq]) & outpost_rank_mask)) continue;
-        if (enemy_pawn_attack_span & SQUARE_BB[sq])  continue; /* can be chased */
-        /* Must be supported by a friendly pawn */
-        if (!(PAWN_ATTACKS[them][sq] & our_pawns))   continue; /* not supported */
+    /* Evaluate knights and bishops with identical logic, different bonuses. */
+    for (int pt = KNIGHT; pt <= BISHOP; pt++) {
+        int bonus_mg = (pt == KNIGHT) ? OUTPOST_KNIGHT_MG : OUTPOST_BISHOP_MG;
+        int bonus_eg = (pt == KNIGHT) ? OUTPOST_KNIGHT_EG : OUTPOST_BISHOP_EG;
 
-        *mg += OUTPOST_KNIGHT_MG;
-        *eg += OUTPOST_KNIGHT_EG;
-    }
+        Bitboard pieces = b->pieces[us][pt];
+        while (pieces) {
+            int sq   = bb_pop(&pieces);
+            int file = sq & 7;
+            int rank = sq >> 3;
 
-    /* Evaluate bishops on outposts (less valuable — bishops can be longer-range) */
-    Bitboard bishops = b->pieces[us][BISHOP];
-    while (bishops) {
-        int sq = bb_pop(&bishops);
-        if (!((SQUARE_BB[sq]) & outpost_rank_mask)) continue;
-        if (enemy_pawn_attack_span & SQUARE_BB[sq])  continue;
-        if (!(PAWN_ATTACKS[them][sq] & our_pawns))   continue;
+            /* Must be in the outpost rank range */
+            if (!(SQUARE_BB[sq] & outpost_rank_mask)) continue;
 
-        *mg += OUTPOST_BISHOP_MG;
-        *eg += OUTPOST_BISHOP_EG;
+            /*
+             * Pawn support check: PAWN_ATTACKS[them][sq] gives squares from
+             * which a them-coloured pawn would attack sq; by symmetry these
+             * are exactly the squares from which one of OUR pawns attacks sq.
+             */
+            if (!(PAWN_ATTACKS[them][sq] & our_pawns)) continue;
+
+            /* Adjacent files */
+            Bitboard adj_files = 0;
+            if (file > 0) adj_files |= FILE_BB[file - 1];
+            if (file < 7) adj_files |= FILE_BB[file + 1];
+
+            /* Future-threat span: ranks from which an enemy pawn can advance
+             * to attack this square.  See function-level comment above. */
+            Bitboard future_threat = 0;
+            if (us == WHITE) {
+                for (int r = rank + 1; r < 8; r++) future_threat |= RANK_BB[r];
+            } else {
+                for (int r = 0; r < rank; r++)     future_threat |= RANK_BB[r];
+            }
+            future_threat &= adj_files;
+
+            if (their_pawns & future_threat) continue;  /* can be chased off */
+
+            *mg += bonus_mg;
+            *eg += bonus_eg;
+        }
     }
 }
 
-static void eval_king_safety(const Board *b, Color us, int *mg) {
+/*
+ * eval_king_safety — Tapered, distance-weighted attack model.
+ *
+ * Changes from the original:
+ *
+ * MG — Distance-weighted attacks:
+ *   The original gave each attacking piece a flat weight regardless of how
+ *   close it was to the king.  A queen on the opposite side of the board is
+ *   far less threatening than one sitting on the f-file adjacent to the king.
+ *   We now scale each attacker's base weight by its Chebyshev distance to
+ *   our king (scale 4× / 2× / 1× for dist ≤1 / dist 2–3 / dist ≥4, with a
+ *   final divide-by-2 to keep values in the same ballpark as before).
+ *
+ * EG — King activity (king-proximity bonus):
+ *   PST_KING_EG already rewards centralization.  It cannot express the
+ *   dynamic bonus for approaching the enemy king (crucial for K+P endings,
+ *   opposition, and mating nets).  We subtract `dist * KING_EG_DISTANCE_PENALTY`
+ *   from the EG score so that the winning king is motivated to close in.
+ *   The function now takes *eg so this term feeds into the tapered blend.
+ */
+static void eval_king_safety(const Board *b, Color us, int *mg, int *eg) {
     Color them = us ^ 1;
     int king_sq   = bb_lsb(b->pieces[us][KING]);
     int king_file = king_sq & 7;
@@ -484,13 +609,21 @@ static void eval_king_safety(const Board *b, Color us, int *mg) {
     }
 
     /*
-     * ── 2. Enemy piece attacks on king zone [NEW] ──
+     * ── 2. Distance-weighted enemy piece attacks on king zone ──
      *
-     * King zone = king square + all king-move squares.
-     * For each enemy piece, if any of its attacks land in the king zone,
-     * add the piece's attack weight to a running total.
-     * The final penalty is quadratic when 2+ pieces are involved, because
-     * coordinated attacks are much more dangerous than isolated probes.
+     * King zone = king square + all king-move squares (up to 9 squares).
+     *
+     * For each enemy piece that attacks into the zone, scale its weight by
+     * proximity to our king:
+     *
+     *   dist <= 1 (adjacent or on king sq): scale 4  — immediate threat,
+     *             can deliver check or capture next move.
+     *   dist 2-3 (nearby):                 scale 2  — standard threat.
+     *   dist >= 4 (far):                   scale 1  — long-range pressure.
+     *
+     * Divide by 2 at the end so the effective multipliers are 2 / 1 / 0.5,
+     * keeping total weights comparable to the original flat model.
+     * The quadratic penalty for 2+ pieces is preserved.
      */
     Bitboard king_zone = KING_ATTACKS[king_sq] | SQUARE_BB[king_sq];
     Bitboard occ       = b->occ[2];
@@ -511,17 +644,37 @@ static void eval_king_safety(const Board *b, Color us, int *mg) {
                 default:     atk = 0; break;
             }
             if (atk & king_zone) {
+                int dist  = chebyshev(sq, king_sq);
+                int scale = (dist <= 1) ? 4 : (dist <= 3) ? 2 : 1;
                 attack_count++;
-                attack_weight += KING_ATTACKER_WEIGHT[pt];
+                attack_weight += KING_ATTACKER_WEIGHT[pt] * scale;
             }
         }
     }
 
-    /* Quadratic penalty when 2+ pieces join the attack */
+    /* Restore to effective 2×/1×/0.5× scale */
+    attack_weight /= 2;
+
+    /* Quadratic penalty when 2+ coordinated pieces attack */
     if (attack_count >= 2) {
         int danger = attack_weight * attack_weight / 200;
         *mg -= danger;
     }
+
+    /*
+     * ── 3. Endgame king activity ──
+     *
+     * Reward the king for being close to the enemy king.  This incentivises
+     * the stronger side to centralise and box in the opponent rather than
+     * remain passive, and penalises the weaker side's king for hiding.
+     *
+     * chebyshev ∈ [1, 7] → bonus ∈ [4 cp, 28 cp] (endgame only).
+     * PST_KING_EG already captures centrality; this adds the inter-king
+     * proximity dimension that a per-piece PST cannot express.
+     */
+    int enemy_king_sq = bb_lsb(b->pieces[them][KING]);
+    int king_dist     = chebyshev(king_sq, enemy_king_sq);
+    *eg -= king_dist * KING_EG_DISTANCE_PENALTY;
 }
 
 /* ──────────────────────────────────────────────
@@ -564,8 +717,12 @@ int evaluate(const Board *b) {
             c_eg += BISHOP_PAIR_EG;
         }
 
-        /* King safety (shield + open files + enemy attacks) */
-        eval_king_safety(b, (Color)c, &c_mg);
+        /*
+         * King safety: shield + open files + distance-weighted enemy attacks
+         * (MG) + king-proximity activity bonus (EG).
+         * Both *mg and *eg are passed so the EG term is tapered correctly.
+         */
+        eval_king_safety(b, (Color)c, &c_mg, &c_eg);
 
         mg += sign * c_mg;
         eg += sign * c_eg;
@@ -575,9 +732,8 @@ int evaluate(const Board *b) {
     int score = taper(mg, eg, phase);
 
     /*
-     * Tempo bonus [NEW]:
-     * The side to move gets a small bonus in both MG and EG.
-     * Tapered here to blend naturally with the rest of the eval.
+     * Tempo bonus: the side to move gets a small bonus.
+     * Tapered to blend naturally with the rest of the eval.
      */
     score += taper(TEMPO_BONUS_MG, TEMPO_BONUS_EG, phase);
 

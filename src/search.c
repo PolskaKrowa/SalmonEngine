@@ -32,6 +32,16 @@
 #include <math.h>
 
 /* ──────────────────────────────────────────────
+ *  Previous-iteration root best move
+ *
+ *  Stored here (file scope) rather than in SearchInfo so that the
+ *  public header doesn't need touching.  Only one search runs at a
+ *  time, so a single static is safe.  Reset to NULL_MOVE at the
+ *  start of every search() call.
+ * ────────────────────────────────────────────── */
+static Move s_root_best_move = NULL_MOVE;
+
+/* ──────────────────────────────────────────────
  *  LMR reduction table  [depth][move_index]
  *  Filled once in search_init() using a log formula
  *  similar to Stockfish / Weiss.
@@ -241,13 +251,29 @@ int quiesce(Board *b, int alpha, int beta, int ply, SearchInfo *si) {
     si->nodes++;
     if (ply > si->seldepth) si->seldepth = ply;
 
-    /* Stand-pat */
+    bool in_chk = in_check(b);
+
+    /*
+     * Stand-pat: our lower bound assuming we can "do nothing".
+     * Not valid when in check — we must find a legal evasion.
+     */
     int stand_pat = evaluate(b);
-    if (stand_pat >= beta) return beta;
-    if (stand_pat > alpha) alpha = stand_pat;
+    if (!in_chk) {
+        if (stand_pat >= beta) return beta;
+        if (stand_pat > alpha) alpha = stand_pat;
+    }
 
     MoveList ml;
-    gen_captures(b, &ml);
+    /*
+     * When in check, generate ALL legal moves (evasions).
+     * A check in qsearch that has no evasion is checkmate;
+     * a stalemate (no legal move, not in check) is a draw.
+     * When not in check, generate captures only — the normal qsearch path.
+     */
+    if (in_chk)
+        gen_moves(b, &ml);
+    else
+        gen_captures(b, &ml);
 
     /* Score moves */
     int scores[MAX_MOVES];
@@ -262,29 +288,33 @@ int quiesce(Board *b, int alpha, int beta, int ply, SearchInfo *si) {
         scores[i] = score_move(b, ml.moves[i], NULL_MOVE,
                                 killers_ply, cm, hist_side);
 
+    int legal_count = 0;
+
     for (int i = 0; i < ml.count; i++) {
         Move m = pick_move(ml.moves, scores, ml.count, i);
 
-        /*
-         * SEE pruning in qsearch:
-         * Skip clearly losing captures (SEE < -50) to avoid wasting
-         * time on hopeless recaptures (e.g. QxP when guarded by pawn).
-         * Delta pruning: if even capturing the most valuable piece on the
-         * board can't raise alpha, skip.
-         */
-        if (scores[i] < 0)      /* negative SEE score */
-            break;              /* remaining moves have equal or worse SEE */
+        if (!in_chk) {
+            /*
+             * SEE pruning in qsearch (captures only path):
+             * Skip clearly losing captures (negative SEE score) and apply
+             * delta pruning.  Neither pruning applies when in check — we
+             * must search every evasion.
+             */
+            if (scores[i] < 0)      /* negative SEE score */
+                break;              /* remaining moves have equal or worse SEE */
 
-        /* Delta pruning: stand_pat + captured value + margin can't reach alpha */
-        int captured_val = (MOVE_TYPE(m) == MT_EP)
-                           ? SEE_VAL[PAWN]
-                           : (b->mailbox[MOVE_TO(m)] != NO_PIECE
-                              ? SEE_VAL[(int)piece_type(b->mailbox[MOVE_TO(m)])]
-                              : 0);
-        if (stand_pat + captured_val + 200 < alpha)
-            continue;
+            /* Delta pruning: stand_pat + captured value + margin can't reach alpha */
+            int captured_val = (MOVE_TYPE(m) == MT_EP)
+                               ? SEE_VAL[PAWN]
+                               : (b->mailbox[MOVE_TO(m)] != NO_PIECE
+                                  ? SEE_VAL[(int)piece_type(b->mailbox[MOVE_TO(m)])]
+                                  : 0);
+            if (stand_pat + captured_val + 200 < alpha)
+                continue;
+        }
 
         if (!is_legal(b, m)) continue;
+        legal_count++;
 
         si->move_stack[ply] = m;
         make_move(b, m);
@@ -295,6 +325,11 @@ int quiesce(Board *b, int alpha, int beta, int ply, SearchInfo *si) {
         if (score >= beta) return beta;
         if (score > alpha) alpha = score;
     }
+
+    /* In check with no legal evasion: checkmate */
+    if (in_chk && legal_count == 0)
+        return -MATE_SCORE + ply;
+
     return alpha;
 }
 
@@ -332,6 +367,16 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
             if (tte.flag == TT_UPPER && tt_score <= alpha) return tt_score;
         }
     }
+
+    /*
+     * Root move ordering: if the TT had no move (cold start or replacement
+     * collision), seed tt_move with the best move found in the previous
+     * iteration.  This guarantees the strongest known candidate is always
+     * searched first at the root, giving the ID framework a reliable anchor
+     * regardless of TT occupancy.
+     */
+    if (root && tt_move == NULL_MOVE && s_root_best_move != NULL_MOVE)
+        tt_move = s_root_best_move;
 
     /* ── Drop into quiescence ── */
     if (depth <= 0)
@@ -389,13 +434,25 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
      * Adaptive reduction R grows with depth and how far eval exceeds beta,
      * inspired by Stockfish / Weiss.  Skip if in check, PV node, zugzwang-
      * likely positions (only pawns + king), or we're already in a null move.
+     *
+     * Extra guards added:
+     *  • If the *opponent* also has only pawns + king, a pawn race or
+     *    blocked ending is likely — NMP is unreliable there too.
+     *  • At high depths (>= 12), a verification search confirms the cutoff
+     *    before we trust it, preventing tactical blunders caused by NMP.
      */
-    if (!pv && !in_chk && depth >= 3
-        && static_eval >= beta
-        && bb_popcount(b->occ[b->side]
-                       & ~b->pieces[b->side][PAWN]
-                       & ~b->pieces[b->side][KING]) > 0) {
+    bool do_nmp = !pv && !in_chk && depth >= 3
+               && static_eval >= beta
+               /* We must have at least one non-pawn/king piece */
+               && bb_popcount(b->occ[b->side]
+                              & ~b->pieces[b->side][PAWN]
+                              & ~b->pieces[b->side][KING]) > 0
+               /* Skip when opponent is pawn-only — zugzwang / pawn-race risk */
+               && bb_popcount(b->occ[b->side ^ 1]
+                              & ~b->pieces[b->side ^ 1][PAWN]
+                              & ~b->pieces[b->side ^ 1][KING]) > 0;
 
+    if (do_nmp) {
         int R = 3 + depth / 6
                   + (((static_eval - beta) / 200) < 3
                      ? (static_eval - beta) / 200 : 3);
@@ -408,9 +465,20 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
         if (null_score >= beta) {
             /* Don't return unverified mate scores */
             if (null_score >= MATE_SCORE - MAX_PLY) null_score = beta;
+
+            /*
+             * Verification search: at high depths, run a reduced search
+             * (same depth - R) with the real window to confirm the cutoff
+             * is genuine and not a horizon artefact.
+             */
+            if (depth >= 12) {
+                int verify = negamax(b, depth - R, beta - 1, beta, ply, si);
+                if (verify < beta) goto after_nmp; /* cutoff not confirmed */
+            }
             return null_score;
         }
     }
+    after_nmp:;
 
     /* ── Generate and score all moves ── */
     MoveList ml;
@@ -613,12 +681,14 @@ void search(Board *b, SearchLimits *lim) {
     Move best_move = NULL_MOVE;
     int  prev_score = 0;
 
+    /* Reset root-move seed for this search */
+    s_root_best_move = NULL_MOVE;
+
     for (int depth = 1; depth <= max_depth; depth++) {
         si.seldepth = 0;
         si.nodes    = 0;
-        memset(si.killers, 0, sizeof(si.killers));
-        /* Decay history between iterations to prevent stale values
-           dominating move ordering in the new iteration.            */
+        /* Keep killer moves across iterations so iterative deepening can
+           reuse the strongest refutations found so far. */
         if (depth > 1) decay_history(&si);
 
         int score;
@@ -669,6 +739,10 @@ void search(Board *b, SearchLimits *lim) {
         /* Retrieve best move from TT */
         TTEntry tte;
         if (tt_probe(b->hash, &tte) && tte.move) best_move = tte.move;
+
+        /* Carry the best move forward as the anchor for next iteration's
+         * root move ordering, in case the TT entry gets evicted.         */
+        if (best_move != NULL_MOVE) s_root_best_move = best_move;
 
         /* UCI info output */
         char mv_str[6];

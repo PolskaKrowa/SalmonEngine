@@ -6,7 +6,7 @@ A traditional chess engine built in C, designed to be **understandable, transpar
 
 - **Classical evaluation** - Transparent material and positional evaluation you can follow
 - **Efficient move generation** - Bitboard-based move generation for performance
-- **UCI protocol support** - Compatible with UCI chess GUIs (Arena, ChessBase, Lichess, etc.)
+- **UCI protocol support** - Compatible with UCI chess GUIs (Arena, ChessBase, [Lichess](https://lichess.org/@/SteveParker), etc.)
 - **Transposition table** - Hash-based caching for improved search efficiency
 - **No NNUE dependency** - Easy to build and understand; no machine learning complexity
 

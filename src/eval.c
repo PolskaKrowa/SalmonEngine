@@ -1,5 +1,5 @@
 /*
- * eval.c — Static evaluation (improved)
+ * eval.c — Static evaluation
  *
  * Scoring convention: always from the perspective of the side to move
  * (positive = good for side to move).
@@ -11,14 +11,14 @@
  *   • Pawn structure:
  *       – Doubled-pawn penalty
  *       – Isolated-pawn penalty
- *       – Backward-pawn penalty  [simplified: rank-loop behind-span]
+ *       – Backward-pawn penalty
  *       – Passed-pawn bonus
- *   • Outpost squares for knights and bishops  [simplified: per-piece front-span]
+ *   • Outpost squares for knights and bishops
  *   • King safety:
  *       – Pawn shield bonus
  *       – Open-file penalty near king
- *       – Distance-weighted enemy-piece attack count  [improved from flat weight]
- *       – Endgame king-activity term (king-to-king proximity bonus)  [new]
+ *       – Distance-weighted enemy-piece attack count
+ *       – Endgame king-activity term (king-to-king proximity bonus)
  *   • Bishop pair bonus
  *   • Rook on open / semi-open file bonus
  *   • Rook on seventh rank bonus
@@ -484,12 +484,7 @@ static void eval_rooks(const Board *b, Color us, int *mg, int *eg) {
 /*
  * eval_outposts — Clean per-piece front-span / attack-mask approach.
  *
- * OLD approach: precomputed enemy_pawn_attack_span by looping over every
- * enemy pawn and filling whole ranks ahead of it on adjacent files.  This
- * was an over-approximation (it could flag squares unreachable due to
- * blockades) and the fill direction was easy to mis-index.
- *
- * NEW approach: for each candidate piece check directly:
+ * for each candidate piece check directly:
  *   1. Is the square in the outpost rank range (ranks 4–6 from our side)?
  *   2. Is it pawn-supported?  A friendly pawn attacks this square when
  *      PAWN_ATTACKS[them][sq] & our_pawns is non-zero (by symmetry of

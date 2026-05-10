@@ -1,5 +1,5 @@
 /*
- * search.c — Move searching (improved)
+ * search.c — Move searching
  *
  * Architecture:
  *  • Iterative deepening (ID) driver in search()

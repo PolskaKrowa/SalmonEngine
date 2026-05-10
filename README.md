@@ -1,6 +1,6 @@
 # SalmonEngine
 
-A traditional chess engine built in C, designed to be **understandable, transparent, and easy to learn from**. No neural networks, no black boxes—just pure chess logic you can understand and modify.
+A traditional chess engine built in C, designed to be **understandable, transparent, and easy to learn from**. No neural networks, no black boxes, no "Unified Theory of Slightly Better Bishops heuristic" bullsh\*\*tery. Just pure chess logic you can understand and modify without being a chess GM.
 
 ## Features
 
@@ -21,13 +21,20 @@ src/
 ├── movegen.c       - Legal move generation
 ├── search.c        - Search algorithm (minimax/alpha-beta)
 ├── tt.c            - Transposition table (hash table)
+├── tune.c          - Texel-style multithreaded evaluation tuner
 └── uci.c           - UCI protocol implementation
 ```
 
 ## Building
 
+To build the engine binary:
 ```bash
 make -j$(nproc)
+```
+
+To build the tuner (Tuna) binary:
+```bash
+make tuner -j$(nproc)
 ```
 
 ## Usage

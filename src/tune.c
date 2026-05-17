@@ -581,7 +581,7 @@ void tune_self_play_loop(int iterations, int games_per_iter, int search_depth) {
         
         /* Save progress checkpoint */
         printf("[Master] Checkpointing weights...\n");
-        /* save_weights(&w, "tuned_weights_checkpoint.c"); */
+        save_weights(&w, "tuned_weights_checkpoint.c");
     }
 }
 

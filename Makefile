@@ -109,6 +109,15 @@ $(BIN_DIR)/tuna: $(TUNER_OBJS) | $(BIN_DIR)
 	$(CC) $(LDFLAGS) -o $@ $^
 	@echo "Built tuner: $@"
 
+tuner_debug: CFLAGS := $(CFLAGS_DEBUG) -DTUNE_STANDALONE
+tuner_debug: LDFLAGS := $(LDFLAGS_DEBUG)
+tuner_debug: TARGET  := $(BIN_DIR)/tuna_debug
+tuner_debug: $(BIN_DIR)/tuna_debug
+
+$(BIN_DIR)/tuna_debug: $(TUNER_SRCS) | $(BIN_DIR)
+	$(CC) $(CFLAGS_DEBUG) -DTUNE_STANDALONE $(LDFLAGS_DEBUG) -o $@ $^
+	@echo "Built debug tuna: $@"
+
 # Create directories
 $(BIN_DIR) $(OBJ_DIR):
 	mkdir -p $@

@@ -897,10 +897,12 @@ int evaluate_w(const Board *b, const EvalWeights *w) {
  * ══════════════════════════════════════════════════════════════════════ */
 #define INF 30000
 
-static int qsearch_w(Board *b, int alpha, int beta, const EvalWeights *w) {
+static int qsearch_w(Board *b, int alpha, int beta, const EvalWeights *w, int depth) {
     int stand_pat = evaluate_w(b, w);
     if (stand_pat >= beta) return beta;
     if (stand_pat > alpha) alpha = stand_pat;
+
+    if (depth <= 0) return alpha;  /* hard cap — no more captures */
 
     MoveList ml;
     gen_captures(b, &ml);
@@ -911,7 +913,7 @@ static int qsearch_w(Board *b, int alpha, int beta, const EvalWeights *w) {
         if (!is_legal(b, m)) continue;
 
         make_move(b, m);
-        int score = -qsearch_w(b, -beta, -alpha, w);
+        int score = -qsearch_w(b, -beta, -alpha, w, depth - 1);
         unmake_move(b);
 
         if (score >= beta) return beta;
@@ -921,7 +923,7 @@ static int qsearch_w(Board *b, int alpha, int beta, const EvalWeights *w) {
 }
 
 static int alphabeta_w(Board *b, int depth, int alpha, int beta, const EvalWeights *w, Move *best_move) {
-    if (depth == 0) return qsearch_w(b, alpha, beta, w);
+    if (depth == 0) return qsearch_w(b, alpha, beta, w, 8); /* cap captures at 8 plies */
 
     MoveList ml;
     gen_moves(b, &ml);
@@ -999,7 +1001,8 @@ static void play_game(const EvalWeights *w, PosDataset *ds, int search_depth,
     Board b;
     board_start_pos(&b);
     
-    Board game_history[500];
+    Board *game_history = malloc(500 * sizeof(Board));
+    if (!game_history) return;
     int ply = 0;
 
     /* Randomize first 4 plies to ensure opening variety (Temperature) */
@@ -1011,7 +1014,7 @@ static void play_game(const EvalWeights *w, PosDataset *ds, int search_depth,
         for (int j = 0; j < ml.count; j++) {
             if (is_legal(&b, ml.moves[j])) legal_moves[l_count++] = j;
         }
-        if (l_count == 0) return;
+        if (l_count == 0) { free(game_history); return; }
         make_move(&b, ml.moves[legal_moves[tune_rand(seed) % l_count]]);
     }
 
@@ -1045,6 +1048,7 @@ static void play_game(const EvalWeights *w, PosDataset *ds, int search_depth,
         ds->positions[ds->count].result = game_result;
         ds->count++;
     }
+    free(game_history);
 }
 
 /* ── Parallel self-play ──────────────────────────────────────────────── */
@@ -1090,14 +1094,19 @@ void self_play_worker(const EvalWeights *w, int num_games, int depth, PosDataset
     int base  = num_games / nthreads;
     int extra = num_games % nthreads;
 
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 64 * 1024 * 1024); /* 64 MB — qsearch can recurse deep */
+
     for (int t = 0; t < nthreads; t++) {
         ctxs[t].w         = w;
         ctxs[t].num_games = base + (t < extra ? 1 : 0);
         ctxs[t].depth     = depth;
         ctxs[t].seed      = (unsigned int)(time(NULL) ^ (unsigned int)(t * 2654435761u));
         ctxs[t].out_ds    = NULL;
-        pthread_create(&threads[t], NULL, self_play_thread_fn, &ctxs[t]);
+        pthread_create(&threads[t], &attr, self_play_thread_fn, &ctxs[t]);
     }
+    pthread_attr_destroy(&attr);
 
     /* Join threads and merge their private datasets into *ds */
     for (int t = 0; t < nthreads; t++) {

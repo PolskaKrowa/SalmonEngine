@@ -27,7 +27,7 @@
 
 /* ── Threading ───────────────────────────────────────────────────────── */
 #define MAX_TUNE_THREADS 128
-static int g_num_threads = 12;
+static int g_num_threads = 1;
 
 /* Portable, re-entrant replacement for rand_r().
  * Each thread keeps its own seed — no shared state, no locks needed.
@@ -1384,10 +1384,10 @@ int main(int argc, char **argv) {
     bitboard_init();
     board_init();
 
-    int rl_iters      = 50;  /* optimiser sweeps per RL iteration           */
-    int games_per_iter = 100; /* scale up heavily for distributed runs       */
-    int depth          = 3;  /* keep low for throughput; rely on eval quality */
-    int num_threads    = 1;  /* default: single-threaded                     */
+    int rl_iters      = 50;   /* optimiser sweeps per RL iteration             */
+    int games_per_iter = 100; /* scale up heavily for distributed runs         */
+    int depth          = 3;   /* keep low for throughput; rely on eval quality */
+    int num_threads    = 12;  /* default: 12 threads                           */
 
     /* Optional positional args: [num_threads] [games_per_iter] [rl_iters] [depth] */
     if (argc > 1) num_threads    = atoi(argv[1]);

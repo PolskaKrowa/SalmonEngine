@@ -1378,7 +1378,7 @@ void tune_self_play_loop(int iterations, int games_per_iter, int search_depth, i
         /* Step 2: Optimization Phase 
          * In a distributed setup, workers would upload .epd files, and this 
          * process would aggregate them before calling optimize_dataset */
-        optimize_dataset(&w, ds, 10); /* Max 10 coordinate descent sweeps per RL iteration */
+        optimize_dataset(&w, ds, 50); /* Max 50 coordinate descent sweeps per RL iteration */
 
         free_dataset(ds);
         

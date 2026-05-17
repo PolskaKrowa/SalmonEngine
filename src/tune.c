@@ -1510,10 +1510,12 @@ void optimize_dataset(EvalWeights *w, PosDataset *ds, int max_iters) {
             }
         }
  
-        printf("[Optimizer] Iter %d: MSE=%.8f (Improved %d params)\n",
+        printf("[Optimizer] Iter %d: MSE=%.8f (Improved %d params)     \r",
                iter + 1, best_err, improved);
+        fflush(stdout);
         if (improved == 0) break;
     }
+    printf("\n");
 }
 
 /* ══════════════════════════════════════════════════════════════════════

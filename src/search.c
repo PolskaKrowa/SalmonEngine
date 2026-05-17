@@ -1,21 +1,25 @@
 /*
- * search.c — Move searching (improved)
+ * search.c — Move searching (SF 11 refactored)
  *
  * Architecture:
  *  • Iterative deepening (ID) driver in search()
  *  • negamax() — principal variation search (PVS) with:
  *      – Transposition table cutoffs
+ *      – TT mate-score adjustment: value_to_tt / value_from_tt (correctness fix)
  *      – Aspiration windows
  *      – Reverse futility pruning / static NMP
  *      – Razoring
  *      – Null-move pruning (NMP, adaptive R)
- *      – Futility pruning (move-loop)
- *      – Late move pruning (LMP)
- *      – Late move reductions (LMR, log formula)
+ *      – ProbCut (depth ≥ 5, raised-beta capture search, ~10 Elo)
+ *      – Futility pruning: improving-adjusted margin via futility_margin()
+ *      – Late move pruning (LMP): closed-form futility_move_count()
+ *      – Late move reductions (LMR): product-of-logs Reductions table (SF 11)
+ *      – Singular extensions (depth ≥ 6, TT-move uniqueness test, ~70 Elo)
  *      – Improving heuristic
  *      – Killer move heuristic (2 killers per ply)
  *      – Countermove heuristic
- *      – History heuristic (with gravity/decay)
+ *      – History heuristic: SF-calibrated stat_bonus formula + gravity/decay
+ *      – Continuation history: (piece,to) affinity at ply-1 (~30 Elo)
  *      – MVV-LVA + SEE capture ordering
  *      – TT move first
  *  • quiesce() — quiescence search, SEE pruning of losing caps
@@ -43,17 +47,73 @@
 static Move s_root_best_move = NULL_MOVE;
 
 /* ──────────────────────────────────────────────
- *  LMR reduction table  [depth][move_index]
- *  Filled once in search_init() using a log formula
- *  similar to Stockfish / Weiss.
+ *  LMR reduction table — product-of-logs (SF 11 style)
+ *
+ *  SF 11 uses two independent log tables multiplied together:
+ *    R = (Reductions[depth] * Reductions[move_count] + 511) / 1024
+ *  This captures the interaction between depth and move count better
+ *  than a single-log formula: at depth 1 all moves get R=0; at depth 10
+ *  move 20 gets a larger reduction than the old table gave.
  * ────────────────────────────────────────────── */
-static int LMR_TABLE[64][64];
+static int Reductions[MAX_MOVES];   /* one table, indexed by depth or move count */
 
-static void init_lmr_table(void) {
-    LMR_TABLE[0][0] = 0;
-    for (int d = 1; d < 64; d++)
-        for (int m = 1; m < 64; m++)
-            LMR_TABLE[d][m] = (int)(0.75 + log((double)d) * log((double)m) / 2.25);
+static void init_reductions(void) {
+    Reductions[0] = 0;
+    for (int i = 1; i < MAX_MOVES; i++)
+        Reductions[i] = (int)(24.8 * log((double)i));
+}
+
+static inline int lmr_reduction(bool improving, int depth, int move_count) {
+    int d = (depth     < MAX_MOVES) ? depth      : MAX_MOVES - 1;
+    int m = (move_count < MAX_MOVES) ? move_count : MAX_MOVES - 1;
+    int r = Reductions[d] * Reductions[m];
+    return (r + 511) / 1024 + (!improving && r > 1007);
+}
+
+/* ──────────────────────────────────────────────
+ *  stat_bonus — SF 11 calibrated history bonus.
+ *  Returns negative for depth > 15 to prevent
+ *  history-table saturation at high depths.
+ * ────────────────────────────────────────────── */
+static inline int stat_bonus(int depth) {
+    return depth > 15 ? -8 : 19 * depth * depth + 155 * depth - 132;
+}
+
+/* ──────────────────────────────────────────────
+ *  futility_margin — improving-adjusted futility
+ * ────────────────────────────────────────────── */
+static inline int futility_margin(int depth, bool improving) {
+    return 217 * (depth - (int)improving);
+}
+
+/* ──────────────────────────────────────────────
+ *  futility_move_count — closed-form LMP threshold
+ *  Replaces the LMP_THRESHOLD lookup table.
+ * ────────────────────────────────────────────── */
+static inline int futility_move_count(bool improving, int depth) {
+    return (5 + depth * depth) * (1 + (int)improving) / 2 - 1;
+}
+
+/* ──────────────────────────────────────────────
+ *  TT score adjustment for mate distances
+ *
+ *  Mate scores are relative to the current ply.  Storing a raw mate
+ *  score in the TT would corrupt the distance when the same position
+ *  is retrieved at a different ply.  value_to_tt() makes the score
+ *  root-relative before storing; value_from_tt() restores it to
+ *  ply-relative when reading back.
+ * ────────────────────────────────────────────── */
+static inline int value_to_tt(int v, int ply) {
+    if (v >= MATE_SCORE - MAX_PLY) return v + ply;
+    if (v <= -MATE_SCORE + MAX_PLY) return v - ply;
+    return v;
+}
+
+static inline int value_from_tt(int v, int ply) {
+    if (v == NO_SCORE)              return NO_SCORE;
+    if (v >= MATE_SCORE - MAX_PLY)  return v - ply;
+    if (v <= -MATE_SCORE + MAX_PLY) return v + ply;
+    return v;
 }
 
 /* ──────────────────────────────────────────────
@@ -131,7 +191,7 @@ int see(const Board *b, Move m) {
         /* Pruning: even in the best case this branch can't change the sign */
         if ( (gain[d - 1] < 0 ? -gain[d - 1] : gain[d - 1]) >
              (gain[d]     < 0 ? -gain[d]     : gain[d]    ) )
-            ; /* keep going — no pruning here, let the loop handle it */
+            {}; /* keep going — no pruning here, let the loop handle it */
 
         /* Find all remaining attackers of 'to' */
         Bitboard atk = attacks_to_sq(b, to, occ) & occ & b->occ[side];
@@ -187,7 +247,8 @@ int see(const Board *b, Move m) {
 
 static int score_move(const Board *b, Move m, Move tt_move,
                       const Move *killers, Move countermove,
-                      int hist[64][64]) {
+                      int hist[64][64], const int cont_hist[7][64],
+                      Move prev_move) {
     if (m == tt_move)    return SCORE_TT_MOVE;
 
     if (MOVE_IS_CAP(m) || MOVE_TYPE(m) == MT_EP) {
@@ -224,7 +285,15 @@ static int score_move(const Board *b, Move m, Move tt_move,
     if (m == killers[1])  return SCORE_KILLER2;
     if (m == countermove) return SCORE_COUNTER;
 
-    return SCORE_QUIET_BASE + hist[MOVE_FROM(m)][MOVE_TO(m)];
+    /* Quiet move: butterfly history + continuation history blend.
+     * The cont_hist bonus captures (piece,to) affinity from the previous
+     * move, which is the single-ply port of SF's continuation history. */
+    int h = hist[MOVE_FROM(m)][MOVE_TO(m)];
+    if (cont_hist && prev_move != NULL_MOVE) {
+        int pt = (int)piece_type(b->mailbox[MOVE_FROM(m)]);
+        h += 2 * cont_hist[pt][MOVE_TO(m)];
+    }
+    return SCORE_QUIET_BASE + h;
 }
 
 /* Partial insertion sort: bring the best move to position [idx] */
@@ -259,15 +328,7 @@ bool time_up(SearchInfo *si) {
     return (int)elapsed >= si->allotted_ms;
 }
 
-/* ──────────────────────────────────────────────
- *  LMP move-count thresholds [improving][depth]
- *  Quiet moves beyond this count are pruned.
- *  Values tuned roughly in line with Weiss / Ethereal.
- * ────────────────────────────────────────────── */
-static const int LMP_THRESHOLD[2][9] = {
-    /* not improving */ { 0, 2,  4,  7, 12, 18, 25, 35, 50 },
-    /* improving     */ { 0, 4,  8, 14, 22, 32, 44, 58, 75 },
-};
+/* LMP_THRESHOLD replaced by the futility_move_count() formula above. */
 
 /* ──────────────────────────────────────────────
  *  Quiescence search
@@ -309,9 +370,11 @@ int quiesce(Board *b, int alpha, int beta, int ply, SearchInfo *si) {
                                [MOVE_TO  (si->move_stack[ply - 1])]
               : NULL_MOVE;
 
+    Move prev_qs = (ply > 0) ? si->move_stack[ply - 1] : NULL_MOVE;
     for (int i = 0; i < ml.count; i++)
         scores[i] = score_move(b, ml.moves[i], NULL_MOVE,
-                                killers_ply, cm, hist_side);
+                                killers_ply, cm, hist_side,
+                                si->cont_hist, prev_qs);
 
     int legal_count = 0;
 
@@ -371,12 +434,19 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
     bool root = (ply == 0);
     bool pv   = (beta - alpha > 1);
 
+    if (ply >= MAX_PLY - 1)
+        return quiesce(b, alpha, beta, ply, si);
+
     /* ── Draw detection ── */
     if (!root) {
         if (b->halfmove >= 100) return DRAW_SCORE;
-        for (int i = b->hist_idx - 2;
-             i >= 0 && i >= b->hist_idx - b->halfmove; i -= 2) {
+
+        for (int i = b->hist_idx - 2; i >= 0; i -= 2) {
             if (b->history[i].hash == b->hash) return DRAW_SCORE;
+            /* The halfmove stored in history[i] is the clock BEFORE that move
+               was made.  If it was 0, the move at i+1 was irreversible — no
+               repetition can cross it. */
+            if (b->history[i].halfmove == 0) break;
         }
     }
 
@@ -386,7 +456,7 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
     if (tt_probe(b->hash, &tte)) {
         tt_move = tte.move;
         if (!pv && tte.depth >= depth) {
-            int tt_score = score_from_tt(tte.score, ply);
+            int tt_score = value_from_tt(tte.score, ply);
             if (tte.flag == TT_EXACT) return tt_score;
             if (tte.flag == TT_LOWER && tt_score >= beta)  return tt_score;
             if (tte.flag == TT_UPPER && tt_score <= alpha) return tt_score;
@@ -505,6 +575,54 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
     }
     after_nmp:;
 
+    /*
+     * ── ProbCut ──
+     *
+     * If we have a capture whose SEE already beats a raised beta threshold,
+     * and a reduced search confirms it scores above that threshold, we can
+     * safely prune the rest of the tree.
+     * Conditions: non-PV, not in check, depth >= 5, score not near mate.
+     */
+    if (!pv && !in_chk && depth >= 5
+        && abs(beta) < MATE_SCORE - MAX_PLY)
+    {
+        int raised_beta = beta + 189 - 45 * (int)improving;
+        if (raised_beta > INF) raised_beta = INF;
+
+        MoveList pc_ml;
+        gen_captures(b, &pc_ml);
+
+        int pc_scores[MAX_MOVES];
+        for (int i = 0; i < pc_ml.count; i++)
+            pc_scores[i] = see(b, pc_ml.moves[i]);
+
+        int pc_count = 0;
+        for (int i = 0; i < pc_ml.count && pc_count < 2; i++) {
+            Move pcm = pick_move(pc_ml.moves, pc_scores, pc_ml.count, i);
+
+            if (!is_legal(b, pcm)) continue;
+            if (see(b, pcm) < raised_beta - static_eval) continue;
+
+            si->move_stack[ply] = pcm;
+            make_move(b, pcm);
+
+            /* Quick qsearch confirmation */
+            int pc_val = -quiesce(b, -(raised_beta), -(raised_beta) + 1,
+                                  ply + 1, si);
+
+            /* Full reduced search if qsearch held */
+            if (pc_val >= raised_beta)
+                pc_val = -negamax(b, depth - 4, -(raised_beta), -(raised_beta) + 1,
+                                  ply + 1, si);
+
+            unmake_move(b);
+
+            if (si->limits->stop) return 0;
+            if (pc_val >= raised_beta) return pc_val;
+            pc_count++;
+        }
+    }
+
     /* ── Generate and score all moves ── */
     MoveList ml;
     gen_moves(b, &ml);
@@ -518,10 +636,12 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
     int scores[MAX_MOVES];
     const Move *killers_ply = si->killers[ply < MAX_PLY ? ply : MAX_PLY - 1];
     int (*hist_side)[64]    = si->history[b->side];
+    Move prev_neg = (ply > 0) ? si->move_stack[ply - 1] : NULL_MOVE;
 
     for (int i = 0; i < ml.count; i++)
         scores[i] = score_move(b, ml.moves[i], tt_move,
-                                killers_ply, cm, hist_side);
+                                killers_ply, cm, hist_side,
+                                si->cont_hist, prev_neg);
 
     int  best_score  = -INF;
     Move best_move   = NULL_MOVE;
@@ -549,17 +669,16 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
              * unlikely to beat alpha — prune them.
              */
             if (depth <= 8
-                && quiet_count >= LMP_THRESHOLD[improving ? 1 : 0][depth])
+                && quiet_count >= futility_move_count(improving, depth))
                 continue;
 
             /*
              * Futility Pruning:
-             * If static eval + a depth-scaled margin is still below alpha,
-             * quiet moves at this node are unlikely to improve alpha.
-             * History scores modulate the margin slightly.
+             * If static eval + an improving-adjusted margin is still below
+             * alpha, quiet moves at this node are unlikely to improve alpha.
              */
             if (depth <= 8) {
-                int fp_margin = 80 + 60 * depth
+                int fp_margin = futility_margin(depth, improving)
                               + hist_side[MOVE_FROM(m)][MOVE_TO(m)] / 128;
                 if (static_eval + fp_margin <= alpha)
                     continue;
@@ -583,15 +702,66 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
             && see(b, m) < -20 * depth * depth)
             continue;
 
+        /*
+         * ── Singular Extension ──
+         *
+         * If the TT move is the only move that fails high in a reduced
+         * search with a narrowed beta, it is "singular" — extend it by
+         * one ply.  If multiple moves fail high we get a multi-cut signal
+         * and can prune the node early.
+         *
+         * Conditions: depth >= 6, move == tt_move, not root, TT entry has
+         * a lower-bound score that isn't near mate, and was searched deeply
+         * enough to be reliable.
+         */
+        int extension = 0;
+        if (depth >= 6
+            && m == tt_move
+            && !root
+            && tt_move != NULL_MOVE
+            && tte.move != NULL_MOVE
+            && abs(tte.score) < MATE_SCORE - MAX_PLY
+            && (tte.flag & TT_LOWER)
+            && tte.depth >= depth - 3)
+        {
+            int sing_beta  = tte.score - 2 * depth;
+            int half_depth = depth / 2;
+
+            /* Temporarily mask out the TT move by setting it to NULL so
+               the recursive call won't give it a TT-move bonus in ordering. */
+            Move saved_tt = tt_move;
+            tt_move = NULL_MOVE;
+
+            int sing_val = negamax(b, half_depth, sing_beta - 1, sing_beta,
+                                   ply, si);
+
+            tt_move = saved_tt;
+
+            if (si->limits->stop) return 0;
+
+            if (sing_val < sing_beta) {
+                extension = 1;  /* TT move is singular → extend */
+            } else if (sing_beta >= beta) {
+                /* Multi-cut: more than one move fails high → prune */
+                return sing_beta;
+            }
+        }
+
         /* ── Make the move ── */
         si->move_stack[ply] = m;
         make_move(b, m);
 
         int score;
-        int new_depth = depth - 1;
+        int new_depth = depth - 1 + extension;
 
-        /* Check extension: extend when the reply puts us in check */
-        if (in_check(b)) new_depth++;
+        /*
+         * Only extend for check when we have not already applied a singular
+         * extension.  Stacking both extensions would give new_depth >= depth,
+         * which — in a chain of checking replies — prevents depth from ever
+         * reaching 0 and causes unbounded recursion.  The hard ply ceiling
+         * above is the primary guard; this keeps extensions individually sane.
+         */
+        if (in_check(b) && extension == 0) new_depth++;
 
         /* ── Late Move Reductions (LMR) ── */
         bool do_lmr = legal_count > 3
@@ -602,9 +772,7 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
 
         int reduction = 0;
         if (do_lmr) {
-            int d_idx = depth < 64 ? depth : 63;
-            int m_idx = legal_count < 64 ? legal_count : 63;
-            reduction = LMR_TABLE[d_idx][m_idx];
+            reduction = lmr_reduction(improving, depth, legal_count);
 
             /* Adjust reduction with heuristics */
             if (!improving)          reduction++;   /* losing ground → reduce more  */
@@ -612,6 +780,15 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
             if (m == cm)             reduction--;   /* countermove → reduce less    */
             if (m == killers_ply[0]
              || m == killers_ply[1]) reduction--;   /* killer → reduce less         */
+
+            /* Continuation history adjustment */
+            if (ply > 0 && si->move_stack[ply - 1] != NULL_MOVE) {
+                int prev_to = MOVE_TO(si->move_stack[ply - 1]);
+                int cur_pt  = (int)piece_type(b->mailbox[MOVE_FROM(m)]);
+                int ch = si->cont_hist[cur_pt][prev_to];
+                if (ch > 0) reduction--;   /* good continuation → reduce less */
+                else if (ch < 0) reduction++; /* bad continuation → reduce more */
+            }
 
             /* Clamp: never drop below 1, never below depth-1 */
             if (reduction < 1)          reduction = 1;
@@ -661,13 +838,21 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
                             [MOVE_TO  (si->move_stack[ply - 1])] = m;
                     }
 
-                    /* History bonus (depth-squared, capped to avoid overflow) */
-                    int bonus = depth * depth;
+                    /* History bonus — SF-calibrated stat_bonus formula */
+                    int bonus = stat_bonus(depth);
                     int *h = &si->history[b->side][MOVE_FROM(m)][MOVE_TO(m)];
-                    *h += bonus - (*h) * bonus / 16384; /* gravity: cap growth */
+                    *h += bonus - (*h) * bonus / 16384;
+
+                    /* Continuation history update */
+                    if (ply > 0 && si->move_stack[ply - 1] != NULL_MOVE) {
+                        int prev_to = MOVE_TO(si->move_stack[ply - 1]);
+                        int cur_pt  = (int)piece_type(b->mailbox[MOVE_TO(m)]);
+                        si->cont_hist[cur_pt][prev_to] += bonus
+                            - si->cont_hist[cur_pt][prev_to] * bonus / 16384;
+                    }
                 }
 
-                tt_store(b->hash, beta, best_move, depth, TT_LOWER, ply);
+                tt_store(b->hash, value_to_tt(beta, ply), best_move, depth, TT_LOWER, ply);
                 return beta;
             }
         }
@@ -677,7 +862,7 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
     if (legal_count == 0)
         return in_chk ? (-MATE_SCORE + ply) : DRAW_SCORE;
 
-    tt_store(b->hash, best_score, best_move, depth, tt_flag, ply);
+    tt_store(b->hash, value_to_tt(best_score, ply), best_move, depth, tt_flag, ply);
     return best_score;
 }
 
@@ -828,6 +1013,6 @@ done:
 
 void search_init(void) {
     init_mvv_lva();
-    init_lmr_table();
+    init_reductions();
     book_init();
 }

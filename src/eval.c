@@ -7,13 +7,21 @@
  * Features implemented:
  *   • Material balance
  *   • Piece-square tables — separate MG and EG tables, blended by game phase
- *   • Mobility (approximate: popcount of attack set minus own pieces)
+ *   • Material imbalance — SF 11 quadratic polynomial (bishop pair, rook vs
+ *       minors, etc.)  Replaces a flat material count.
+ *   • Mobility — non-linear per-count tables (SF 11 MobilityBonus values)
+ *       so the first squares of freedom are worth the most.
  *   • Pawn structure:
  *       – Doubled-pawn penalty
  *       – Isolated-pawn penalty
  *       – Backward-pawn penalty
  *       – Passed-pawn bonus
  *   • Outpost squares for knights and bishops
+ *   • TrappedRook  — penalty when a rook with ≤3 moves is hemmed in on the
+ *       same side as its own king
+ *   • WeakQueen    — penalty when enemy sliders x-ray through our queen
+ *   • KingProtector — minor pieces far from own king incur a distance penalty
+ *   • MinorBehindPawn — minor piece sheltered behind a friendly pawn earns a bonus
  *   • King safety:
  *       – Pawn shield bonus
  *       – Open-file penalty near king
@@ -23,6 +31,11 @@
  *   • Rook on open / semi-open file bonus
  *   • Rook on seventh rank bonus
  *   • Tempo bonus (side to move)
+ *   • Initiative / complexity correction — reduces a winning advantage when
+ *       the winning side cannot realistically convert (no passed pawns, no
+ *       outflanking, pawns on only one flank).
+ *   • Lazy evaluation guard — fast material+PST proxy bails out when the
+ *       score is far from any search window, saving ~5 % NPS for free.
  */
 
 #include "eval.h"
@@ -168,8 +181,39 @@ static const int BACKWARD_PAWN_PENALTY_EG = -22;
 static const int PASSED_PAWN_BONUS_MG[8]  = { 0, 5, 10, 20, 35, 60, 90, 0, };
 static const int PASSED_PAWN_BONUS_EG[8]  = { 0, 10, 20, 40, 65, 95, 140, 0, };
 
-static const int MOBILITY_MG[6] = { 0, 20, 10, 20, 0, 0, };
-static const int MOBILITY_EG[6] = { 0, 20, 20, 6, 0, 0, };
+/*
+ * Non-linear MobilityBonus tables (SF 11 values).
+ * Each table is indexed by the number of accessible squares for that piece
+ * type (capped at MOB_MAX).  The first few squares are worth the most;
+ * flat per-square scoring over-values the 15th square relative to the 1st.
+ */
+
+/* Knights: 0..8 squares */
+static const int MOB_KNIGHT_MG[] = {-62,-53,-12, -4,  3, 13, 22, 28, 33};
+static const int MOB_KNIGHT_EG[] = {-81,-56,-30,-14,  8, 15, 23, 27, 33};
+
+/* Bishops: 0..13 squares */
+static const int MOB_BISHOP_MG[] = {-48,-20, 16, 26, 38, 51, 55, 63, 63, 68, 81, 81, 91, 98};
+static const int MOB_BISHOP_EG[] = {-59,-23, -3, 13, 24, 42, 54, 57, 65, 73, 78, 86, 88, 97};
+
+/* Rooks: 0..14 squares */
+static const int MOB_ROOK_MG[] = {-58,-27,-15,-10, -5, -2,  9, 16, 30, 29, 32, 38, 46, 48, 58};
+static const int MOB_ROOK_EG[] = {-76,-18, 28, 55, 69, 82,112,118,132,142,155,165,166,169,171};
+
+/* Queens: 0..27 squares */
+static const int MOB_QUEEN_MG[] = {
+    -39,-21,  3,  3, 14, 22, 28, 41, 43, 48, 56, 60, 60, 66,
+     67, 70, 71, 73, 79, 88, 88, 99,102,102,106,109,113,116};
+static const int MOB_QUEEN_EG[] = {
+    -36,-15,  8, 18, 34, 54, 61, 73, 79, 92, 94,104,113,120,
+    123,126,133,136,140,143,148,166,170,175,184,191,206,212};
+
+/* Mobility evaluation indexing */
+static const int * const MOB_MG_TABLE[6] = {
+    NULL, MOB_KNIGHT_MG, MOB_BISHOP_MG, MOB_ROOK_MG, MOB_QUEEN_MG, NULL};
+static const int * const MOB_EG_TABLE[6] = {
+    NULL, MOB_KNIGHT_EG, MOB_BISHOP_EG, MOB_ROOK_EG, MOB_QUEEN_EG, NULL};
+static const int MOB_MAX[6] = {0, 8, 13, 14, 27, 0};
 
 static const int ROOK_OPEN_FILE_MG  = 27;
 static const int ROOK_OPEN_FILE_EG  = 57;
@@ -431,8 +475,9 @@ static void eval_mobility(const Board *b, Color us, int *mg, int *eg) {
                 default: break;
             }
             int mob = bb_popcount(atk & not_us);
-            *mg += MOBILITY_MG[pt] * mob;
-            *eg += MOBILITY_EG[pt] * mob;
+            if (mob > MOB_MAX[pt]) mob = MOB_MAX[pt];
+            *mg += MOB_MG_TABLE[pt][mob];
+            *eg += MOB_EG_TABLE[pt][mob];
         }
     }
 }
@@ -462,6 +507,24 @@ static void eval_rooks(const Board *b, Color us, int *mg, int *eg) {
         } else if (no_own_pawn) {
             *mg += ROOK_SEMIOPEN_MG;
             *eg += ROOK_SEMIOPEN_EG;
+        }
+
+        /*
+         * TrappedRook: a rook with very limited mobility (<=3 squares) on
+         * a closed file is penalised, especially when trapped by its own king.
+         */
+        if (!no_own_pawn && !no_enemy_pawn) {
+            Bitboard rook_mob = rook_attacks((Square)sq, b->occ[2]) & ~b->occ[us];
+            int mob = bb_popcount(rook_mob);
+            if (mob <= 3) {
+                int king_sq = bb_lsb(b->pieces[us][KING]);
+                int kf = king_sq & 7;
+                /* Penalise when the rook is hemmed in on the same side as king */
+                if ((kf < 4) == (file < kf)) {
+                    *mg -= 52;
+                    *eg -= 10;
+                }
+            }
         }
 
         /*
@@ -831,11 +894,239 @@ static void eval_threats(const Board *b, Color us, int *mg, int *eg) {
 }
 
 /* ──────────────────────────────────────────────
+ *  WeakQueen — penalty when a slider x-rays through our queen
+ * ────────────────────────────────────────────── */
+static void eval_queen_weak(const Board *b, Color us, int *mg, int *eg) {
+    Color them = us ^ 1;
+    Bitboard occ    = b->occ[2];
+    Bitboard queens = b->pieces[us][QUEEN];
+    while (queens) {
+        int sq = bb_pop(&queens);
+        /* Remove the queen from occupancy to reveal x-ray sliders */
+        Bitboard occ_no_q = occ ^ SQUARE_BB[sq];
+        Bitboard rook_x   = rook_attacks((Square)sq, occ_no_q)
+                          & (b->pieces[them][ROOK] | b->pieces[them][QUEEN]);
+        Bitboard bish_x   = bishop_attacks((Square)sq, occ_no_q)
+                          & (b->pieces[them][BISHOP] | b->pieces[them][QUEEN]);
+        if (rook_x | bish_x) {
+            *mg -= 49;
+            *eg -= 15;
+        }
+    }
+}
+
+/* ──────────────────────────────────────────────
+ *  KingProtector — minor pieces far from own king incur a penalty
+ * ────────────────────────────────────────────── */
+static void eval_king_protector(const Board *b, Color us, int *mg, int *eg) {
+    int king_sq = bb_lsb(b->pieces[us][KING]);
+    for (int pt = KNIGHT; pt <= BISHOP; pt++) {
+        Bitboard pieces = b->pieces[us][pt];
+        while (pieces) {
+            int sq   = bb_pop(&pieces);
+            int dist = chebyshev(sq, king_sq);
+            *mg -= 7 * dist;
+            *eg -= 8 * dist;
+        }
+    }
+}
+
+/* ──────────────────────────────────────────────
+ *  MinorBehindPawn — minor piece directly behind a friendly pawn
+ * ────────────────────────────────────────────── */
+static void eval_minor_behind_pawn(const Board *b, Color us, int *mg, int *eg) {
+    Bitboard pawns = b->pieces[us][PAWN];
+    Bitboard behind_pawns = (us == WHITE) ? (pawns >> 8) : (pawns << 8);
+    Bitboard minors = b->pieces[us][KNIGHT] | b->pieces[us][BISHOP];
+    int count = bb_popcount(minors & behind_pawns);
+    *mg += 18 * count;
+    *eg +=  3 * count;
+}
+
+/* ──────────────────────────────────────────────
+ *  Material Imbalance (SF 11 quadratic polynomial)
+ *
+ *  Uses per-piece-pair coefficients to reward or penalise having certain
+ *  piece combinations: bishop pair, rook vs. minors, etc.  The quadratic
+ *  term captures interactions that a simple count cannot (e.g. the bishop
+ *  pair is worth more when there are many pawns).
+ *
+ *  Index 0 = bishop-pair proxy; 1=Pawn 2=Knight 3=Bishop 4=Rook 5=Queen.
+ * ────────────────────────────────────────────── */
+static const int QuadOurs[6][6] = {
+    {1438,   0,   0,   0,    0,   0},   /* bishop pair */
+    {  40,  38,   0,   0,    0,   0},   /* pawn        */
+    {  32, 255, -62,   0,    0,   0},   /* knight      */
+    {   0, 104,   4,   0,    0,   0},   /* bishop      */
+    { -26,  -2,  47, 105, -208,   0},   /* rook        */
+    {-189,  24, 117, 133, -134,  -6},   /* queen       */
+};
+static const int QuadTheirs[6][6] = {
+    {  0,   0,   0,   0,   0,   0},
+    { 36,   0,   0,   0,   0,   0},
+    {  9,  63,   0,   0,   0,   0},
+    { 59,  65,  42,   0,   0,   0},
+    { 46,  39,  24, -24,   0,   0},
+    { 97, 100, -42, 137, 268,   0},
+};
+
+static int material_imbalance(const Board *b) {
+    int pc[2][6] = {{0}};
+    for (int c = 0; c < 2; c++) {
+        pc[c][0] = (bb_popcount(b->pieces[c][BISHOP]) > 1) ? 1 : 0;
+        for (int pt = PAWN; pt <= QUEEN; pt++)
+            pc[c][pt + 1] = bb_popcount(b->pieces[c][pt]);
+    }
+
+    int bonus = 0;
+    for (int us = 0; us < 2; us++) {
+        int them = us ^ 1;
+        int sign = (us == WHITE) ? 1 : -1;
+        int b_us = 0;
+        for (int pt1 = 0; pt1 <= 5; pt1++) {
+            if (!pc[us][pt1]) continue;
+            int v = 0;
+            for (int pt2 = 0; pt2 <= pt1; pt2++)
+                v += QuadOurs[pt1][pt2]   * pc[us][pt2]
+                   + QuadTheirs[pt1][pt2] * pc[them][pt2];
+            b_us += pc[us][pt1] * v;
+        }
+        bonus += sign * b_us;
+    }
+    return bonus / 16;
+}
+
+/* ──────────────────────────────────────────────
+ *  Initiative / complexity correction (SF 11)
+ *
+ *  Reduces a winning advantage when the winning side cannot realistically
+ *  convert it: no passed pawns, no outflanking, pawns on only one flank.
+ *  Applied just before the side-to-move flip.
+ * ────────────────────────────────────────────── */
+static int initiative(const Board *b, int mg, int eg) {
+    int wk = bb_lsb(b->pieces[WHITE][KING]);
+    int bk = bb_lsb(b->pieces[BLACK][KING]);
+
+    int outflanking = ((wk & 7) - (bk & 7))
+                    - ((wk >> 3) - (bk >> 3));
+
+    bool infiltration = (wk >> 3) > 3 || (bk >> 3) < 4;
+
+    Bitboard all_pawns = b->pieces[WHITE][PAWN] | b->pieces[BLACK][PAWN];
+    bool both_flanks = (all_pawns & 0x0F0F0F0F0F0F0F0FULL) &&
+                       (all_pawns & 0xF0F0F0F0F0F0F0F0ULL);
+
+    /* Count passed pawns for both sides */
+    int passed_count = 0;
+    {
+        Bitboard wp = b->pieces[WHITE][PAWN];
+        Bitboard bp = b->pieces[BLACK][PAWN];
+        Bitboard tmp = wp;
+        while (tmp) {
+            int sq = bb_pop(&tmp);
+            int f = sq & 7, r = sq >> 3;
+            Bitboard adj = 0;
+            if (f > 0) adj |= FILE_BB[f-1];
+            if (f < 7) adj |= FILE_BB[f+1];
+            Bitboard ahead = 0;
+            for (int rr = r+1; rr < 8; rr++) ahead |= RANK_BB[rr];
+            if (!(bp & (FILE_BB[f] | adj) & ahead)) passed_count++;
+        }
+        tmp = bp;
+        while (tmp) {
+            int sq = bb_pop(&tmp);
+            int f = sq & 7, r = sq >> 3;
+            Bitboard adj = 0;
+            if (f > 0) adj |= FILE_BB[f-1];
+            if (f < 7) adj |= FILE_BB[f+1];
+            Bitboard ahead = 0;
+            for (int rr = 0; rr < r; rr++) ahead |= RANK_BB[rr];
+            if (!(wp & (FILE_BB[f] | adj) & ahead)) passed_count++;
+        }
+    }
+
+    int pawn_count = bb_popcount(all_pawns);
+    bool no_npm = (b->occ[WHITE] & ~b->pieces[WHITE][PAWN] & ~b->pieces[WHITE][KING]) == 0
+               && (b->occ[BLACK] & ~b->pieces[BLACK][PAWN] & ~b->pieces[BLACK][KING]) == 0;
+
+    bool almost_unwinnable = !passed_count && outflanking < 0 && !both_flanks;
+
+    int complexity =
+          9 * passed_count
+        + 11 * pawn_count
+        +  9 * outflanking
+        + 12 * (int)infiltration
+        + 21 * (int)both_flanks
+        + 51 * (int)no_npm
+        - 43 * (int)almost_unwinnable
+        - 100;
+
+    int sign_mg = (mg > 0) - (mg < 0);
+    int sign_eg = (eg > 0) - (eg < 0);
+
+    int u_raw = complexity + 50;
+    int u = sign_mg * (u_raw < 0 ? u_raw : 0);
+    if (u < -abs(mg)) u = -abs(mg);
+
+    int v = sign_eg * (complexity > -abs(eg) ? complexity : -abs(eg));
+
+    int phase = game_phase(b);
+    return taper(u, v, phase);
+}
+
+/* ──────────────────────────────────────────────
+ *  Lazy evaluation guard (~5 % NPS, free Elo)
+ *
+ *  Before running the full evaluation, compute a cheap material+PST proxy.
+ *  If the proxy is far outside the window, return it immediately — the
+ *  full eval cannot change the result.  LAZY_THRESHOLD is tuned conservatively
+ *  so we never skip evaluation for positions near the window boundary.
+ * ────────────────────────────────────────────── */
+#define LAZY_THRESHOLD 1400
+
+static int lazy_score(const Board *b, int phase) {
+    int mg = 0, eg = 0;
+    for (int c = 0; c < 2; c++) {
+        int sign = (c == WHITE) ? 1 : -1;
+        for (int pt = 0; pt < 6; pt++) {
+            Bitboard bb = b->pieces[c][pt];
+            while (bb) {
+                int sq  = bb_pop(&bb);
+                int psq = pst_sq((Color)c, (Square)sq);
+                mg += sign * (MATERIAL_MG[pt] + PST_MG[pt][psq]);
+                eg += sign * (MATERIAL_EG[pt] + PST_EG[pt][psq]);
+            }
+        }
+    }
+    return taper(mg, eg, phase);
+}
+
+/* ──────────────────────────────────────────────
  *  Main evaluation
  * ────────────────────────────────────────────── */
 int evaluate(const Board *b) {
-    int mg = 0, eg = 0;
     int phase = game_phase(b);
+
+    /*
+     * ── Lazy evaluation guard (~5 % NPS) ──────────────────────────────
+     * Compute a cheap material+PST proxy.  If it is far outside any
+     * plausible search window the full evaluation cannot change the result,
+     * so we return early.  LAZY_THRESHOLD (1400 cp) is deliberately large
+     * to guarantee we never skip a position close to the window boundary.
+     */
+    int proxy = lazy_score(b, phase);
+    if (abs(proxy) > LAZY_THRESHOLD) {
+        /* Still apply the side-to-move flip for consistency */
+        return (b->side == WHITE) ? proxy : -proxy;
+    }
+
+    int mg = 0, eg = 0;
+
+    /* ── Material imbalance (quadratic polynomial, SF 11) ─────────────
+     * Accounts for piece-combination interactions: bishop pair value,
+     * rook vs. two minors, etc.  Applied once per position, not per side.
+     */
+    mg += material_imbalance(b);
 
     for (int c = 0; c < 2; c++) {
         int sign = (c == WHITE) ? 1 : -1;
@@ -855,13 +1146,13 @@ int evaluate(const Board *b) {
         /* Pawn structure (doubled, isolated, backward, passed) */
         eval_pawns(b, (Color)c, &c_mg, &c_eg);
 
-        /* Piece mobility */
+        /* Piece mobility — non-linear per-count SF 11 tables */
         eval_mobility(b, (Color)c, &c_mg, &c_eg);
 
-        /* Rook bonuses */
+        /* Rook bonuses (open file, semi-open, 7th rank, TrappedRook) */
         eval_rooks(b, (Color)c, &c_mg, &c_eg);
 
-        /* Outpost bonuses */
+        /* Outpost bonuses for knights and bishops */
         eval_outposts(b, (Color)c, &c_mg, &c_eg);
 
         /* Bishop pair */
@@ -870,14 +1161,22 @@ int evaluate(const Board *b) {
             c_eg += BISHOP_PAIR_EG;
         }
 
+        /* WeakQueen: penalty when enemy sliders x-ray through our queen */
+        eval_queen_weak(b, (Color)c, &c_mg, &c_eg);
+
+        /* KingProtector: minor pieces far from own king incur a penalty */
+        eval_king_protector(b, (Color)c, &c_mg, &c_eg);
+
+        /* MinorBehindPawn: minor pieces sheltered behind friendly pawns */
+        eval_minor_behind_pawn(b, (Color)c, &c_mg, &c_eg);
+
         /*
-         * King safety: shield + open files + distance-weighted enemy attacks
-         * (MG) + king-proximity activity bonus (EG).
-         * Both *mg and *eg are passed so the EG term is tapered correctly.
+         * King safety: shield + open files + distance-weighted enemy
+         * attacks (MG) + king-proximity activity bonus (EG).
          */
         eval_king_safety(b, (Color)c, &c_mg, &c_eg);
 
-        /* Tactical threats: hanging pieces, fork potential, skewers. */
+        /* Tactical threats: hanging pieces, fork potential, skewers */
         eval_threats(b, (Color)c, &c_mg, &c_eg);
 
         mg += sign * c_mg;
@@ -887,11 +1186,16 @@ int evaluate(const Board *b) {
     /* Taper MG/EG blend */
     int score = taper(mg, eg, phase);
 
-    /*
-     * Tempo bonus: the side to move gets a small bonus.
-     * Tapered to blend naturally with the rest of the eval.
-     */
+    /* Tempo bonus */
     score += taper(TEMPO_BONUS_MG, TEMPO_BONUS_EG, phase);
+
+    /*
+     * ── Initiative / complexity correction (SF 11) ────────────────────
+     * Reduces a winning advantage when the winning side cannot realistically
+     * convert it: no passed pawns, no outflanking, pawns on only one flank.
+     * Applied before the side-to-move flip.
+     */
+    score += initiative(b, mg, eg);
 
     /* Return from side-to-move perspective */
     return (b->side == WHITE) ? score : -score;

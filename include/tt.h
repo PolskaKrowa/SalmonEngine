@@ -8,7 +8,7 @@
 #define TT_NONE  0
 #define TT_EXACT 1   /* exact score (PV node)          */
 #define TT_LOWER 2   /* lower bound (fail-high / cut)  */
-#define TT_UPPER 3   /* upper bound (fail-low / all)   */
+#define TT_UPPER 4   /* upper bound (fail-low / all)   */
 
 /* ──────────────────────────────────────────────
  *  Transposition table entry  (16 bytes)

@@ -34,7 +34,7 @@ TUNER_OBJS := $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(TUNER_SRCS))
 
 # ── Common flags ─────────────────────────────────────────────
 CFLAGS_COMMON := \
-    -std=c11 \
+    -std=c2x \
     -I$(INC_DIR) \
     -Wall -Wextra -Wpedantic \
     -Wshadow -Wconversion -Wno-unused-parameter

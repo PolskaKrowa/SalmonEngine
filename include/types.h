@@ -47,7 +47,7 @@ typedef enum {
     NO_PIECE = 12
 } Piece;
 
-static inline Color  piece_color(Piece p) { return (Color)(((p >> 2) & 1) | (p / 6)); }
+static inline Color  piece_color(Piece p) { return (Color)(p / 6); }
 static inline Color  piece_col(Piece p)   { return (Color)(p >= BP ? BLACK : WHITE); }
 static inline PieceType piece_type(Piece p) { return (PieceType)(p % 6); }
 static inline Piece  make_piece(Color c, PieceType pt) { return (Piece)(c * 6 + pt); }

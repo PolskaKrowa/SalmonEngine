@@ -199,6 +199,12 @@ void make_move(Board *b, Move m) {
     Square to   = MOVE_TO(m);
     MoveType mt = MOVE_TYPE(m);
 
+    if (b->hist_idx >= MAX_PLY) {
+        /* Should never reach here after the negamax ply ceiling is in place.
+           Silently clamp rather than crash so a bug report for the CPU manufacturer is still possible. */
+        b->hist_idx = MAX_PLY - 1;
+    }
+
     /* Save undo state */
     UndoInfo *u  = &b->history[b->hist_idx++];
     u->move      = m;

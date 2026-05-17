@@ -27,7 +27,7 @@
 
 /* ── Threading ───────────────────────────────────────────────────────── */
 #define MAX_TUNE_THREADS 128
-static int g_num_threads = 1;
+static int g_num_threads = 12;
 
 /* Portable, re-entrant replacement for rand_r().
  * Each thread keeps its own seed — no shared state, no locks needed.

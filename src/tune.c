@@ -29,6 +29,14 @@
 #define MAX_TUNE_THREADS 128
 static int g_num_threads = 1;
 
+/* Portable, re-entrant replacement for rand_r().
+ * Each thread keeps its own seed — no shared state, no locks needed.
+ * Returns a value in [0, 0x7fffffff]. */
+static inline int tune_rand(unsigned int *seed) {
+    *seed = *seed * 1664525u + 1013904223u;   /* Numerical Recipes LCG */
+    return (int)((*seed >> 1) & 0x7fffffff);
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  *  Default weights — must be kept in sync with eval.c.
  *  These are the values the engine ships with; tuning starts here.
@@ -984,7 +992,7 @@ void free_dataset(PosDataset* ds) {
  * ══════════════════════════════════════════════════════════════════════ */
 
 /* Plays one game and appends positions to the dataset.
- * seed is a per-thread rand_r() state — never share the same pointer
+ * seed is a per-thread tune_rand() state — never share the same pointer
  * between threads. */
 static void play_game(const EvalWeights *w, PosDataset *ds, int search_depth,
                       unsigned int *seed) {
@@ -1004,7 +1012,7 @@ static void play_game(const EvalWeights *w, PosDataset *ds, int search_depth,
             if (is_legal(&b, ml.moves[j])) legal_moves[l_count++] = j;
         }
         if (l_count == 0) return;
-        make_move(&b, ml.moves[legal_moves[rand_r(seed) % l_count]]);
+        make_move(&b, ml.moves[legal_moves[tune_rand(seed) % l_count]]);
     }
 
     /* Self-Play loop */

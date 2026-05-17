@@ -5,7 +5,7 @@
 /* Engine identity */
 #define ENGINE_NAME    "SalmonEngine"
 #define ENGINE_AUTHOR  "Steve"
-#define ENGINE_VERSION "1.1"
+#define ENGINE_VERSION "2.0"
 
 /*
  * Run the UCI command loop.

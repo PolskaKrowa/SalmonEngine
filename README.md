@@ -32,12 +32,13 @@ src/
 
 To build the engine binary:
 ```bash
+./configure
 make -j$(nproc)
-```
 
-To build the tuner (Tuna) binary:
-```bash
-make tuner -j$(nproc)
+# optionally run a quick smoke-test
+
+make perft
+
 ```
 
 ## Usage

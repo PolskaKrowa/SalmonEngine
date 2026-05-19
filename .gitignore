@@ -1,2 +1,16 @@
 bin/
 build/
+
+# autotools generated
+Makefile.in
+aclocal.m4
+autom4te.cache/
+compile
+config.guess
+config.h.in
+config.sub
+depcomp
+install-sh
+missing
+stamp-h1
+build-aux/

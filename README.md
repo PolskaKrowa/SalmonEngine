@@ -36,7 +36,6 @@ To build the engine binary:
 make -j$(nproc)
 
 # optionally run a quick smoke-test
-
 make perft
 
 ```

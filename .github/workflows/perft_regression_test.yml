@@ -21,6 +21,7 @@ jobs:
           local got=$(run_perft "$1" "$2")
           if [ "$got" != "$3" ]; then
             echo "FAIL: $1 depth $2 — expected $3, got $got"
+            exit 1
           fi
           echo "PASS: depth $2 = $got"
         }

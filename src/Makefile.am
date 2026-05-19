@@ -7,6 +7,7 @@ bin_PROGRAMS = engine
 engine_SOURCES = \
     bitboard.c \
     board.c \
+    book.c \
     eval.c \
     main.c \
     movegen.c \

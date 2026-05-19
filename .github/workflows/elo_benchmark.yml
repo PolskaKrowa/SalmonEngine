@@ -1,0 +1,49 @@
+name: Elo Benchmark
+
+on: [pull_request]
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0   # need full history to check out base branch
+
+    - name: install deps
+      run: |
+        sudo apt-get install -y autoconf automake autoconf-archive cutechess-cli
+
+    - name: build PR version
+      run: |
+        autoreconf --install && ./configure && make
+        cp src/engine engine-pr
+
+    - name: build base version
+      run: |
+        git checkout ${{ github.base_ref }}
+        autoreconf --install && ./configure && make
+        cp src/engine engine-base
+
+    - name: run match
+      run: |
+        cutechess-cli \
+          -engine cmd=./engine-pr name=PR \
+          -engine cmd=./engine-base name=Base \
+          -each proto=uci tc=10+0.1 \
+          -rounds 200 -concurrency 2 \
+          -pgnout results.pgn | tee match.txt
+
+    - name: post result as comment
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const result = fs.readFileSync('match.txt', 'utf8');
+          const elo = result.match(/Elo difference.*$/m)?.[0] ?? 'Could not parse Elo';
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `## Elo Benchmark\n\`\`\`\n${elo}\n\`\`\``
+          })

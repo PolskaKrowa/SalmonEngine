@@ -32,13 +32,16 @@ src/
 
 To build the engine binary:
 ```bash
-./configure
-make -j$(nproc)
+# you must have autoconf, automake and autoconf-archive installed.
+autoreconf --install     # creates the necessary configure files (you run this so that the repo stays clean)
+./configure              # generates a makefile and checks stuff from the system
+make -j$(nproc)          # compiles and links the source code into a `bin/engine` binary using multiple threads
 
 # optionally run a quick smoke-test
 make perft
-
 ```
+
+You can also install a pre-compiled binary that is provided in the Releases page. (after V2.1)
 
 ## Usage
 

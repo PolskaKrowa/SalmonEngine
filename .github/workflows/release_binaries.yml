@@ -1,0 +1,75 @@
+name: Release Binaries
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os:
+          - { name: ubuntu-latest,  id: linux,   pkg: apt  }
+          - { name: macos-latest,   id: macos,   pkg: brew }
+          - { name: macos-13,       id: macos,   pkg: brew }
+        arch:
+          - { id: x86_64,    cc_linux: gcc,                    cc_macos: clang, march: x86-64        }
+          - { id: x86_64_v3, cc_linux: gcc,                    cc_macos: clang, march: x86-64-v3     }  # AVX2
+          - { id: x86_64_v4, cc_linux: gcc,                    cc_macos: clang, march: x86-64-v4     }  # AVX-512
+          - { id: arm64,     cc_linux: aarch64-linux-gnu-gcc,  cc_macos: clang, march: armv8-a       }
+          - { id: arm32,     cc_linux: arm-linux-gnueabihf-gcc,cc_macos: clang, march: armv7-a       }
+
+        exclude:
+          # macOS can't cross-compile to ARM32
+          - os: { id: macos }
+            arch: { id: arm32 }
+          # macOS ARM runner (macos-latest) is already ARM — skip x86 cross
+          - os: { name: macos-latest }
+            arch: { id: x86_64 }
+          - os: { name: macos-latest }
+            arch: { id: x86_64_v3 }
+          - os: { name: macos-latest }
+            arch: { id: x86_64_v4 }
+          # macos-13 is Intel — skip ARM targets
+          - os: { name: macos-13 }
+            arch: { id: arm64 }
+          - os: { name: macos-13 }
+            arch: { id: arm32 }
+
+    runs-on: ${{ matrix.os.name }}
+    name: ${{ matrix.os.id }}-${{ matrix.arch.id }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: install dependencies (apt)
+      if: matrix.os.pkg == 'apt'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y autoconf automake autoconf-archive \
+          gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+
+    - name: install dependencies (brew)
+      if: matrix.os.pkg == 'brew'
+      run: brew install autoconf automake autoconf-archive
+
+    - name: bootstrap
+      run: autoreconf --install
+
+    - name: configure
+      run: |
+        CC=${{ matrix.os.id == 'linux' && matrix.arch.cc_linux || matrix.arch.cc_macos }}
+        ./configure CC=$CC CFLAGS="-march=${{ matrix.arch.march }}"
+
+    - name: make
+      run: make
+
+    - name: rename binary
+      run: |
+        mkdir -p dist
+        cp src/engine dist/salmon-${{ matrix.os.id }}-${{ matrix.arch.id }}
+
+    - name: upload to release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: dist/salmon-${{ matrix.os.id }}-${{ matrix.arch.id }}

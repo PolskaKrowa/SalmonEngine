@@ -2439,7 +2439,6 @@ ac_compiler_gnu=$ac_cv_c_compiler_gnu
 ac_config_headers="$ac_config_headers include/config.h"
    # generates a config.h with detected defines
 
-
 am__api_version='1.18'
 
 

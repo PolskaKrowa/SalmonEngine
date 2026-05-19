@@ -1,0 +1,6 @@
+fen,best_move,mate_in,label
+6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1,e1e8,1,M1 back rank (R)
+r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4,h5f7,1,M1 Scholar's mate
+4k3/8/4K3/8/8/8/8/7R w - - 0 1,h1h8,1,M1 K+R box
+r2qkb1r/pp2nppp/3p4/2pNN1B1/2BnP3/3P4/PPP2PPP/R2bK2R w KQkq - 1 1,d5f6,2,M2 double knight
+6k1/pp4pp/2p5/2bp4/5qn1/2N3Pr/PP3P1K/R1BQ1R2 b - - 0 1,f4g3,1,M2 queen+knight

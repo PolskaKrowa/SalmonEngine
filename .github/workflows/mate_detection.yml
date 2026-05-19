@@ -1,0 +1,22 @@
+name: Mate Detection
+
+on: [push, pull_request]
+
+jobs:
+  mate:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: install deps
+      run: sudo apt-get install -y autoconf automake autoconf-archive
+
+    - name: build
+      run: autoreconf --install && ./configure && make
+
+    - name: run mate tests
+      run: |
+        python3 tests/test_mate.py \
+          --engine src/engine \
+          --positions tests/mate_positions.csv \
+          --movetime 2000

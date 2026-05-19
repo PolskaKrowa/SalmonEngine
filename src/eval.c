@@ -42,6 +42,7 @@
 #include "bitboard.h"
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 
 static const int MATERIAL_MG[6] = { 82, 344, 358, 480, 1022, 0 };
 static const int MATERIAL_EG[6] = { 94, 338, 329, 546, 924, 0 };

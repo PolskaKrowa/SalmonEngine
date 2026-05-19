@@ -16,11 +16,11 @@ jobs:
           - { name: macos-latest,   id: macos,   pkg: brew }
           - { name: macos-13,       id: macos,   pkg: brew }
         arch:
-          - { id: x86_64,    cc_linux: gcc,                    cc_macos: clang, march: x86-64        }
-          - { id: x86_64_v3, cc_linux: gcc,                    cc_macos: clang, march: x86-64-v3     }  # AVX2
-          - { id: x86_64_v4, cc_linux: gcc,                    cc_macos: clang, march: x86-64-v4     }  # AVX-512
-          - { id: arm64,     cc_linux: aarch64-linux-gnu-gcc,  cc_macos: clang, march: armv8-a       }
-          - { id: arm32,     cc_linux: arm-linux-gnueabihf-gcc,cc_macos: clang, march: armv7-a       }
+          - { id: x86_64,    cc_linux: gcc,                     cc_macos: clang, march: x86-64,    host_triple: x86_64-linux-gnu          }
+          - { id: x86_64_v3, cc_linux: gcc,                     cc_macos: clang, march: x86-64-v3, host_triple: x86_64-linux-gnu          }
+          - { id: x86_64_v4, cc_linux: gcc,                     cc_macos: clang, march: x86-64-v4, host_triple: x86_64-linux-gnu          }
+          - { id: arm64,     cc_linux: aarch64-linux-gnu-gcc,   cc_macos: clang, march: armv8-a,   host_triple: aarch64-linux-gnu         }
+          - { id: arm32,     cc_linux: arm-linux-gnueabihf-gcc, cc_macos: clang, march: armv7-a,   host_triple: arm-linux-gnueabihf       }
 
         exclude:
           # macOS can't cross-compile to ARM32
@@ -61,11 +61,24 @@ jobs:
 
     - name: configure
       run: |
-        CC=${{ matrix.os.id == 'linux' && matrix.arch.cc_linux || matrix.arch.cc_macos }}
-        ./configure CC=$CC CFLAGS="-march=${{ matrix.arch.march }}"
+        if [ "${{ matrix.os.id }}" = "linux" ]; then
+          echo "CC=${{ matrix.arch.cc_linux }}" >> $GITHUB_ENV
+        else
+          echo "CC=${{ matrix.arch.cc_macos }}" >> $GITHUB_ENV
+        fi
+
+    - name: configure
+      run: |
+        ./configure \
+          --host=${{ matrix.arch.host_triple }} \
+          CFLAGS="-march=${{ matrix.arch.march }}"
 
     - name: make
       run: make
+      
+    - name: smoke_test
+      if: matrix.arch.id == 'x86_64'
+      run: make perft
 
     - name: rename binary
       run: |

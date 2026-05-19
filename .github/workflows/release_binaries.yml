@@ -76,7 +76,7 @@ jobs:
     - name: rename binary
       run: |
         mkdir -p dist
-        cp src/engine dist/salmon-${{ matrix.arch.bin_name }}
+        cp src/engine dist/salmon-${{ matrix.os.id }}-${{ matrix.arch.bin_name }}
 
     - name: upload to release
       uses: softprops/action-gh-release@v2

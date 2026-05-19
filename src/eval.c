@@ -208,13 +208,6 @@ static const int MOB_QUEEN_EG[] = {
     -36,-15,  8, 18, 34, 54, 61, 73, 79, 92, 94,104,113,120,
     123,126,133,136,140,143,148,166,170,175,184,191,206,212};
 
-/* Mobility evaluation indexing */
-static const int * const MOB_MG_TABLE[6] = {
-    NULL, MOB_KNIGHT_MG, MOB_BISHOP_MG, MOB_ROOK_MG, MOB_QUEEN_MG, NULL};
-static const int * const MOB_EG_TABLE[6] = {
-    NULL, MOB_KNIGHT_EG, MOB_BISHOP_EG, MOB_ROOK_EG, MOB_QUEEN_EG, NULL};
-static const int MOB_MAX[6] = {0, 8, 13, 14, 27, 0};
-
 static const int ROOK_OPEN_FILE_MG  = 27;
 static const int ROOK_OPEN_FILE_EG  = 57;
 static const int ROOK_SEMIOPEN_MG   = 12;
@@ -244,6 +237,13 @@ static const int KING_EG_DISTANCE_PENALTY = 4;
 
 #define TEMPO_BONUS_MG 16
 #define TEMPO_BONUS_EG 0
+
+/* Mobility evaluation indexing */
+static const int * const MOB_MG_TABLE[6] = {
+    NULL, MOB_KNIGHT_MG, MOB_BISHOP_MG, MOB_ROOK_MG, MOB_QUEEN_MG, NULL};
+static const int * const MOB_EG_TABLE[6] = {
+    NULL, MOB_KNIGHT_EG, MOB_BISHOP_EG, MOB_ROOK_EG, MOB_QUEEN_EG, NULL};
+static const int MOB_MAX[6] = {0, 8, 13, 14, 27, 0};
 
 /* Table-of-tables for quick lookup */
 static const int * const PST_MG[6] = {
@@ -1196,6 +1196,10 @@ int evaluate(const Board *b) {
      * Applied before the side-to-move flip.
      */
     score += initiative(b, mg, eg);
+
+#ifdef WORST_ENGINE
+    score = -score;
+#endif
 
     /* Return from side-to-move perspective */
     return (b->side == WHITE) ? score : -score;

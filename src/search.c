@@ -1,25 +1,26 @@
 /*
- * search.c — Move searching (SF 11 refactored)
+ * search.c — Move searching (SF 11 refactored, optimised)
  *
  * Architecture:
  *  • Iterative deepening (ID) driver in search()
  *  • negamax() — principal variation search (PVS) with:
  *      – Transposition table cutoffs
- *      – TT mate-score adjustment: value_to_tt / value_from_tt (correctness fix)
+ *      – TT mate-score adjustment: value_to_tt / value_from_tt
+ *      – TT score refinement of static eval
  *      – Aspiration windows
  *      – Reverse futility pruning / static NMP
  *      – Razoring
  *      – Null-move pruning (NMP, adaptive R)
- *      – ProbCut (depth ≥ 5, raised-beta capture search, ~10 Elo)
+ *      – ProbCut (depth ≥ 5, raised-beta capture search)
  *      – Futility pruning: improving-adjusted margin via futility_margin()
  *      – Late move pruning (LMP): closed-form futility_move_count()
  *      – Late move reductions (LMR): product-of-logs Reductions table (SF 11)
- *      – Singular extensions (depth ≥ 6, TT-move uniqueness test, ~70 Elo)
+ *      – Singular extensions (depth ≥ 6, TT-move uniqueness test)
  *      – Improving heuristic
  *      – Killer move heuristic (2 killers per ply)
  *      – Countermove heuristic
  *      – History heuristic: SF-calibrated stat_bonus formula + gravity/decay
- *      – Continuation history: (piece,to) affinity at ply-1 (~30 Elo)
+ *      – Continuation history: (piece,to) affinity at ply-1
  *      – MVV-LVA + SEE capture ordering
  *      – TT move first
  *  • quiesce() — quiescence search, SEE pruning of losing caps
@@ -35,33 +36,33 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <limits.h>
 
 /* ──────────────────────────────────────────────
- *  Previous-iteration root best move
- *
- *  Stored here (file scope) rather than in SearchInfo so that the
- *  public header doesn't need touching.  Only one search runs at a
- *  time, so a single static is safe.  Reset to NULL_MOVE at the
- *  start of every search() call.
+ *  sentinel for eval_stack when in check.
+ *  Must be outside the normal eval range so the improving heuristic
+ *  at ply+2 can detect that ply was an in-check node and avoid a
+ *  spurious improving=true.  Choose INT_MIN/2 to stay safe from
+ *  any accidental arithmetic that might wrap a plain INT_MIN.
  * ────────────────────────────────────────────── */
+#define EVAL_NONE (INT_MIN / 2)
+
 static Move s_root_best_move = NULL_MOVE;
 
 /* ──────────────────────────────────────────────
  *  LMR reduction table — product-of-logs (SF 11 style)
- *
- *  SF 11 uses two independent log tables multiplied together:
- *    R = (Reductions[depth] * Reductions[move_count] + 511) / 1024
- *  This captures the interaction between depth and move count better
- *  than a single-log formula: at depth 1 all moves get R=0; at depth 10
- *  move 20 gets a larger reduction than the old table gave.
  * ────────────────────────────────────────────── */
-static int Reductions[MAX_MOVES];   /* one table, indexed by depth or move count */
+static int Reductions[MAX_MOVES];
 
 static void init_reductions(void) {
     Reductions[0] = 0;
     for (int i = 1; i < MAX_MOVES; i++)
         Reductions[i] = (int)(24.8 * log((double)i));
 }
+
+/* __attribute__((pure)) — reads Reductions[] global, no side effects */
+static inline int lmr_reduction(bool improving, int depth, int move_count)
+    __attribute__((pure));
 
 static inline int lmr_reduction(bool improving, int depth, int move_count) {
     int d = (depth     < MAX_MOVES) ? depth      : MAX_MOVES - 1;
@@ -70,45 +71,35 @@ static inline int lmr_reduction(bool improving, int depth, int move_count) {
     return (r + 511) / 1024 + (!improving && r > 1007);
 }
 
-/* ──────────────────────────────────────────────
- *  stat_bonus — SF 11 calibrated history bonus.
- *  Returns negative for depth > 15 to prevent
- *  history-table saturation at high depths.
- * ────────────────────────────────────────────── */
+/* __attribute__((const)) — result depends only on arguments */
+static inline int stat_bonus(int depth)
+    __attribute__((const));
 static inline int stat_bonus(int depth) {
     return depth > 15 ? -8 : 19 * depth * depth + 155 * depth - 132;
 }
 
-/* ──────────────────────────────────────────────
- *  futility_margin — improving-adjusted futility
- * ────────────────────────────────────────────── */
+static inline int futility_margin(int depth, bool improving)
+    __attribute__((const));
 static inline int futility_margin(int depth, bool improving) {
     return 217 * (depth - (int)improving);
 }
 
-/* ──────────────────────────────────────────────
- *  futility_move_count — closed-form LMP threshold
- *  Replaces the LMP_THRESHOLD lookup table.
- * ────────────────────────────────────────────── */
+static inline int futility_move_count(bool improving, int depth)
+    __attribute__((const));
 static inline int futility_move_count(bool improving, int depth) {
     return (5 + depth * depth) * (1 + (int)improving) / 2 - 1;
 }
 
-/* ──────────────────────────────────────────────
- *  TT score adjustment for mate distances
- *
- *  Mate scores are relative to the current ply.  Storing a raw mate
- *  score in the TT would corrupt the distance when the same position
- *  is retrieved at a different ply.  value_to_tt() makes the score
- *  root-relative before storing; value_from_tt() restores it to
- *  ply-relative when reading back.
- * ────────────────────────────────────────────── */
+static inline int value_to_tt(int v, int ply)
+    __attribute__((const));
 static inline int value_to_tt(int v, int ply) {
     if (v >= MATE_SCORE - MAX_PLY) return v + ply;
     if (v <= -MATE_SCORE + MAX_PLY) return v - ply;
     return v;
 }
 
+static inline int value_from_tt(int v, int ply)
+    __attribute__((const));
 static inline int value_from_tt(int v, int ply) {
     if (v == NO_SCORE)              return NO_SCORE;
     if (v >= MATE_SCORE - MAX_PLY)  return v - ply;
@@ -140,11 +131,8 @@ static void init_mvv_lva(void) {
  *  Based on the "swap algorithm" by Koord/Hyatt (CPW wiki).
  * ────────────────────────────────────────────── */
 
-/* Material values for SEE only — don't need to match eval exactly */
 static const int SEE_VAL[7] = { 100, 320, 330, 500, 900, 20000, 0 };
-/*                               P    N    B    R    Q    K   NO_PIECE */
 
-/* All pieces attacking 'sq' given occupancy 'occ' (both colours) */
 static Bitboard attacks_to_sq(const Board *b, Square sq, Bitboard occ) {
     return (PAWN_ATTACKS[WHITE][sq]  & b->pieces[BLACK][PAWN])
          | (PAWN_ATTACKS[BLACK][sq]  & b->pieces[WHITE][PAWN])
@@ -161,43 +149,37 @@ int see(const Board *b, Move m) {
     Square    to   = (Square)MOVE_TO(m);
     MoveType  mt   = MOVE_TYPE(m);
 
-    /* Determine the piece initially captured */
     int captured;
     if (mt == MT_EP)
         captured = PAWN;
     else if (b->mailbox[to] != NO_PIECE)
         captured = (int)piece_type(b->mailbox[to]);
     else
-        return 0; /* quiet move — SEE = 0 */
+        return 0;
 
     int gain[32];
     int d = 0;
     gain[0] = SEE_VAL[captured];
 
-    /* Remove the moving piece from occupancy */
     Bitboard occ = b->occ[2] ^ SQUARE_BB[from];
 
-    /* For en-passant, also remove the captured pawn */
     if (mt == MT_EP)
         occ ^= SQUARE_BB[b->ep_sq];
 
-    int  attacker_type = (int)piece_type(b->mailbox[from]);
-    Color side = b->side ^ 1; /* side to recapture */
+    int   attacker_type = (int)piece_type(b->mailbox[from]);
+    Color side = b->side ^ 1;
 
     while (true) {
         d++;
         gain[d] = SEE_VAL[attacker_type] - gain[d - 1];
 
-        /* Pruning: even in the best case this branch can't change the sign */
-        if ( (gain[d - 1] < 0 ? -gain[d - 1] : gain[d - 1]) >
-             (gain[d]     < 0 ? -gain[d]     : gain[d]    ) )
-            {}; /* keep going — no pruning here, let the loop handle it */
+        /* removed dead stub `if (…) {};` that was here.
+         * The backward pass below already implements the correct
+         * "don't recapture if it loses material" logic. */
 
-        /* Find all remaining attackers of 'to' */
         Bitboard atk = attacks_to_sq(b, to, occ) & occ & b->occ[side];
         if (!atk) break;
 
-        /* Pick the least-valuable attacker for this side */
         int pt;
         Bitboard piece_bb = 0;
         for (pt = PAWN; pt <= KING; pt++) {
@@ -206,17 +188,11 @@ int see(const Board *b, Move m) {
         }
         if (pt > KING) break;
 
-        /* Remove the attacker (LSB) from occupancy — reveals x-ray pieces */
         occ ^= (piece_bb & -piece_bb);
         attacker_type = pt;
         side ^= 1;
     }
 
-    /*
-     * Backward pass: each side may choose NOT to recapture.
-     * gain[d-1] = -max(-gain[d-1], gain[d])
-     *           =  min( gain[d-1], -gain[d] )
-     */
     while (--d)
         gain[d - 1] = -((-gain[d - 1] > gain[d]) ? -gain[d - 1] : gain[d]);
 
@@ -226,25 +202,27 @@ int see(const Board *b, Move m) {
 /* ──────────────────────────────────────────────
  *  Move scoring for ordering
  * ────────────────────────────────────────────── */
-/*
- * Move ordering score tiers (highest = searched first).
- *
- * SCORE_TACTICAL_CAP is intentionally placed ABOVE SCORE_TT_MOVE.
- * This guarantees that a clearly winning capture (SEE >= 150 cp —
- * roughly "gain at least a pawn free") is always tried before even
- * the TT move.  The TT move comes from a previous, possibly shallower
- * iteration that may not have seen the hanging piece; putting winning
- * captures first ensures we never miss a free piece because an old
- * quiet TT move happened to cause a beta cutoff first.
- */
-#define SCORE_TACTICAL_CAP 1050000   /* SEE >= 150 — above TT move          */
+#define SCORE_TACTICAL_CAP 1050000
 #define SCORE_TT_MOVE      1000000
-#define SCORE_GOOD_CAP      900000   /* 0 <= SEE < 150 — even / slight gain */
+#define SCORE_GOOD_CAP      900000
 #define SCORE_KILLER1       800000
 #define SCORE_KILLER2       790000
-#define SCORE_COUNTER       780000   /* countermove bonus */
-#define SCORE_QUIET_BASE          0  /* + history score   */
+#define SCORE_COUNTER       780000
+#define SCORE_QUIET_BASE          0
 
+/*
+ * score_move
+ *
+ *   losing capture  → return see_score           (raw negative value)
+ *   even capture    → return SCORE_GOOD_CAP + …   (≥ 900 000)
+ *   winning capture → return SCORE_TACTICAL_CAP + … (≥ 1 050 000)
+ *
+ * This means for captures, scores[i] == see_score when the capture is losing,
+ * and scores[i] >> 0 when it is even or winning.  The capture-SEE pruning
+ * threshold (-20 * depth * depth, at most -2000 for depth ≤ 10) can never be
+ * satisfied by a score ≥ 900 000, so replacing `see(b,m)` with `scores[i]` in
+ * that pruning check is semantically identical.  See negamax() below.
+ */
 static int score_move(const Board *b, Move m, Move tt_move,
                       const Move *killers, Move countermove,
                       int hist[64][64], const int cont_hist[7][64],
@@ -258,25 +236,13 @@ static int score_move(const Board *b, Move m, Move tt_move,
                        ? (int)PAWN
                        : (int)piece_type(b->mailbox[to]);
 
-        /* Separate captures into three tiers by SEE:
-         *
-         *  >= 150 cp  → SCORE_TACTICAL_CAP  (clearly winning — above TT move)
-         *     0..149  → SCORE_GOOD_CAP      (even or slight gain)
-         *  < 0        → raw SEE score        (losing capture, tried last)
-         *
-         * The 150 cp threshold catches any capture of a piece that is either
-         * completely undefended or defended only by a more-expensive piece.
-         * Examples that go to SCORE_TACTICAL_CAP:
-         *   PxN undefended (SEE=320), PxR undefended (SEE=500),
-         *   NxR undefended (SEE=180), PxB undefended (SEE=230).
-         */
         int see_score = see(b, m);
         if (see_score >= 150)
             return SCORE_TACTICAL_CAP + MVV_LVA[attacker][victim];
         else if (see_score >= 0)
             return SCORE_GOOD_CAP + MVV_LVA[attacker][victim];
         else
-            return see_score; /* losing capture — below quiet moves */
+            return see_score; /* losing capture — raw SEE as score (OPT-3 invariant) */
     }
 
     if (MOVE_IS_PROMO(m)) return SCORE_GOOD_CAP - 1;
@@ -285,9 +251,6 @@ static int score_move(const Board *b, Move m, Move tt_move,
     if (m == killers[1])  return SCORE_KILLER2;
     if (m == countermove) return SCORE_COUNTER;
 
-    /* Quiet move: butterfly history + continuation history blend.
-     * The cont_hist bonus captures (piece,to) affinity from the previous
-     * move, which is the single-ply port of SF's continuation history. */
     int h = hist[MOVE_FROM(m)][MOVE_TO(m)];
     if (cont_hist && prev_move != NULL_MOVE) {
         int pt = (int)piece_type(b->mailbox[MOVE_FROM(m)]);
@@ -308,8 +271,6 @@ static Move pick_move(Move *moves, int *scores, int count, int idx) {
 
 /* ──────────────────────────────────────────────
  *  History gravity (age / decay the history table)
- *  Called between ID iterations to avoid stale bonuses
- *  dominating early in the new iteration.
  * ────────────────────────────────────────────── */
 static void decay_history(SearchInfo *si) {
     for (int c = 0; c < 2; c++)
@@ -328,21 +289,17 @@ bool time_up(SearchInfo *si) {
     return (int)elapsed >= si->allotted_ms;
 }
 
-/* LMP_THRESHOLD replaced by the futility_move_count() formula above. */
-
 /* ──────────────────────────────────────────────
  *  Quiescence search
  * ────────────────────────────────────────────── */
+/* mark quiesce as hot */
+__attribute__((hot))
 int quiesce(Board *b, int alpha, int beta, int ply, SearchInfo *si) {
     si->nodes++;
     if (ply > si->seldepth) si->seldepth = ply;
 
     bool in_chk = in_check(b);
 
-    /*
-     * Stand-pat: our lower bound assuming we can "do nothing".
-     * Not valid when in check — we must find a legal evasion.
-     */
     int stand_pat = evaluate(b);
     if (!in_chk) {
         if (stand_pat >= beta) return beta;
@@ -350,18 +307,11 @@ int quiesce(Board *b, int alpha, int beta, int ply, SearchInfo *si) {
     }
 
     MoveList ml;
-    /*
-     * When in check, generate ALL legal moves (evasions).
-     * A check in qsearch that has no evasion is checkmate;
-     * a stalemate (no legal move, not in check) is a draw.
-     * When not in check, generate captures only — the normal qsearch path.
-     */
     if (in_chk)
         gen_moves(b, &ml);
     else
         gen_captures(b, &ml);
 
-    /* Score moves */
     int scores[MAX_MOVES];
     const Move *killers_ply = si->killers[ply < MAX_PLY ? ply : MAX_PLY - 1];
     int (*hist_side)[64]    = si->history[b->side];
@@ -382,16 +332,9 @@ int quiesce(Board *b, int alpha, int beta, int ply, SearchInfo *si) {
         Move m = pick_move(ml.moves, scores, ml.count, i);
 
         if (!in_chk) {
-            /*
-             * SEE pruning in qsearch (captures only path):
-             * Skip clearly losing captures (negative SEE score) and apply
-             * delta pruning.  Neither pruning applies when in check — we
-             * must search every evasion.
-             */
-            if (scores[i] < 0)      /* negative SEE score */
-                break;              /* remaining moves have equal or worse SEE */
+            if (scores[i] < 0)
+                break;
 
-            /* Delta pruning: stand_pat + captured value + margin can't reach alpha */
             int captured_val = (MOVE_TYPE(m) == MT_EP)
                                ? SEE_VAL[PAWN]
                                : (b->mailbox[MOVE_TO(m)] != NO_PIECE
@@ -409,12 +352,12 @@ int quiesce(Board *b, int alpha, int beta, int ply, SearchInfo *si) {
         int score = -quiesce(b, -beta, -alpha, ply + 1, si);
         unmake_move(b);
 
-        if (si->limits->stop) return 0;
+        /* stop flag is rarely set in the hot path */
+        if (__builtin_expect(si->limits->stop, 0)) return 0;
         if (score >= beta) return beta;
         if (score > alpha) alpha = score;
     }
 
-    /* In check with no legal evasion: checkmate */
     if (in_chk && legal_count == 0)
         return -MATE_SCORE + ply;
 
@@ -424,8 +367,13 @@ int quiesce(Board *b, int alpha, int beta, int ply, SearchInfo *si) {
 /* ──────────────────────────────────────────────
  *  Negamax alpha-beta (PVS) — the main search
  * ────────────────────────────────────────────── */
+/* mark negamax as hot */
+__attribute__((hot))
 int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
-    if (si->nodes % 2048 == 0 && time_up(si)) {
+    /* power-of-2 modulo → bitwise AND.
+     * GCC already performs this transform at -O3, but the explicit form
+     * documents intent and removes any ambiguity for readers and tools. */
+    if ((si->nodes & 2047) == 0 && time_up(si)) {
         si->limits->stop = true;
         return 0;
     }
@@ -443,77 +391,88 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
 
         for (int i = b->hist_idx - 2; i >= 0; i -= 2) {
             if (b->history[i].hash == b->hash) return DRAW_SCORE;
-            /* The halfmove stored in history[i] is the clock BEFORE that move
-               was made.  If it was 0, the move at i+1 was irreversible — no
-               repetition can cross it. */
             if (b->history[i].halfmove == 0) break;
         }
     }
 
     /* ── TT probe ── */
     TTEntry tte;
-    Move    tt_move = NULL_MOVE;
-    if (tt_probe(b->hash, &tte)) {
-        tt_move = tte.move;
-        if (!pv && tte.depth >= depth) {
-            int tt_score = value_from_tt(tte.score, ply);
-            if (tte.flag == TT_EXACT) return tt_score;
-            if (tte.flag == TT_LOWER && tt_score >= beta)  return tt_score;
-            if (tte.flag == TT_UPPER && tt_score <= alpha) return tt_score;
-        }
+    bool    tt_hit  = tt_probe(b->hash, &tte);
+    Move    tt_move = tt_hit ? tte.move : NULL_MOVE;
+
+    if (tt_hit && !pv && tte.depth >= depth) {
+        int tt_score = value_from_tt(tte.score, ply);
+        if (tte.flag == TT_EXACT) return tt_score;
+        if (tte.flag == TT_LOWER && tt_score >= beta)  return tt_score;
+        if (tte.flag == TT_UPPER && tt_score <= alpha) return tt_score;
     }
 
-    /*
-     * Root move ordering: if the TT had no move (cold start or replacement
-     * collision), seed tt_move with the best move found in the previous
-     * iteration.  This guarantees the strongest known candidate is always
-     * searched first at the root, giving the ID framework a reliable anchor
-     * regardless of TT occupancy.
-     */
     if (root && tt_move == NULL_MOVE && s_root_best_move != NULL_MOVE)
         tt_move = s_root_best_move;
 
-    /* ── Drop into quiescence ── */
     if (depth <= 0)
         return quiesce(b, alpha, beta, ply, si);
 
+    /* ── In-check detection — computed BEFORE evaluate() ──
+     *
+     * when the side to move is in check, every pruning path that uses
+     * static_eval is already gated on !in_chk.  Calling evaluate() at in-check
+     * nodes is therefore wasted work.  We skip it and store EVAL_NONE in
+     * eval_stack so the improving heuristic at ply+2 correctly treats the
+     * intervening in-check node as "not comparable" rather than "clearly worse."
+     */
     bool in_chk = in_check(b);
 
-    /* ── Static evaluation (cached for pruning heuristics) ── */
-    int static_eval = evaluate(b);
-    si->eval_stack[ply] = static_eval;
+    /* ── Static evaluation ── */
+    int static_eval;
+    if (__builtin_expect(!in_chk, 1)) {
+        static_eval = evaluate(b);
 
-    /*
-     * Improving heuristic:
-     * The position is "improving" when the side-to-move is better off than
-     * they were two plies ago.  An improving position allows more aggressive
-     * pruning (LMR, LMP), while a worsening one is treated conservatively.
+        /* TT score refinement.
+         *
+         * The raw static eval is a heuristic estimate; the TT score is a
+         * search-verified bound for this exact position.  When the TT entry
+         * provides a bound that is more accurate than the static eval (i.e.
+         * when the score lies outside what the static eval would suggest),
+         * use the TT score as the working eval for pruning decisions.  This
+         * improves the accuracy of RFP, razoring, and NMP at no extra cost.
+         */
+        if (tt_hit) {
+            int tt_score = value_from_tt(tte.score, ply);
+            if (tt_score != NO_SCORE) {
+                if ( tte.flag == TT_EXACT
+                  || (tte.flag == TT_LOWER && tt_score > static_eval)
+                  || (tte.flag == TT_UPPER && tt_score < static_eval))
+                    static_eval = tt_score;
+            }
+        }
+
+        si->eval_stack[ply] = static_eval;
+    } else {
+        /* In check: store EVAL_NONE so ply+2's improving check is clean. */
+        static_eval = EVAL_NONE;
+        si->eval_stack[ply] = EVAL_NONE;
+    }
+
+    /* ── Improving heuristic ──
+     *
+     * follow-up: guard against EVAL_NONE in eval_stack[ply-2].
+     * If that ply was an in-check node we stored EVAL_NONE; comparing
+     * against it would give a spurious improving=true result.
      */
     bool improving = (!in_chk && ply >= 2
+                      && si->eval_stack[ply - 2] != EVAL_NONE
                       && static_eval > si->eval_stack[ply - 2]);
 
     if (!in_chk && !pv) {
-        /*
-         * ── Reverse Futility Pruning (Static Null-Move Pruning) ──
-         *
-         * If the static eval already exceeds beta by a depth-scaled margin,
-         * the position is probably too good and will cause a cutoff anyway.
-         * Return a blended value to avoid discontinuities at the boundary.
-         *
-         * Conditions: not in check, not PV, depth <= 8, no mate scores.
-         */
+        /* ── Reverse Futility Pruning (Static Null-Move Pruning) ── */
         if (depth <= 8 && abs(beta) < MATE_SCORE - MAX_PLY) {
             int rfp_margin = (improving ? 60 : 80) * depth;
             if (static_eval - rfp_margin >= beta)
                 return (static_eval + beta) / 2;
         }
 
-        /*
-         * ── Razoring ──
-         *
-         * If the static eval is far below alpha, drop into quiescence.
-         * Only useful at depth <= 3; deeper, NMP / RFP handle the work.
-         */
+        /* ── Razoring ── */
         if (depth <= 3 && abs(alpha) < MATE_SCORE - MAX_PLY) {
             int razor_margin = 300 + 60 * depth;
             if (static_eval + razor_margin <= alpha) {
@@ -523,26 +482,17 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
         }
     }
 
-    /*
-     * ── Null-Move Pruning (NMP) ──
-     *
-     * Adaptive reduction R grows with depth and how far eval exceeds beta,
-     * inspired by Stockfish / Weiss.  Skip if in check, PV node, zugzwang-
-     * likely positions (only pawns + king), or we're already in a null move.
-     *
-     * Extra guards added:
-     *  • If the *opponent* also has only pawns + king, a pawn race or
-     *    blocked ending is likely — NMP is unreliable there too.
-     *  • At high depths (>= 12), a verification search confirms the cutoff
-     *    before we trust it, preventing tactical blunders caused by NMP.
-     */
+    /* pre-compute whether the previous ply has a real move.
+     * This expression appeared five times in the original negamax body.
+     * Computing it once saves repeated ply comparisons and NULL_MOVE checks. */
+    bool prev_move_exists = (ply > 0 && si->move_stack[ply - 1] != NULL_MOVE);
+
+    /* ── Null-Move Pruning (NMP) ── */
     bool do_nmp = !pv && !in_chk && depth >= 3
                && static_eval >= beta
-               /* We must have at least one non-pawn/king piece */
                && bb_popcount(b->occ[b->side]
                               & ~b->pieces[b->side][PAWN]
                               & ~b->pieces[b->side][KING]) > 0
-               /* Skip when opponent is pawn-only — zugzwang / pawn-race risk */
                && bb_popcount(b->occ[b->side ^ 1]
                               & ~b->pieces[b->side ^ 1][PAWN]
                               & ~b->pieces[b->side ^ 1][KING]) > 0;
@@ -558,31 +508,18 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
         unmake_null_move(b);
 
         if (null_score >= beta) {
-            /* Don't return unverified mate scores */
             if (null_score >= MATE_SCORE - MAX_PLY) null_score = beta;
 
-            /*
-             * Verification search: at high depths, run a reduced search
-             * (same depth - R) with the real window to confirm the cutoff
-             * is genuine and not a horizon artefact.
-             */
             if (depth >= 12) {
                 int verify = negamax(b, depth - R, beta - 1, beta, ply, si);
-                if (verify < beta) goto after_nmp; /* cutoff not confirmed */
+                if (verify < beta) goto after_nmp;
             }
             return null_score;
         }
     }
     after_nmp:;
 
-    /*
-     * ── ProbCut ──
-     *
-     * If we have a capture whose SEE already beats a raised beta threshold,
-     * and a reduced search confirms it scores above that threshold, we can
-     * safely prune the rest of the tree.
-     * Conditions: non-PV, not in check, depth >= 5, score not near mate.
-     */
+    /* ── ProbCut ── */
     if (!pv && !in_chk && depth >= 5
         && abs(beta) < MATE_SCORE - MAX_PLY)
     {
@@ -606,18 +543,17 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
             si->move_stack[ply] = pcm;
             make_move(b, pcm);
 
-            /* Quick qsearch confirmation */
             int pc_val = -quiesce(b, -(raised_beta), -(raised_beta) + 1,
                                   ply + 1, si);
 
-            /* Full reduced search if qsearch held */
             if (pc_val >= raised_beta)
                 pc_val = -negamax(b, depth - 4, -(raised_beta), -(raised_beta) + 1,
                                   ply + 1, si);
 
             unmake_move(b);
 
-            if (si->limits->stop) return 0;
+            /* OPT-6 */
+            if (__builtin_expect(si->limits->stop, 0)) return 0;
             if (pc_val >= raised_beta) return pc_val;
             pc_count++;
         }
@@ -627,8 +563,8 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
     MoveList ml;
     gen_moves(b, &ml);
 
-    /* Look up the countermove for the move played at the previous ply */
-    Move cm = (ply > 0 && si->move_stack[ply - 1] != NULL_MOVE)
+    /* use pre-computed prev_move_exists */
+    Move cm = prev_move_exists
               ? si->countermove[MOVE_FROM(si->move_stack[ply - 1])]
                                [MOVE_TO  (si->move_stack[ply - 1])]
               : NULL_MOVE;
@@ -636,7 +572,7 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
     int scores[MAX_MOVES];
     const Move *killers_ply = si->killers[ply < MAX_PLY ? ply : MAX_PLY - 1];
     int (*hist_side)[64]    = si->history[b->side];
-    Move prev_neg = (ply > 0) ? si->move_stack[ply - 1] : NULL_MOVE;
+    Move prev_neg = prev_move_exists ? si->move_stack[ply - 1] : NULL_MOVE;
 
     for (int i = 0; i < ml.count; i++)
         scores[i] = score_move(b, ml.moves[i], tt_move,
@@ -646,7 +582,7 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
     int  best_score  = -INF;
     Move best_move   = NULL_MOVE;
     int  legal_count = 0;
-    int  quiet_count = 0;   /* quiet moves searched so far (for LMP) */
+    int  quiet_count = 0;
     int  tt_flag     = TT_UPPER;
 
     for (int i = 0; i < ml.count; i++) {
@@ -660,60 +596,45 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
         legal_count++;
         if (is_quiet) quiet_count++;
 
-        /* ── Pruning for non-PV, non-check quiet moves ── */
+        /* ── Pruning for non-PV, non-check quiet moves ──
+         *
+         * LMP and futility pruning shared depth <= 8 but were
+         * in separate if-blocks, each re-evaluating the guard.  They are
+         * now merged into a single block that evaluates `depth <= 8` once.
+         */
         if (!pv && !in_chk && is_quiet && best_score > -MATE_SCORE + MAX_PLY) {
 
-            /*
-             * Late Move Pruning (Move Count Pruning):
-             * After searching enough quiet moves at low depth, the rest are
-             * unlikely to beat alpha — prune them.
-             */
-            if (depth <= 8
-                && quiet_count >= futility_move_count(improving, depth))
-                continue;
-
-            /*
-             * Futility Pruning:
-             * If static eval + an improving-adjusted margin is still below
-             * alpha, quiet moves at this node are unlikely to improve alpha.
-             */
             if (depth <= 8) {
+                /* Late Move Pruning */
+                if (quiet_count >= futility_move_count(improving, depth))
+                    continue;
+
+                /* Futility Pruning */
                 int fp_margin = futility_margin(depth, improving)
                               + hist_side[MOVE_FROM(m)][MOVE_TO(m)] / 128;
                 if (static_eval + fp_margin <= alpha)
                     continue;
             }
 
-            /*
-             * SEE-based quiet move pruning:
-             * A quiet move with a deeply negative SEE (e.g. walking into a
-             * pawn fork) is pruned at low depth.
-             */
+            /* SEE-based quiet move pruning (depth <= 5 only) */
             if (depth <= 5 && see(b, m) < -40 * depth)
                 continue;
         }
 
-        /*
-         * SEE pruning for captures:
-         * Losing captures (SEE < threshold) are skipped at higher depths.
-         * The threshold tightens with depth.
+        /* ── SEE pruning for captures ──
+         *
+         * the original code re-called see(b, m) here.  We instead
+         * use scores[i], which for losing captures already equals the raw
+         * SEE value (score_move returns it verbatim).  For even/winning
+         * captures scores[i] >= 900 000, so the threshold (at most -2000
+         * for depth <= 10) is never satisfied — identical semantics, zero
+         * extra SEE calls.
          */
         if (!pv && is_cap && depth <= 10
-            && see(b, m) < -20 * depth * depth)
+            && scores[i] < -20 * depth * depth)
             continue;
 
-        /*
-         * ── Singular Extension ──
-         *
-         * If the TT move is the only move that fails high in a reduced
-         * search with a narrowed beta, it is "singular" — extend it by
-         * one ply.  If multiple moves fail high we get a multi-cut signal
-         * and can prune the node early.
-         *
-         * Conditions: depth >= 6, move == tt_move, not root, TT entry has
-         * a lower-bound score that isn't near mate, and was searched deeply
-         * enough to be reliable.
-         */
+        /* ── Singular Extension ── */
         int extension = 0;
         if (depth >= 6
             && m == tt_move
@@ -727,8 +648,6 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
             int sing_beta  = tte.score - 2 * depth;
             int half_depth = depth / 2;
 
-            /* Temporarily mask out the TT move by setting it to NULL so
-               the recursive call won't give it a TT-move bonus in ordering. */
             Move saved_tt = tt_move;
             tt_move = NULL_MOVE;
 
@@ -737,12 +656,11 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
 
             tt_move = saved_tt;
 
-            if (si->limits->stop) return 0;
+            if (__builtin_expect(si->limits->stop, 0)) return 0;
 
             if (sing_val < sing_beta) {
-                extension = 1;  /* TT move is singular → extend */
+                extension = 1;
             } else if (sing_beta >= beta) {
-                /* Multi-cut: more than one move fails high → prune */
                 return sing_beta;
             }
         }
@@ -754,13 +672,6 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
         int score;
         int new_depth = depth - 1 + extension;
 
-        /*
-         * Only extend for check when we have not already applied a singular
-         * extension.  Stacking both extensions would give new_depth >= depth,
-         * which — in a chain of checking replies — prevents depth from ever
-         * reaching 0 and causes unbounded recursion.  The hard ply ceiling
-         * above is the primary guard; this keeps extensions individually sane.
-         */
         if (in_check(b) && extension == 0) new_depth++;
 
         /* ── Late Move Reductions (LMR) ── */
@@ -774,37 +685,32 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
         if (do_lmr) {
             reduction = lmr_reduction(improving, depth, legal_count);
 
-            /* Adjust reduction with heuristics */
-            if (!improving)          reduction++;   /* losing ground → reduce more  */
-            if (pv)                  reduction--;   /* PV node → reduce less        */
-            if (m == cm)             reduction--;   /* countermove → reduce less    */
+            if (!improving)          reduction++;
+            if (pv)                  reduction--;
+            if (m == cm)             reduction--;
             if (m == killers_ply[0]
-             || m == killers_ply[1]) reduction--;   /* killer → reduce less         */
+             || m == killers_ply[1]) reduction--;
 
-            /* Continuation history adjustment */
-            if (ply > 0 && si->move_stack[ply - 1] != NULL_MOVE) {
+            /* use pre-computed prev_move_exists */
+            if (prev_move_exists) {
                 int prev_to = MOVE_TO(si->move_stack[ply - 1]);
                 int cur_pt  = (int)piece_type(b->mailbox[MOVE_FROM(m)]);
                 int ch = si->cont_hist[cur_pt][prev_to];
-                if (ch > 0) reduction--;   /* good continuation → reduce less */
-                else if (ch < 0) reduction++; /* bad continuation → reduce more */
+                if (ch > 0) reduction--;
+                else if (ch < 0) reduction++;
             }
 
-            /* Clamp: never drop below 1, never below depth-1 */
             if (reduction < 1)          reduction = 1;
             if (reduction > new_depth)  reduction = new_depth;
         }
 
         /* ── PVS / LMR search ── */
         if (legal_count == 1) {
-            /* Full-window search for the first (presumably best) move */
             score = -negamax(b, new_depth, -beta, -alpha, ply + 1, si);
         } else {
-            /* Null-window search (possibly reduced) */
             score = -negamax(b, new_depth - reduction,
                              -alpha - 1, -alpha, ply + 1, si);
 
-            /* Re-search at full depth if it beat alpha and was reduced or PV */
             if (score > alpha && (reduction > 0 || pv)) {
                 score = -negamax(b, new_depth, -beta, -alpha, ply + 1, si);
             }
@@ -812,7 +718,7 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
 
         unmake_move(b);
 
-        if (si->limits->stop) return 0;
+        if (__builtin_expect(si->limits->stop, 0)) return 0;
 
         if (score > best_score) {
             best_score = score;
@@ -823,7 +729,6 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
             tt_flag = TT_EXACT;
 
             if (score >= beta) {
-                /* Beta cutoff — update killer, countermove and history */
                 if (is_quiet) {
                     /* Killers */
                     if (m != killers_ply[0]) {
@@ -831,20 +736,20 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
                         si->killers[ply][0] = m;
                     }
 
-                    /* Countermove: this move refutes the opponent's last move */
-                    if (ply > 0 && si->move_stack[ply - 1] != NULL_MOVE) {
+                    /* Countermove — use pre-computed prev_move_exists */
+                    if (prev_move_exists) {
                         si->countermove
                             [MOVE_FROM(si->move_stack[ply - 1])]
                             [MOVE_TO  (si->move_stack[ply - 1])] = m;
                     }
 
-                    /* History bonus — SF-calibrated stat_bonus formula */
+                    /* History bonus */
                     int bonus = stat_bonus(depth);
                     int *h = &si->history[b->side][MOVE_FROM(m)][MOVE_TO(m)];
                     *h += bonus - (*h) * bonus / 16384;
 
-                    /* Continuation history update */
-                    if (ply > 0 && si->move_stack[ply - 1] != NULL_MOVE) {
+                    /* Continuation history update — OPT-4 */
+                    if (prev_move_exists) {
                         int prev_to = MOVE_TO(si->move_stack[ply - 1]);
                         int cur_pt  = (int)piece_type(b->mailbox[MOVE_TO(m)]);
                         si->cont_hist[cur_pt][prev_to] += bonus
@@ -877,7 +782,6 @@ void search(Board *b, SearchLimits *lim) {
     si.limits     = lim;
     si.start_time = clock();
 
-    /* Time management */
     if (!lim->infinite && lim->movetime == 0) {
         int time_left = (b->side == WHITE) ? lim->wtime : lim->btime;
         int inc       = (b->side == WHITE) ? lim->winc  : lim->binc;
@@ -891,14 +795,6 @@ void search(Board *b, SearchLimits *lim) {
     Move best_move = NULL_MOVE;
     int  prev_score = 0;
 
-    /* ── Opening book probe ──
-     *
-     * If the current position has a book entry, play it immediately
-     * without searching.  This saves the full search budget for the
-     * middlegame and guarantees solid, well-tested opening moves.
-     * book_probe() validates legality internally, so a hash collision
-     * cannot cause an illegal move to be returned.
-     */
     {
         Move bm = book_probe(b);
         if (bm != NULL_MOVE) {
@@ -912,26 +808,15 @@ void search(Board *b, SearchLimits *lim) {
         }
     }
 
-    /* Reset root-move seed for this search */
     s_root_best_move = NULL_MOVE;
 
     for (int depth = 1; depth <= max_depth; depth++) {
         si.seldepth = 0;
         si.nodes    = 0;
-        /* Keep killer moves across iterations so iterative deepening can
-           reuse the strongest refutations found so far. */
         if (depth > 1) decay_history(&si);
 
         int score;
 
-        /*
-         * ── Aspiration Windows ──
-         *
-         * For depth >= 4, start the search with a narrow window around
-         * the score from the previous iteration.  On a fail, widen
-         * exponentially and re-search.  This reduces the search space
-         * significantly when the score is stable.
-         */
         if (depth >= 4) {
             int delta = 25;
             int asp_alpha = prev_score - delta;
@@ -943,18 +828,15 @@ void search(Board *b, SearchLimits *lim) {
                 if (lim->stop) goto done;
 
                 if (score <= asp_alpha) {
-                    /* Fail low: widen lower bound, keep upper tight */
                     asp_alpha = (asp_alpha - delta < -INF) ? -INF : asp_alpha - delta;
                     delta    *= 2;
                 } else if (score >= asp_beta) {
-                    /* Fail high: widen upper bound, keep lower tight */
                     asp_beta  = (asp_beta + delta >  INF) ?  INF : asp_beta + delta;
                     delta    *= 2;
                 } else {
-                    break; /* Exact score within window */
+                    break;
                 }
 
-                /* Safety: fall back to full window after too many fails */
                 if (delta > 500) {
                     score = negamax(b, depth, -INF, INF, 0, &si);
                     break;
@@ -967,15 +849,11 @@ void search(Board *b, SearchLimits *lim) {
         if (lim->stop) break;
         prev_score = score;
 
-        /* Retrieve best move from TT */
         TTEntry tte;
         if (tt_probe(b->hash, &tte) && tte.move) best_move = tte.move;
 
-        /* Carry the best move forward as the anchor for next iteration's
-         * root move ordering, in case the TT entry gets evicted.         */
         if (best_move != NULL_MOVE) s_root_best_move = best_move;
 
-        /* UCI info output */
         char mv_str[6];
         move_to_str(best_move, mv_str);
         int elapsed_ms = (int)((clock() - si.start_time) * 1000 / CLOCKS_PER_SEC);

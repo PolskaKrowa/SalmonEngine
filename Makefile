@@ -57,6 +57,8 @@ CFLAGS_DEBUG := \
     -march=native \
     -DENGINE_DEBUG
 
+EXTRA_FLAGS := 
+
 LDFLAGS_DEBUG := -lm
 
 # ── Sanitize flags ───────────────────────────────────────────
@@ -69,7 +71,7 @@ CFLAGS_SANITIZE := \
 LDFLAGS_SANITIZE := -fsanitize=address,undefined -lm
 
 # ── Default (release) ────────────────────────────────────────
-CFLAGS  := $(CFLAGS_RELEASE)
+CFLAGS  := $(CFLAGS_RELEASE) $(EXTRA_FLAGS)
 LDFLAGS := $(LDFLAGS_RELEASE)
 
 # ─────────────────────────────────────────────────────────────

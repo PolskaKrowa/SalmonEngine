@@ -2,11 +2,8 @@
  * SalmonEngine - (Codename: OpenStessine)
  * 
  * An Open Source attempt at making a good chess engine without using NNUE
- * 
- */
-
-
-/*
+ * -----------------------------------------------------------------------
+ *
  * main.c — Entry point
  *
  * Initialises all subsystems then hands control to the UCI loop.

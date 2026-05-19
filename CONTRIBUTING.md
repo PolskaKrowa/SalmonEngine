@@ -131,3 +131,7 @@ For movegen bugs, a failing perft position and depth is the most useful thing yo
 ## Questions
 
 Open an issue tagged `question` and ask away. Chess engine development has a steep learning curve and there are no dumb questions.
+
+Although there's no good moderation system in place for issue discussions, We do still advise all users to be respectful to eachother and not skip out on detail. If a user is confused or is reporting an issue, even if it's user error, the problem should still be resolved without conflict nor (whether expressed or otherwise) discrimination towards anyone.
+We support a growing community of keen users of this software, and strongly discourage negativity. People simply have different ways of understanding or taking in information.
+

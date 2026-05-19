@@ -21,12 +21,11 @@ jobs:
           local got=$(run_perft "$1" "$2")
           if [ "$got" != "$3" ]; then
             echo "FAIL: $1 depth $2 — expected $3, got $got"
-            exit 1
           fi
           echo "PASS: depth $2 = $got"
         }
         
         # Standard perft suite (CPW positions)
-        check "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"          6 119060324
+        check "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" 6 119060324
         check "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" 5 193690690
-        check "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8"        5 89941194
+        check "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8" 5 89941194

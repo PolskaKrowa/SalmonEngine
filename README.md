@@ -2,6 +2,8 @@
 
 A traditional chess engine built in C, designed to be **understandable, transparent, and easy to learn from**. No neural networks, no black boxes, no "Unified Theory of Slightly Better Bishops heuristic" bullsh\*\*tery. Just pure chess logic you can understand and modify without being a chess GM.
 
+okay, maybe the search module may look a bit intimidating... I promise it's GCC's fault and not mine.
+
 ## Features
 
 - **Classical evaluation** - Transparent material and positional evaluation you can follow

@@ -14,7 +14,7 @@ jobs:
     - name: perft suite
       run: |
         run_perft() {
-          echo "position fen $1\nperft $2\nquit" | ./src/engine | grep "Nodes:" | awk '{print $2}'
+          echo -e "position fen $1\nperft $2\nquit" | ./src/engine | grep "^depth $2:" | awk '{print $3}'
         }
         
         check() {

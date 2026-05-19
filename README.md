@@ -60,9 +60,7 @@ Pre-compiled binaries for Linux, macOS, and Windows across x86-64 and ARM64 are 
 | Linux          | x86-64-v3   | AVX2         |
 | Linux          | x86-64-v4   | AVX-512      |
 | Linux          | ARM64       | —            |
-| macOS          | x86-64      | baseline     |
 | macOS          | ARM64       | Apple Silicon|
-| Windows        | x86-64      | baseline     |
 
 > If you're not sure which to pick, use the `x86_64` build. Use `x86_64_v3` if your CPU is from 2013 or later and you want better performance.
 

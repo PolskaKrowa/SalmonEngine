@@ -8,14 +8,22 @@ on:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: install autotools
+      run: sudo apt-get install -y autoconf automake autoconf-archive
+
+    - name: bootstrap
+      run: autoreconf --install
+
     - name: configure
       run: ./configure
+
     - name: make
       run: make
+
     - name: smoke_test
       run: make perft

@@ -238,7 +238,7 @@ static const int KING_ATTACKER_WEIGHT[6]  = { 0, 20, 20, 40, 80, 0, };
 static const int KING_EG_DISTANCE_PENALTY = 4;
 
 #define TEMPO_BONUS_MG 16
-#define TEMPO_BONUS_EG 0
+#define TEMPO_BONUS_EG 2
 
 /* Mobility evaluation indexing */
 static const int * const MOB_MG_TABLE[6] = {

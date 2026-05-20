@@ -33,7 +33,7 @@ jobs:
 
     - name: run match
       run: |
-        ./cutechess/cutechess-cli \
+        ./home/runner/work/SalmonEngine/cutechess/cutechess-cli \
           -engine cmd=./engine-pr name=PR \
           -engine cmd=./engine-base name=Base \
           -each proto=uci tc=10+0.1 \

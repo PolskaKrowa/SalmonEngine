@@ -13,7 +13,7 @@ jobs:
     - name: install deps
       run: |
         sudo apt-get install -y autoconf automake autoconf-archive \
-          cmake qtbase5-dev qt5-qmake libqt5core5a
+          cmake qtbase5-dev qt5-qmake libqt5core5a libqt5svg5-dev
     
         git clone --depth 1 https://github.com/cutechess/cutechess.git
         cmake -S cutechess -B cutechess/build -DBUILD_GUI=OFF

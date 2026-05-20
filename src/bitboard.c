@@ -13,7 +13,6 @@
  *     fits entirely in L1 cache.
  *
  * Non-sliding pieces use simple pre-computed lookup tables.
- * 
  */
 
 #include "bitboard.h"

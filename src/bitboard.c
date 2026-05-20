@@ -195,7 +195,7 @@ void bitboard_init(void) {
     init_between_line();
 }
 
-/* ──────────────────────────────────────────
+/* ─────────────────────────────────────────
  *  Hyperbola Quintessence core
  *
  *    forward  = (o & mask) - 2*s

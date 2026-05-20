@@ -17,7 +17,7 @@ jobs:
     
         git clone --depth 1 https://github.com/cutechess/cutechess.git
         cmake -S cutechess -B cutechess/build -DBUILD_GUI=OFF
-        cmake --build cutechess/build --target cutechess-cli -j$(nproc)
+        cmake --build cutechess/build -j$(nproc)
         sudo cmake --install cutechess/build --component cli
 
     - name: build PR version

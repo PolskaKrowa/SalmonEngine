@@ -7,6 +7,7 @@
 # -------------------------------------------------------------
 
 AC_INIT([salmon], [2.0], [], [salmon-engine])
+AC_CONFIG_MACRO_DIRS([m4])
 AC_CONFIG_SRCDIR([src/main.c])          # sanity-check: fails if this file is missing
 AC_CONFIG_HEADERS([include/config.h])   # generates a config.h with detected defines
 AC_CONFIG_AUX_DIR([build-aux])

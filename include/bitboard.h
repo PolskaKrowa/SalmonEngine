@@ -55,9 +55,7 @@ void bitboard_init(void);
 Bitboard rook_attacks  (Square sq, Bitboard occ);
 Bitboard bishop_attacks(Square sq, Bitboard occ);
 
-static inline Bitboard queen_attacks(Square sq, Bitboard occ) {
-    return rook_attacks(sq, occ) | bishop_attacks(sq, occ);
-}
+static inline Bitboard queen_attacks(Square sq, Bitboard occ);
 
 /* ──────────────────────────────────────────────
  *  Bit-manipulation helpers (all inline / intrinsic)

@@ -236,7 +236,7 @@ Bitboard queen_attacks(Square sq, Bitboard occ) {
     return rook_attacks(sq, occ) | bishop_attacks(sq, occ);
 }
 
-/* ──────────────────────────────────────────────
+/* ─────────────────────────────────────────────
  *  Debug print
  * ────────────────────────────────────────────── */
 void bb_print(Bitboard bb) {

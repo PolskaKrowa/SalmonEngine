@@ -28,21 +28,17 @@ jobs:
           cmake -S cutechess -B cutechess/build -DWITH_TESTS=OFF
           cmake --build cutechess/build --target cli -j"$(nproc)"
 
-      - name: Build PR version
+      - name: build PR version
         run: |
           mkdir -p m4
-          autoreconf --install
-          ./configure
-          make -j"$(nproc)"
+          autoreconf --install --force && ./configure && make
           cp src/engine engine-pr
-
-      - name: Build base version
+      
+      - name: build base version
         run: |
           git checkout ${{ github.base_ref }}
           mkdir -p m4
-          autoreconf --install
-          ./configure
-          make -j"$(nproc)"
+          autoreconf --install --force && ./configure && make
           cp src/engine engine-base
 
       - name: Run match

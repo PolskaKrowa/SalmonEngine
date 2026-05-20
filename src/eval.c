@@ -1199,10 +1199,6 @@ int evaluate(const Board *b) {
      */
     score += initiative(b, mg, eg);
 
-#ifdef WORST_ENGINE
-    score = -score;
-#endif
-
     /* Return from side-to-move perspective */
     return (b->side == WHITE) ? score : -score;
 }

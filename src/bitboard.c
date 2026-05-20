@@ -36,12 +36,6 @@ Bitboard KING_ATTACKS[64];
 Bitboard BETWEEN_BB[64][64];
 Bitboard LINE_BB[64][64];
 
-/*
- * O1: 64-byte alignment.
- * rank_atk[file][occupancy_byte] — 8 × 256 = 2 048 bytes.
- * Placing it on a cache-line boundary reduces cold-start thrashing when
- * rank_attacks() is first called for many different files in sequence.
- */
 static uint8_t rank_atk[8][256] __attribute__((aligned(64)));
 
 /* ──────────────────────────────────────────────
@@ -119,12 +113,6 @@ static void init_king_attacks(void) {
 }
 
 static void init_between_line(void) {
-    /*
-     * O5: direction table hoisted out of the loop body.
-     * Previously declared `static const` inside the double loop, which is
-     * valid C but forces a hidden guard-variable check on every iteration
-     * with some compilers.  Moving it here is unambiguous.
-     */
     static const int dirs[4][2] = {{1,0},{0,1},{1,1},{1,-1}};
 
     for (int a = 0; a < 64; a++) {
@@ -222,13 +210,6 @@ static inline Bitboard hyp_quint(Bitboard occ, Bitboard sq_b, Bitboard mask) {
     return (fwd ^ bwd) & mask;
 }
 
-/*
- * O2: rank_attacks — single bitmask replaces multiply + two separate vars.
- *
- * (sq & 0x38) == (sq >> 3) << 3 == rank * 8.
- * Using a bitmask is a single AND with an immediate, cheaper than a right-
- * shift followed by a multiply on processors that don't fuse them.
- */
 static inline Bitboard rank_attacks(Square sq, Bitboard occ) {
     int shift  = (int)sq & 0x38;                       /* rank * 8        */
     uint8_t o8 = (uint8_t)(occ >> shift);              /* rank occupancy  */
@@ -239,12 +220,6 @@ static inline Bitboard rank_attacks(Square sq, Bitboard occ) {
  *  Public attack functions
  * ────────────────────────────────────────────── */
 
-/*
- * O3: load SQUARE_BB[sq] once.
- * hyp_quint() takes the square as a Bitboard; passing a local avoids
- * re-reading the same table entry for each hyp_quint call in the same
- * function.
- */
 Bitboard rook_attacks(Square sq, Bitboard occ) {
     Bitboard sq_b = SQUARE_BB[sq];
     return hyp_quint(occ, sq_b, FILE_MASK[sq])
@@ -257,11 +232,6 @@ Bitboard bishop_attacks(Square sq, Bitboard occ) {
          | hyp_quint(occ, sq_b, ADIAG_MASK[sq]);
 }
 
-/*
- * O4: queen_attacks() defined here.
- * movegen.c calls queen_attacks(); if you had it as a static inline in the
- * header, remove that declaration and let this definition serve instead.
- */
 Bitboard queen_attacks(Square sq, Bitboard occ) {
     return rook_attacks(sq, occ) | bishop_attacks(sq, occ);
 }

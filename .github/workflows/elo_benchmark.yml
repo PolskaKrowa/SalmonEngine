@@ -30,6 +30,7 @@ jobs:
 
       - name: Build PR version
         run: |
+          mkdir -p m4
           autoreconf --install
           ./configure
           make -j"$(nproc)"
@@ -38,6 +39,7 @@ jobs:
       - name: Build base version
         run: |
           git checkout ${{ github.base_ref }}
+          mkdir -p m4
           autoreconf --install
           ./configure
           make -j"$(nproc)"

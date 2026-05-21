@@ -1,5 +1,5 @@
 /*
- * board.c — Board state management
+ * board.c — Board state management  (optimised)
  *
  * Zobrist keys are generated using xorshift64* for a uniform, fast PRNG.
  * make_move / unmake_move maintain all bitboards, the mailbox, occupancy,
@@ -41,13 +41,28 @@ void board_init(void) {
         ZKEYS.ep[i] = xorshift64(&seed);
 }
 
+static const int CASTLE_MASK[64] = {
+    /* a1 */ ~CR_WQ, ~0, ~0, ~0,
+    /* e1 */ ~(CR_WK|CR_WQ), ~0, ~0,
+    /* h1 */ ~CR_WK,
+    /* a2-a7 rows: all ~0 */
+    ~0, ~0, ~0, ~0, ~0, ~0, ~0, ~0,
+    ~0, ~0, ~0, ~0, ~0, ~0, ~0, ~0,
+    ~0, ~0, ~0, ~0, ~0, ~0, ~0, ~0,
+    ~0, ~0, ~0, ~0, ~0, ~0, ~0, ~0,
+    ~0, ~0, ~0, ~0, ~0, ~0, ~0, ~0,
+    ~0, ~0, ~0, ~0, ~0, ~0, ~0, ~0,
+    /* a8 */ ~CR_BQ, ~0, ~0, ~0,
+    /* e8 */ ~(CR_BK|CR_BQ), ~0, ~0,
+    /* h8 */ ~CR_BK,
+};
+
 /* ──────────────────────────────────────────────
  *  Board helpers
  * ────────────────────────────────────────────── */
 static void board_clear(Board *b) {
     memset(b, 0, sizeof(*b));
     b->ep_sq = NO_SQ;
-    for (int i = 0; i < 64; i++) b->mailbox[i] = NO_PIECE;
 }
 
 static uint64_t compute_hash(const Board *b) {
@@ -79,7 +94,6 @@ void board_start_pos(Board *b) {
 bool board_from_fen(Board *b, const char *fen) {
     board_clear(b);
 
-    /* Piece placement */
     int rank = 7, file = 0;
     const char *p = fen;
     while (*p && *p != ' ') {
@@ -94,8 +108,6 @@ bool board_from_fen(Board *b, const char *fen) {
             Color col = (piece_idx >= 6) ? BLACK : WHITE;
             PieceType pt = (PieceType)(piece_idx % 6);
             Square sq = (Square)(rank * 8 + file);
-            /* put_piece hashes incrementally, but hash not started yet; 
-               we will compute it from scratch at the end */
             Bitboard s = SQUARE_BB[sq];
             b->pieces[col][pt] |= s;
             b->occ[col]        |= s;
@@ -105,12 +117,10 @@ bool board_from_fen(Board *b, const char *fen) {
         }
     }
 
-    /* Side to move */
-    if (*p) p++; /* space */
+    if (*p) p++;
     b->side = (*p == 'b') ? BLACK : WHITE;
-    if (*p) p += 2; /* 'w '/' b ' */
+    if (*p) p += 2;
 
-    /* Castling rights */
     b->castle = 0;
     while (*p && *p != ' ') {
         switch (*p++) {
@@ -121,24 +131,19 @@ bool board_from_fen(Board *b, const char *fen) {
             default: break;
         }
     }
-    if (*p) p++; /* space */
+    if (*p) p++;
 
-    /* En passant */
     b->ep_sq = NO_SQ;
     if (*p && *p != '-') {
-        int ef = *p - 'a';
-        p++;
-        int er = *p - '1';
-        p++;
+        int ef = *p - 'a'; p++;
+        int er = *p - '1'; p++;
         b->ep_sq = er * 8 + ef;
     } else if (*p) { p++; }
     if (*p) p++;
 
-    /* Half-move clock */
     b->halfmove = 0;
     if (*p) { b->halfmove = atoi(p); while (*p && *p != ' ') p++; if (*p) p++; }
 
-    /* Full-move number */
     b->fullmove = 1;
     if (*p) b->fullmove = atoi(p);
 
@@ -174,13 +179,14 @@ void board_print(const Board *b) {
 bool is_square_attacked(const Board *b, Square sq, Color attacker) {
     Bitboard occ = b->occ[2];
 
-    if (PAWN_ATTACKS[attacker ^ 1][sq] & b->pieces[attacker][PAWN])   return true;
-    if (KNIGHT_ATTACKS[sq]             & b->pieces[attacker][KNIGHT])  return true;
-    if (KING_ATTACKS[sq]               & b->pieces[attacker][KING])    return true;
-    if (bishop_attacks(sq, occ)        & (b->pieces[attacker][BISHOP]
-                                        | b->pieces[attacker][QUEEN])) return true;
-    if (rook_attacks(sq, occ)          & (b->pieces[attacker][ROOK]
-                                        | b->pieces[attacker][QUEEN])) return true;
+    if (PAWN_ATTACKS[attacker ^ 1][sq] & b->pieces[attacker][PAWN])  return true;
+    if (KNIGHT_ATTACKS[sq]             & b->pieces[attacker][KNIGHT]) return true;
+    if (KING_ATTACKS[sq]               & b->pieces[attacker][KING])   return true;
+
+    Bitboard queen_bb = b->pieces[attacker][QUEEN];
+    if (bishop_attacks(sq, occ) & (b->pieces[attacker][BISHOP] | queen_bb)) return true;
+    if (rook_attacks  (sq, occ) & (b->pieces[attacker][ROOK]   | queen_bb)) return true;
+
     return false;
 }
 
@@ -193,63 +199,53 @@ bool in_check(const Board *b) {
  *  Make move
  * ────────────────────────────────────────────── */
 void make_move(Board *b, Move m) {
-    Color  us   = b->side;
-    Color  them = us ^ 1;
-    Square from = MOVE_FROM(m);
-    Square to   = MOVE_TO(m);
-    MoveType mt = MOVE_TYPE(m);
+    Color    us   = b->side;
+    Color    them = us ^ 1;
+    Square   from = MOVE_FROM(m);
+    Square   to   = MOVE_TO(m);
+    MoveType mt   = MOVE_TYPE(m);
 
-    if (b->hist_idx >= MAX_PLY) {
-        /* Should never reach here after the negamax ply ceiling is in place.
-           Silently clamp rather than crash so a bug report for the CPU manufacturer is still possible. */
+    if (b->hist_idx >= MAX_PLY)
         b->hist_idx = MAX_PLY - 1;
-    }
 
-    /* Save undo state */
-    UndoInfo *u  = &b->history[b->hist_idx++];
-    u->move      = m;
-    u->ep_sq     = b->ep_sq;
-    u->castle    = b->castle;
-    u->halfmove  = b->halfmove;
-    u->hash      = b->hash;
-    u->captured  = NO_PIECE;
+    UndoInfo *u = &b->history[b->hist_idx++];
+    u->move     = m;
+    u->ep_sq    = b->ep_sq;
+    u->castle   = b->castle;
+    u->halfmove = b->halfmove;
+    u->hash     = b->hash;
+    u->captured = NO_PIECE;
 
-    /* Update hash for old state */
     b->hash ^= ZKEYS.castle[b->castle];
     if (b->ep_sq != NO_SQ) b->hash ^= ZKEYS.ep[b->ep_sq & 7];
     b->ep_sq = NO_SQ;
 
-    Piece moving = b->mailbox[from];
-    PieceType pt = piece_type(moving);
+    Piece     moving = b->mailbox[from];
+    PieceType pt     = piece_type(moving);
 
     b->halfmove++;
 
-    /* Remove captured piece */
     if (mt == MT_CAPTURE || mt >= MT_N_PROMO_CAP) {
-        Piece cap = b->mailbox[to];
+        Piece cap   = b->mailbox[to];
         u->captured = cap;
         remove_piece(b, them, piece_type(cap), to);
         b->halfmove = 0;
     } else if (mt == MT_EP) {
         Square ep_cap = (us == WHITE) ? (Square)(to - 8) : (Square)(to + 8);
-        u->captured = make_piece(them, PAWN);
+        u->captured   = make_piece(them, PAWN);
         remove_piece(b, them, PAWN, ep_cap);
         b->halfmove = 0;
     }
 
     if (pt == PAWN) b->halfmove = 0;
 
-    /* Move the piece */
     if (mt >= MT_N_PROMO) {
-        /* Promotion: remove pawn, place promoted piece */
         remove_piece(b, us, PAWN, from);
-        PieceType promo = MOVE_PROMO_PT(m);
-        put_piece(b, us, promo, to);
+        put_piece(b, us, MOVE_PROMO_PT(m), to);
     } else {
         move_piece(b, us, pt, from, to);
     }
 
-    /* Castling: also move the rook */
     if (mt == MT_KCASTLE) {
         Square rf = (us == WHITE) ? H1 : H8;
         Square rt = (us == WHITE) ? F1 : F8;
@@ -260,28 +256,16 @@ void make_move(Board *b, Move m) {
         move_piece(b, us, ROOK, rf, rt);
     }
 
-    /* Double pawn push sets en-passant square */
     if (mt == MT_DPUSH) {
         b->ep_sq = (us == WHITE) ? (int)(to - 8) : (int)(to + 8);
         b->hash ^= ZKEYS.ep[b->ep_sq & 7];
     }
 
-    /* Update castling rights */
-    static const int castle_mask[64] = {
-        [A1]=~CR_WQ, [E1]=~(CR_WK|CR_WQ), [H1]=~CR_WK,
-        [A8]=~CR_BQ, [E8]=~(CR_BK|CR_BQ), [H8]=~CR_BK,
-    };
-    /* For all other squares the mask is -1 (0xFF...FF) */
-    int cm_from = (from < 64) ? castle_mask[from] : ~0;
-    int cm_to   = (to   < 64) ? castle_mask[to]   : ~0;
-    if (cm_from == 0) cm_from = ~0; /* not a castling-relevant square */
-    if (cm_to   == 0) cm_to   = ~0;
-    b->castle &= cm_from & cm_to;
+    b->castle &= CASTLE_MASK[from] & CASTLE_MASK[to];
 
-    /* Finalise hash */
     b->hash ^= ZKEYS.castle[b->castle];
     b->hash ^= ZKEYS.black_to_move;
-    b->side  = them;
+    b->side   = them;
     b->ply++;
     if (us == BLACK) b->fullmove++;
 }
@@ -291,32 +275,29 @@ void make_move(Board *b, Move m) {
  * ────────────────────────────────────────────── */
 void unmake_move(Board *b) {
     UndoInfo *u = &b->history[--b->hist_idx];
-    Move m  = u->move;
-    Color them = b->side;          /* after unmake, them becomes the mover */
-    Color us   = them ^ 1;
+    Move     m  = u->move;
+    Color    them = b->side;
+    Color    us   = them ^ 1;
 
-    b->side      = us;
-    b->ep_sq     = u->ep_sq;
-    b->castle    = u->castle;
-    b->halfmove  = u->halfmove;
-    b->hash      = u->hash;
+    b->side     = us;
+    b->ep_sq    = u->ep_sq;
+    b->castle   = u->castle;
+    b->halfmove = u->halfmove;
+    b->hash     = u->hash;
     b->ply--;
     if (us == BLACK) b->fullmove--;
 
-    Square from = MOVE_FROM(m);
-    Square to   = MOVE_TO(m);
-    MoveType mt = MOVE_TYPE(m);
+    Square   from = MOVE_FROM(m);
+    Square   to   = MOVE_TO(m);
+    MoveType mt   = MOVE_TYPE(m);
 
-    /* Undo promotion */
     if (mt >= MT_N_PROMO) {
-        PieceType promo = MOVE_PROMO_PT(m);
-        remove_piece(b, us, promo, to);
+        remove_piece(b, us, MOVE_PROMO_PT(m), to);
         put_piece   (b, us, PAWN, from);
     } else {
         move_piece(b, us, piece_type(b->mailbox[to]), to, from);
     }
 
-    /* Restore captured piece */
     if (mt == MT_CAPTURE || mt >= MT_N_PROMO_CAP) {
         put_piece(b, them, piece_type(u->captured), to);
     } else if (mt == MT_EP) {
@@ -324,7 +305,6 @@ void unmake_move(Board *b) {
         put_piece(b, them, PAWN, ep_cap);
     }
 
-    /* Undo castling rook move */
     if (mt == MT_KCASTLE) {
         Square rf = (us == WHITE) ? F1 : F8;
         Square rt = (us == WHITE) ? H1 : H8;
@@ -337,7 +317,7 @@ void unmake_move(Board *b) {
 }
 
 /* ──────────────────────────────────────────────
- *  Null move (for null-move pruning in search)
+ *  Null move
  * ────────────────────────────────────────────── */
 void make_null_move(Board *b) {
     UndoInfo *u = &b->history[b->hist_idx++];
@@ -373,12 +353,27 @@ void unmake_null_move(Board *b) {
  * ────────────────────────────────────────────── */
 uint64_t perft(Board *b, int depth) {
     if (depth == 0) return 1;
+
     MoveList ml;
     gen_moves(b, &ml);
+
+    if (depth == 1) {
+        uint64_t count = 0;
+        for (int i = 0; i < ml.count; i++) {
+            make_move(b, ml.moves[i]);
+            if (!is_square_attacked(b,
+                    (Square)bb_lsb(b->pieces[b->side ^ 1][KING]), b->side))
+                count++;
+            unmake_move(b);
+        }
+        return count;
+    }
+
     uint64_t nodes = 0;
     for (int i = 0; i < ml.count; i++) {
         make_move(b, ml.moves[i]);
-        if (!is_square_attacked(b, (Square)bb_lsb(b->pieces[b->side^1][KING]), b->side))
+        if (!is_square_attacked(b,
+                (Square)bb_lsb(b->pieces[b->side ^ 1][KING]), b->side))
             nodes += perft(b, depth - 1);
         unmake_move(b);
     }

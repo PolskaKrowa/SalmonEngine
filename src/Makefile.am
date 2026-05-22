@@ -7,6 +7,7 @@ bin_PROGRAMS = engine
 engine_SOURCES = \
     bitboard.c \
     board.c \
+    nnue.c \
     book.c \
     eval.c \
     main.c \
@@ -25,7 +26,8 @@ tuna_SOURCES = \
     tune.c \
     bitboard.c \
     board.c \
-    movegen.c
+    movegen.c \
+    nnue.c
 
 tuna_CFLAGS  = $(AM_CFLAGS) -DTUNE_STANDALONE
 tuna_LDADD   = -lm

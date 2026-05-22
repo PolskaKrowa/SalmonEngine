@@ -1,6 +1,6 @@
 # SalmonEngine 🐟
 
-A traditional chess engine built in C, designed to be **understandable, transparent, and easy to learn from**. No neural networks, no black boxes — just pure chess logic you can read, follow, and modify without a PhD in machine learning.
+A ~~traditional~~ chess engine built in C, designed to be ~~**understandable, transparent, and easy to learn from**. No neural networks, no black boxes — just pure chess logic you can read, follow, and modify without a PhD in machine learning.~~ good.
 
 > okay, the search module may look a bit intimidating. I promise it's GCC's fault and not mine.
 
@@ -12,11 +12,11 @@ A traditional chess engine built in C, designed to be **understandable, transpar
 
 ## Features
 
-- **Classical evaluation** — Transparent material and positional scoring you can actually follow
+- ~~**Classical evaluation** — Transparent material and positional scoring you can actually follow~~
 - **Bitboard move generation** — Fast 64-bit board representation using `uint64_t`
 - **UCI protocol** — Works out of the box with Arena, ChessBase, [Lichess](https://lichess.org/@/SteveParker), and other GUIs
 - **Transposition table** — Hash-based caching for improved search efficiency
-- **No NNUE, no magic** — No machine learning, no precomputed syzygy tables. The engine thinks for itself
+- ~~**No NNUE, no magic** — No machine learning, no precomputed syzygy tables. The engine thinks for itself~~ This branch uses an NNUE evaluator (purely for experimental purposes.)
 - **Opening book** — because even salmon know where they're going *(later stages of the game are on its own)*
 
 ---
@@ -108,7 +108,8 @@ SalmonEngine/
 ├── src/
 │   ├── bitboard.c   — Bitboard utilities and move representation
 │   ├── board.c      — Board state, FEN parsing, make/unmake move
-│   ├── eval.c       — Classical material + positional evaluation
+│   ├── eval.c       — Evaluation engine
+│   ├── nnue.c       — My worst nightmare
 │   ├── main.c       — Entry point
 │   ├── movegen.c    — Legal move generation
 │   ├── search.c     — Minimax / alpha-beta search
@@ -125,7 +126,7 @@ SalmonEngine/
 
 ## Design Philosophy
 
-### Why No NNUE?
+### Why No NNUE? (on the main branch)
 
 NNUE (Efficiently Updatable Neural Networks) is powerful, but it creates a black box — it's hard to understand *why* a move was chosen, let alone improve it. SalmonEngine prioritises **clarity over raw strength**, making it ideal for:
 
@@ -133,9 +134,17 @@ NNUE (Efficiently Updatable Neural Networks) is powerful, but it creates a black
 - Experimenting with evaluation tweaks and seeing exactly what changed
 - Understanding classical techniques before diving into neural approaches
 
+### Why an NNUE on a separate branch?
+
+NNUE is... i'm not going to give the whole explanation again.
+
+This branch is purely for experimenting with using an NNUE engine for board evaluation, with release binaries from this branch being marked with "NNUE".
+
 ### Name Origin
 
-Like salmon returning to their birthplace, this engine returns to the foundational principles of chess programming — the era before NNUE dominated the field.
+~~Like salmon returning to their birthplace, this engine returns to the foundational principles of chess programming — the era before NNUE dominated the field.~~
+
+I like salmon.
 
 ---
 

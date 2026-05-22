@@ -20,3 +20,5 @@ stamp-h1
 config.h
 config.log
 config.status
+engine
+tuna

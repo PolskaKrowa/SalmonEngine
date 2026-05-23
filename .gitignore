@@ -22,6 +22,7 @@ config.log
 config.status
 engine
 tuna
+tunad
 build-aux/
 *.bin
 

@@ -128,11 +128,15 @@ void train_on_dataset(NNUENet *net, ReplayBuffer *rb,
 float cosine_lr(float lr_max, float lr_min, int iter, int total_iters);
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * §4  Global network pointer (defined in tune.c or dist_tune_main.c)
+ * §4  Shared globals
+ *
+ *  g_nnue        — defined in nnue.c; used by tune.c and dist_tune.c
+ *  g_num_threads — defined in tune.c (non-static); written by dist_tune.c
+ *                  before the training loop, read inside tune.c workers
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-extern NNUENet *g_nnue;
-extern int      g_num_threads;   /* per-rank thread count */
+extern NNUENet *g_nnue;        /* owned by nnue.c          */
+extern int      g_num_threads; /* owned by tune.c          */
 
 #ifdef __cplusplus
 }

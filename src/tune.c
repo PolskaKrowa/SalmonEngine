@@ -44,7 +44,7 @@
 
 /* ── Threading ───────────────────────────────────────────────────────── */
 #define MAX_TUNE_THREADS 128
-static int g_num_threads = 1;
+int g_num_threads = 1;
 
 /* Portable, lock-free per-thread LCG PRNG. */
 static inline int tune_rand(unsigned int *seed) {
@@ -398,7 +398,7 @@ static void adam_update(NNUENet *net, const NNUEGrad *grad, AdamState *state,
  *   iter: 0-indexed (0 .. total_iters-1)
  *   Returns a value in [lr_min, lr_max].
  */
-static float cosine_lr(float lr_max, float lr_min, int iter, int total_iters) {
+float cosine_lr(float lr_max, float lr_min, int iter, int total_iters) {
     if (total_iters <= 1) return lr_max;
     float t = (float)iter / (float)(total_iters - 1);
     return lr_min + 0.5f * (lr_max - lr_min) * (1.0f + cosf((float)M_PI * t));
@@ -566,7 +566,7 @@ typedef struct {
     unsigned int seed;   /* PRNG state for sampling                */
 } ReplayBuffer;
 
-static ReplayBuffer *replay_create(int cap) {
+ReplayBuffer *replay_create(int cap) {
     ReplayBuffer *rb = malloc(sizeof(ReplayBuffer));
     if (!rb) return NULL;
     rb->buf   = malloc((size_t)cap * sizeof(TunePos));
@@ -578,7 +578,7 @@ static ReplayBuffer *replay_create(int cap) {
     return rb;
 }
 
-static void replay_free(ReplayBuffer *rb) {
+void replay_free(ReplayBuffer *rb) {
     if (rb) { free(rb->buf); free(rb); }
 }
 
@@ -586,7 +586,7 @@ static void replay_free(ReplayBuffer *rb) {
  * Push one position into the buffer.
  * If full, the oldest position is silently evicted (ring behaviour).
  */
-static void replay_push(ReplayBuffer *rb, const TunePos *pos) {
+void replay_push(ReplayBuffer *rb, const TunePos *pos) {
     rb->buf[rb->head] = *pos;
     rb->head = (rb->head + 1) % rb->cap;
     if (rb->count < rb->cap) rb->count++;
@@ -658,7 +658,7 @@ static double train_one_epoch(NNUENet *net, ReplayBuffer *rb,
  * must persist across all RL iterations; resetting them was the root
  * cause of the quality degradation in the original code.
  */
-static void train_on_dataset(NNUENet *net, ReplayBuffer *rb,
+void train_on_dataset(NNUENet *net, ReplayBuffer *rb,
                              int max_epochs, int batch_size,
                              float lr, float wdl_lambda,
                              int nthreads, AdamState *adam) {
@@ -697,7 +697,7 @@ typedef struct {
     int      cap;
 } PosDataset;
 
-static PosDataset *create_dataset(void) {
+PosDataset *create_dataset(void) {
     PosDataset *ds = malloc(sizeof(PosDataset));
     ds->cap        = 500000;
     ds->positions  = malloc((size_t)ds->cap * sizeof(TunePos));
@@ -705,7 +705,7 @@ static PosDataset *create_dataset(void) {
     return ds;
 }
 
-static void free_dataset(PosDataset *ds) {
+void free_dataset(PosDataset *ds) {
     free(ds->positions);
     free(ds);
 }

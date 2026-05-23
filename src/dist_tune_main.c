@@ -34,10 +34,6 @@
 #include <string.h>
 #include <ctype.h>
 
-/* ── Global network pointer (referenced by tune.c and dist_tune.c) ──────── */
-NNUENet *g_nnue       = NULL;
-int      g_num_threads = 1;
-
 /* ── Defaults ────────────────────────────────────────────────────────────── */
 #define DEFAULT_ITERATIONS      50
 #define DEFAULT_GAMES_PER_ITER  1000

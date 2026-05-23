@@ -52,6 +52,12 @@ jobs:
             bin_name: arm64
         exclude:
           - os:
+              runner: ubuntu-latest
+              id: linux
+              pkg: apt
+            arch:
+              id: arm64
+          - os:
               runner: macos-latest
               id: macos
               pkg: brew

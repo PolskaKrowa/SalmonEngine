@@ -25,9 +25,6 @@ jobs:
           - runner: macos-latest
             id: macos
             pkg: brew
-          - runner: macos-13
-            id: macos
-            pkg: brew
         arch:
           - id: x86_64
             cc_linux: gcc
@@ -72,12 +69,6 @@ jobs:
               pkg: brew
             arch:
               id: x86_64_v4
-          - os:
-              runner: macos-13
-              id: macos
-              pkg: brew
-            arch:
-              id: arm64
 
     runs-on: ${{ matrix.os.runner }}
 
@@ -91,9 +82,10 @@ jobs:
       - name: install dependencies (apt)
         if: matrix.os.pkg == 'apt'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y autoconf automake autoconf-archive \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+         sudo apt-get update
+         sudo apt-get install -y autoconf automake autoconf-archive \
+           mingw-w64 gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
+           gcc-mingw-w64-aarch64 g++-mingw-w64-aarch64
 
       - name: install dependencies (brew)
         if: matrix.os.pkg == 'brew'

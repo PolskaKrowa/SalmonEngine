@@ -84,8 +84,7 @@ jobs:
         run: |
          sudo apt-get update
          sudo apt-get install -y autoconf automake autoconf-archive \
-           mingw-w64 gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
-           gcc-mingw-w64-aarch64 g++-mingw-w64-aarch64
+           mingw-w64 gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
 
       - name: install dependencies (brew)
         if: matrix.os.pkg == 'brew'
@@ -159,10 +158,6 @@ jobs:
             host_triple: x86_64-w64-mingw32
             cc: x86_64-w64-mingw32-gcc
             bin_name: AVX512
-          - id: arm64
-            host_triple: aarch64-w64-mingw32
-            cc: aarch64-w64-mingw32-gcc
-            bin_name: arm64
 
     runs-on: ubuntu-latest
 

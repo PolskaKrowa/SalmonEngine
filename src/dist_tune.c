@@ -284,25 +284,29 @@ barrier:
 
 int dist_checkpoint_load(DistCtx *ctx, NNUENet *net, const char *path,
                           const unsigned char key[DIST_HMAC_KEY_LEN]) {
-    /*
-     * All ranks read independently.  This works on shared-filesystem clusters
-     * (NFS, Lustre, GPFS).  On a cluster WITHOUT a shared FS you should
-     * instead have rank 0 read and then MPI_Bcast the bytes to the others.
-     */
-    FILE *f = fopen(path, "rb");
-    if (!f) return -1;
+    int load_err = 0;
+    unsigned char stored_tag[DIST_HMAC_LEN] = {0};
 
-    if (fread(net, sizeof *net, 1, f) != 1) {
-        fclose(f);
-        return -1;
+    /* Rank 0 reads, everyone else receives. */
+    if (ctx->rank == 0) {
+        FILE *f = fopen(path, "rb");
+        if (!f) {
+            load_err = -1;
+        } else {
+            if (fread(net, sizeof *net, 1, f) != 1)
+                load_err = -1;
+            else if (fread(stored_tag, DIST_HMAC_LEN, 1, f) != 1)
+                load_err = -1;
+            fclose(f);
+        }
     }
 
-    unsigned char stored_tag[DIST_HMAC_LEN];
-    if (fread(stored_tag, DIST_HMAC_LEN, 1, f) != 1) {
-        fclose(f);
+    MPI_Bcast(&load_err, 1, MPI_INT, 0, ctx->comm);
+    if (load_err != 0)
         return -1;
-    }
-    fclose(f);
+
+    MPI_Bcast(net, (int)sizeof *net, MPI_BYTE, 0, ctx->comm);
+    MPI_Bcast(stored_tag, DIST_HMAC_LEN, MPI_BYTE, 0, ctx->comm);
 
     unsigned char computed_tag[DIST_HMAC_LEN];
     if (compute_hmac_sha256(key, net, sizeof *net, computed_tag) != 0)

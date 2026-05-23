@@ -24,3 +24,6 @@ engine
 tuna
 build-aux/
 *.bin
+
+# tilda means old according to autoconf.
+configure~

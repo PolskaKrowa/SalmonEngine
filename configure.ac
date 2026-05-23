@@ -2,8 +2,15 @@
 #  configure.ac — Salmon Chess Engine
 #
 #  Run:  autoreconf --install
-#  Then: ./configure [--prefix=/usr/local] [--enable-debug]
-#                    [--enable-sanitize] [--enable-tuner]
+#  Then: ./configure [--prefix=/usr/local]
+#                    [--enable-debug]
+#                    [--enable-sanitize]
+#                    [--enable-tuner]
+#                    [--enable-dist-tuner]
+#
+#  --enable-tuner      builds bin/tuna  (single-node NNUE tuner)
+#  --enable-dist-tuner builds bin/tunad (distributed MPI tuner)
+#                      implies --enable-tuner (shares object files)
 # -------------------------------------------------------------
 
 AC_INIT([salmon], [2.0], [], [salmon-engine])
@@ -13,38 +20,44 @@ AC_CONFIG_HEADERS([include/config.h])   # generates a config.h with detected def
 AC_CONFIG_AUX_DIR([build-aux])
 AM_INIT_AUTOMAKE([foreign -Wall -Werror subdir-objects])
 
-# Require a C compiler that supports C2x
+# ── C compiler ────────────────────────────────────────────────────────────
+
 AC_PROG_CC
+
 AX_CHECK_COMPILE_FLAG([-std=c2x],
     [CFLAGS="$CFLAGS -std=c2x"],
     [AC_MSG_ERROR([Your compiler does not support -std=c2x. GCC 9+ or Clang 9+ required.])])
 
-# Check for -march=native support
 AX_CHECK_COMPILE_FLAG([-march=native],
     [MARCH_NATIVE="-march=native"],
     [AC_MSG_WARN([-march=native not supported; CPU-specific optimisations disabled.])
      MARCH_NATIVE=""])
 AC_SUBST([MARCH_NATIVE])
 
-# Check for __builtin_popcountll (needed by bitboard code)
+# ── Required builtins ─────────────────────────────────────────────────────
+
 AC_MSG_CHECKING([for __builtin_popcountll])
 AC_LINK_IFELSE(
     [AC_LANG_PROGRAM([[]], [[long long x = __builtin_popcountll(0ULL);]])],
     [AC_MSG_RESULT([yes])],
     [AC_MSG_ERROR([__builtin_popcountll not available. Use GCC or Clang.])])
 
-# Check for __builtin_ctzll
 AC_MSG_CHECKING([for __builtin_ctzll])
 AC_LINK_IFELSE(
     [AC_LANG_PROGRAM([[]], [[long long x = __builtin_ctzll(1ULL);]])],
     [AC_MSG_RESULT([yes])],
     [AC_MSG_ERROR([__builtin_ctzll not available. Use GCC or Clang.])])
 
-# libm
+# ── Always-required libraries ─────────────────────────────────────────────
+
 AC_CHECK_LIB([m], [sqrt], [],
     [AC_MSG_ERROR([libm not found. Install libc development headers.])])
 
-# Optional build modes
+AC_CHECK_LIB([pthread], [pthread_create], [],
+    [AC_MSG_ERROR([libpthread not found. Install libc development headers.])])
+
+# ── Build-mode flags ──────────────────────────────────────────────────────
+
 AC_ARG_ENABLE([debug],
     [AS_HELP_STRING([--enable-debug], [build with debug symbols and no optimisation])],
     [enable_debug=$enableval], [enable_debug=no])
@@ -53,13 +66,6 @@ AC_ARG_ENABLE([sanitize],
     [AS_HELP_STRING([--enable-sanitize], [build with AddressSanitizer + UBSan])],
     [enable_sanitize=$enableval], [enable_sanitize=no])
 
-AC_ARG_ENABLE([tuner],
-    [AS_HELP_STRING([--enable-tuner], [also build the tuner binary (bin/tuna)])],
-    [enable_tuner=$enableval], [enable_tuner=no])
-
-AM_CONDITIONAL([ENABLE_TUNER], [test "x$enable_tuner" = "xyes"])
-
-# Set CFLAGS / LDFLAGS based on selected mode
 if test "x$enable_sanitize" = "xyes"; then
     CFLAGS="$CFLAGS -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
     LDFLAGS="$LDFLAGS -fsanitize=address,undefined"
@@ -73,7 +79,87 @@ else
     AC_MSG_NOTICE([Release build enabled])
 fi
 
-# Generate files
+# ── Optional: single-node tuner (bin/tuna) ────────────────────────────────
+
+AC_ARG_ENABLE([tuner],
+    [AS_HELP_STRING([--enable-tuner], [build the single-node tuner binary (bin/tuna)])],
+    [enable_tuner=$enableval], [enable_tuner=no])
+
+# ── Optional: distributed tuner (bin/tunad) ───────────────────────────────
+#
+# --enable-dist-tuner implies --enable-tuner because tunad links the same
+# engine object files and tune.c (compiled without -DTUNE_STANDALONE).
+
+AC_ARG_ENABLE([dist-tuner],
+    [AS_HELP_STRING([--enable-dist-tuner],
+        [build the distributed MPI tuner (bin/tunad); implies --enable-tuner])],
+    [enable_dist_tuner=$enableval], [enable_dist_tuner=no])
+
+if test "x$enable_dist_tuner" = "xyes"; then
+    enable_tuner=yes
+fi
+
+# ── OpenBLAS (required by both tuner variants) ────────────────────────────
+#
+# Kept as a per-target LDADD variable (OPENBLAS_LIBS) instead of appending
+# to the global LDFLAGS, so the engine binary is not linked against OpenBLAS.
+
+OPENBLAS_LIBS=""
+if test "x$enable_tuner" = "xyes"; then
+    AC_CHECK_LIB([openblas], [cblas_sgemm],
+        [OPENBLAS_LIBS="-lopenblas"],
+        [AC_MSG_ERROR([OpenBLAS not found. Install libopenblas-dev.])])
+fi
+AC_SUBST([OPENBLAS_LIBS])
+
+# ── OpenSSL (required by dist tuner only) — via pkg-config ───────────────
+
+OPENSSL_CFLAGS=""
+OPENSSL_LIBS=""
+if test "x$enable_dist_tuner" = "xyes"; then
+    PKG_CHECK_MODULES([OPENSSL], [openssl >= 3.0],
+        [],
+        [AC_MSG_ERROR([OpenSSL >= 3.0 not found. Install libssl-dev.])])
+fi
+AC_SUBST([OPENSSL_CFLAGS])
+AC_SUBST([OPENSSL_LIBS])
+
+# ── OpenMPI C bindings (required by dist tuner only) — via pkg-config ─────
+#
+# ompi-c.pc is the canonical C-only pkg-config module installed by OpenMPI.
+# Using pkg-config here rather than AC_CHECK_LIB means we automatically pick
+# up non-standard install prefixes (e.g. /opt/openmpi) without the user
+# having to manually set CPPFLAGS/LDFLAGS.
+
+MPI_CFLAGS=""
+MPI_LIBS=""
+if test "x$enable_dist_tuner" = "xyes"; then
+    PKG_CHECK_MODULES([MPI], [ompi-c >= 4.0],
+        [],
+        [AC_MSG_ERROR([OpenMPI C >= 4.0 not found. Install libopenmpi-dev.])])
+
+    # Verify MPI_Init is actually linkable with the flags pkg-config gave us.
+    # This catches installations where the .pc file is present but the .so
+    # was built for a different ABI.
+    save_CFLAGS="$CFLAGS"
+    save_LIBS="$LIBS"
+    CFLAGS="$CFLAGS $MPI_CFLAGS"
+    LIBS="$LIBS $MPI_LIBS"
+    AC_CHECK_FUNC([MPI_Init], [],
+        [AC_MSG_ERROR([MPI_Init not found with flags from ompi-c.pc.])])
+    CFLAGS="$save_CFLAGS"
+    LIBS="$save_LIBS"
+fi
+AC_SUBST([MPI_CFLAGS])
+AC_SUBST([MPI_LIBS])
+
+# ── Automake conditionals ─────────────────────────────────────────────────
+
+AM_CONDITIONAL([ENABLE_TUNER],      [test "x$enable_tuner"      = "xyes"])
+AM_CONDITIONAL([ENABLE_DIST_TUNER], [test "x$enable_dist_tuner" = "xyes"])
+
+# ── Output ────────────────────────────────────────────────────────────────
+
 AC_CONFIG_FILES([Makefile src/Makefile])
 AC_OUTPUT
 
@@ -81,7 +167,16 @@ AC_MSG_NOTICE([
 -------------------------------------------
   Salmon Chess Engine — configuration done
 -------------------------------------------
-  Now run:  make
-            make tuner   (if --enable-tuner)
-            make perft   (smoke test)
+  Build targets:
+    engine  (always)
+    tuna    (--enable-tuner or --enable-dist-tuner)
+    tunad   (--enable-dist-tuner)
+
+  Now run:
+    make
+    make check   (perft smoke test)
+
+  Distributed tuner quick-start:
+    export TUNE_HMAC_KEY_HEX=\$(openssl rand -hex 32)
+    mpirun -np 4 ./src/tunad --threads 4 --games 2000
 ])

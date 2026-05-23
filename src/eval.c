@@ -51,5 +51,5 @@ int game_phase(const Board *b) {
  * mobility, king safety, and any other patterns captured during training.
  */
 int evaluate(const Board *b) {
-    return nnue_eval(&g_nnue, b);
+    return nnue_eval(g_nnue, b);
 }

@@ -1,3 +1,4 @@
+name: release-binaries
 
 on:
   release:
@@ -7,78 +8,236 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  build_unix:
+    name: ${{ matrix.source.ref }}-${{ matrix.os.id }}-${{ matrix.arch.id }}
     strategy:
+      fail-fast: false
       matrix:
+        source:
+          - ref: main
+            suffix: ""
+          - ref: NNUEval
+            suffix: "_NNUE"
         os:
-          - { name: ubuntu-latest,  id: linux,   pkg: apt  }
-          - { name: macos-latest,   id: macos,   pkg: brew }
-          - { name: macos-13,       id: macos,   pkg: brew }
+          - runner: ubuntu-latest
+            id: linux
+            pkg: apt
+          - runner: macos-latest
+            id: macos
+            pkg: brew
+          - runner: macos-13
+            id: macos
+            pkg: brew
         arch:
-          - { id: x86_64,    cc_linux: gcc,                     cc_macos: clang, march: x86-64,    host_triple: x86_64-linux-gnu,   bin_name: x86_64 }
-          - { id: x86_64_v3, cc_linux: gcc,                     cc_macos: clang, march: x86-64-v3, host_triple: x86_64-linux-gnu,   bin_name: AVX2   }
-          - { id: x86_64_v4, cc_linux: gcc,                     cc_macos: clang, march: x86-64-v4, host_triple: x86_64-linux-gnu,   bin_name: AVX512 }
-          - { id: arm64,     cc_linux: aarch64-linux-gnu-gcc,   cc_macos: clang, march: armv8-a,   host_triple: aarch64-linux-gnu,  bin_name: arm64  }
-
+          - id: x86_64
+            cc_linux: gcc
+            cc_macos: clang
+            march: x86-64
+            host_triple: x86_64-linux-gnu
+            bin_name: x86_64
+          - id: x86_64_v3
+            cc_linux: gcc
+            cc_macos: clang
+            march: x86-64-v3
+            host_triple: x86_64-linux-gnu
+            bin_name: AVX2
+          - id: x86_64_v4
+            cc_linux: gcc
+            cc_macos: clang
+            march: x86-64-v4
+            host_triple: x86_64-linux-gnu
+            bin_name: AVX512
+          - id: arm64
+            cc_linux: aarch64-linux-gnu-gcc
+            cc_macos: clang
+            march: armv8-a
+            host_triple: aarch64-linux-gnu
+            bin_name: arm64
         exclude:
-          # macOS ARM runner (macos-latest) is already ARM — skip x86 cross
-          - os: { name: macos-latest }
-            arch: { id: x86_64 }
-          - os: { name: macos-latest }
-            arch: { id: x86_64_v3 }
-          - os: { name: macos-latest }
-            arch: { id: x86_64_v4 }
-          # macos-13 is Intel — skip ARM targets
-          - os: { name: macos-13 }
-            arch: { id: arm64 }
+          - os:
+              runner: macos-latest
+              id: macos
+              pkg: brew
+            arch:
+              id: x86_64
+          - os:
+              runner: macos-latest
+              id: macos
+              pkg: brew
+            arch:
+              id: x86_64_v3
+          - os:
+              runner: macos-latest
+              id: macos
+              pkg: brew
+            arch:
+              id: x86_64_v4
+          - os:
+              runner: macos-13
+              id: macos
+              pkg: brew
+            arch:
+              id: arm64
 
-    runs-on: ${{ matrix.os.name }}
-    name: ${{ matrix.os.id }}-${{ matrix.arch.id }}
+    runs-on: ${{ matrix.os.runner }}
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout source branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.source.ref }}
+          fetch-depth: 0
 
-    - name: install dependencies (apt)
-      if: matrix.os.pkg == 'apt'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y autoconf automake autoconf-archive \
-          gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+      - name: install dependencies (apt)
+        if: matrix.os.pkg == 'apt'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake autoconf-archive \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
 
-    - name: install dependencies (brew)
-      if: matrix.os.pkg == 'brew'
-      run: brew install autoconf automake autoconf-archive
+      - name: install dependencies (brew)
+        if: matrix.os.pkg == 'brew'
+        run: brew install autoconf automake autoconf-archive
 
-    - name: bootstrap
-      run: autoreconf --install
+      - name: bootstrap
+        run: autoreconf --install
 
-    - name: configure
-      run: |
-        if [ "${{ matrix.os.id }}" = "linux" ]; then
-          echo "CC=${{ matrix.arch.cc_linux }}" >> $GITHUB_ENV
-        else
-          echo "CC=${{ matrix.arch.cc_macos }}" >> $GITHUB_ENV
-        fi
+      - name: configure compiler
+        run: |
+          if [ "${{ matrix.os.id }}" = "linux" ]; then
+            echo "CC=${{ matrix.arch.cc_linux }}" >> "$GITHUB_ENV"
+          else
+            echo "CC=${{ matrix.arch.cc_macos }}" >> "$GITHUB_ENV"
+          fi
 
-    - name: configure
-      run: |
-        ./configure \
-          --host=${{ matrix.arch.host_triple }} \
-          CFLAGS="-march=${{ matrix.arch.march }}"
+      - name: configure
+        run: |
+          ./configure \
+            --host=${{ matrix.arch.host_triple }} \
+            CFLAGS="-march=${{ matrix.arch.march }}"
 
-    - name: make
-      run: make
-      
-    - name: smoke_test
-      if: matrix.arch.id == 'x86_64'
-      run: make perft
+      - name: make
+        run: make
 
-    - name: rename binary
-      run: |
-        mkdir -p dist
-        cp src/engine dist/salmon-${{ matrix.os.id }}-${{ matrix.arch.bin_name }}
+      - name: smoke_test
+        if: matrix.arch.id == 'x86_64' && matrix.os.id == 'linux' && matrix.source.ref == 'main'
+        run: make perft
 
-    - name: upload to release
-      uses: softprops/action-gh-release@v2
-      with:
-        files: dist/salmon-${{ matrix.os.id }}-${{ matrix.arch.bin_name }}
+      - name: stage binary
+        run: |
+          mkdir -p dist
+          binary_path="src/engine"
+          if [ -f src/engine.exe ]; then
+            binary_path="src/engine.exe"
+          fi
+
+          out_name="salmon-${{ matrix.os.id }}-${{ matrix.arch.bin_name }}${{ matrix.source.suffix }}"
+          if [ "${{ matrix.os.id }}" = "windows" ]; then
+            out_name="${out_name}.exe"
+          fi
+
+          cp "$binary_path" "dist/$out_name"
+
+      - name: upload build artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unix-${{ matrix.source.ref }}-${{ matrix.os.id }}-${{ matrix.arch.id }}
+          path: dist/*
+
+  build_windows:
+    name: windows-${{ matrix.source.ref }}-${{ matrix.arch.id }}
+    strategy:
+      fail-fast: false
+      matrix:
+        source:
+          - ref: main
+            suffix: ""
+          - ref: NNUEval
+            suffix: "_NNUE"
+        arch:
+          - id: x86_64
+            host_triple: x86_64-w64-mingw32
+            cc: x86_64-w64-mingw32-gcc
+            bin_name: x86_64
+          - id: x86_64_v3
+            host_triple: x86_64-w64-mingw32
+            cc: x86_64-w64-mingw32-gcc
+            bin_name: AVX2
+          - id: x86_64_v4
+            host_triple: x86_64-w64-mingw32
+            cc: x86_64-w64-mingw32-gcc
+            bin_name: AVX512
+          - id: arm64
+            host_triple: aarch64-w64-mingw32
+            cc: aarch64-w64-mingw32-gcc
+            bin_name: arm64
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.source.ref }}
+          fetch-depth: 0
+
+      - name: install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake autoconf-archive \
+            mingw-w64 gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+
+      - name: bootstrap
+        run: autoreconf --install
+
+      - name: configure compiler
+        run: |
+          echo "CC=${{ matrix.arch.cc }}" >> "$GITHUB_ENV"
+          echo "LDFLAGS=-static" >> "$GITHUB_ENV"
+
+      - name: configure
+        run: |
+          ./configure \
+            --host=${{ matrix.arch.host_triple }} \
+            CFLAGS="-march=${{ matrix.arch.id == 'x86_64_v3' && 'x86-64-v3' || matrix.arch.id == 'x86_64_v4' && 'x86-64-v4' || 'x86-64' }}" \
+            LDFLAGS="-static"
+
+      - name: make
+        run: make
+
+      - name: stage binary
+        run: |
+          mkdir -p dist
+          binary_path="src/engine.exe"
+          if [ ! -f "$binary_path" ]; then
+            binary_path="src/engine"
+          fi
+
+          out_name="salmon-windows-${{ matrix.arch.bin_name }}${{ matrix.source.suffix }}.exe"
+          cp "$binary_path" "dist/$out_name"
+
+      - name: upload build artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.source.ref }}-${{ matrix.arch.id }}
+          path: dist/*
+
+  publish_release:
+    name: publish release assets
+    needs: [build_unix, build_windows]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: download all artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: upload to release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          files: release-assets/**
+          overwrite: true

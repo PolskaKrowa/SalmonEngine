@@ -189,7 +189,7 @@ bool is_square_attacked(const Board *b, Square sq, Color attacker) {
 bool in_check(const Board *b) {
     Bitboard king_bb = b->pieces[b->side][KING];
     if (!king_bb) return false; /* guard against missing king */
-    int king_sq = bb_lsb(&king_bb);
+    int king_sq = bb_lsb(king_bb);
     return is_square_attacked(b, (Square)king_sq, (Color)(b->side ^ 1));
 }
 

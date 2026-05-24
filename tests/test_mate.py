@@ -25,7 +25,7 @@ def query_engine(engine_path: str, fen: str, movetime_ms: int = 2000) -> str:
             line = line.rstrip()
             lines.append(line)
             if line.startswith(token):
-                return lines
+                break  # <-- stop reading immediately, don't wait for more
         return lines
 
     send("uci")
@@ -34,11 +34,8 @@ def query_engine(engine_path: str, fen: str, movetime_ms: int = 2000) -> str:
     send(f"position fen {fen}")
     send(f"go movetime {movetime_ms}")
     lines = read_until("bestmove")
-    send("quit")
-    try:
-        proc.stdin.close()
-    except BrokenPipeError:
-        pass
+    proc.stdin.close()
+    proc.stdout.close()
     proc.wait()
 
     for line in lines:

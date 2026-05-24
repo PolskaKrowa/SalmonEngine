@@ -100,6 +100,9 @@ int nnue_get_features(const Board *b, int perspective, int *features) {
 
 /* ── Accumulator refresh ─────────────────────────────────────────── */
 void nnue_accum_refresh(const NNUENet *net, const Board *b, NNUEAccum *acc) {
+    if (!net || !b || !acc)
+        return;
+
     for (int pov = 0; pov < 2; pov++) {
         int ksq = king_square(b, pov);
         acc->king_sq[pov] = ksq;
@@ -137,6 +140,8 @@ void nnue_accum_update(const NNUENet *net, NNUEAccum *acc, int pov,
 
 /* ── Forward pass (L1 + L2 + output) from accumulator ───────────── */
 int nnue_eval_from_accum(const NNUENet *net, const NNUEAccum *acc, int stm) {
+    /* Defensive checks to avoid null-pointer dereference reported by sanitizer */
+    if (net == NULL || acc == NULL) return 0;
     /*
      * Step 1: SCReLU the two accumulator halves and concatenate.
      *   x[0..L1)      = SCReLU(acc[stm])

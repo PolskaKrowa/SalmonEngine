@@ -1,3 +1,6 @@
+> [!CAUTION]
+> SalmonEngine's NNUE branch ***requires*** the existance of a .bin file which contains the model weights, and does not (and will not) come with hard-coded weights inside of the program binary. Currently the bot will initialise random weights on program start, which may feel like the engine isn't good at chess. In the not too distant future, i will provide pretuned model weights in the repository source and releases page.
+
 # SalmonEngine 🐟
 
 A ~~traditional~~ chess engine built in C, designed to be ~~**understandable, transparent, and easy to learn from**. No neural networks, no black boxes — just pure chess logic you can read, follow, and modify without a PhD in machine learning.~~ good.

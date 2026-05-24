@@ -276,20 +276,21 @@ Create `appfile.txt` on the head node:
 
 ```
 # Head node
--host 192.168.1.10 -np 4 /home/youruser/SalmonEngine/src/tunad
+-host 192.168.1.10 -np 1 /home/youruser/SalmonEngine/src/tunad --threads 4
 
 # Worker nodes — SSH config aliases (node1, node2, node3) are used here,
 # so MPI connects as the right user automatically
--host node1 -np 4 /home/alice/SalmonEngine/src/tunad
--host node2 -np 4 /home/bob/SalmonEngine/src/tunad
--host node3 -np 4 /home/carol/SalmonEngine/src/tunad
+-host node1 -np 1 /home/alice/SalmonEngine/src/tunad --threads 4
+-host node2 -np 1 /home/bob/SalmonEngine/src/tunad --threads 4
+-host node3 -np 1 /home/carol/SalmonEngine/src/tunad --threads 4
 ```
 
 Each line specifies:
 
 - `-host` — which machine to use (hostname, IP, or SSH config alias)
-- `-np` — number of MPI processes on that machine (typically one per physical CPU core)
+- `-np` — number of MPI processes on that machine (tunad already handles threading via POSIX threads.)
 - the path — where the Tunad binary lives **on that specific machine**
+- `--threads` — number of CPU threads tunad will occupy. (defaults to 4 threads. Ideally this should be set to the maximum amount of threads available on your machine.)
 
 ---
 

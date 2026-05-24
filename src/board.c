@@ -173,8 +173,9 @@ void board_print(const Board *b) {
  * ────────────────────────────────────────────── */
 bool is_square_attacked(const Board *b, Square sq, Color attacker) {
     Bitboard occ = b->occ[2];
-    /* Protect against invalid square (NO_SQ==64) */
-    if (sq == NO_SQ) return false;
+     /* Protect against invalid square (NO_SQ may be 64 or use sentinel like -1)
+         Guard against any out-of-range value to avoid indexing attack tables. */
+     if ((unsigned)sq >= 64) return false;
 
     if (PAWN_ATTACKS[attacker ^ 1][sq] & b->pieces[attacker][PAWN])   return true;
     if (KNIGHT_ATTACKS[sq]             & b->pieces[attacker][KNIGHT])  return true;

@@ -25,6 +25,7 @@ tuna
 tunad
 build-aux/
 *.bin
+hostfile
 
 # tilda means old according to autoconf.
 configure~

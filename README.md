@@ -148,6 +148,24 @@ I like salmon.
 
 ---
 
+## Tuning
+
+### Tuna
+
+This branch uses an Adam tuner (named Tuna for an obvious reason: Fish.) and can be compiled by passing `--enable-tuner` to the `./configure` command.
+
+Tuna requires the "OpenBLAS" library and development headers to be installed.
+
+### Tunad
+
+This isn't a mis-spelling of "Tuna", it's a local-cluster distributed tuning program that uses OpenMPI to distribute the computational workload across multiple machines on the same network. (Linux/MacOS only. Sorry windows users.)
+
+To use Tunad properly, you must configure your OpenMPI cluster network to allow Tunad to share data across your compute nodes and allow for all processes to run properly.
+
+A full guide on using Tunad can be found in [this document](TUNAD.md)
+
+---
+
 ## Contributing
 
 Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for how to get started.

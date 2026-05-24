@@ -63,14 +63,17 @@ static inline Bitboard queen_attacks(Square sq, Bitboard occ) {
  *  Bit-manipulation helpers (all inline / intrinsic)
  * ────────────────────────────────────────────── */
 static inline int bb_lsb(Bitboard bb) {
+    if (bb == 0) return -1;
     return __builtin_ctzll(bb);
 }
 
 static inline int bb_msb(Bitboard bb) {
+    if (bb == 0) return -1;
     return 63 ^ __builtin_clzll(bb);
 }
 
 static inline int bb_pop(Bitboard *bb) {
+    if (*bb == 0) return -1;
     int sq = __builtin_ctzll(*bb);
     *bb &= *bb - 1;
     return sq;

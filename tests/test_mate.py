@@ -16,11 +16,8 @@ def query_engine(engine_path: str, fen: str, movetime_ms: int = 2000) -> str:
     )
 
     def send(cmd: str):
-        try:
-            proc.stdin.write(cmd + "\n")
-            proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            pass
+        proc.stdin.write(cmd + "\n")
+        proc.stdin.flush()
 
     def read_until(token: str) -> list[str]:
         lines = []
@@ -38,6 +35,10 @@ def query_engine(engine_path: str, fen: str, movetime_ms: int = 2000) -> str:
     send(f"go movetime {movetime_ms}")
     lines = read_until("bestmove")
     send("quit")
+    try:
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
     proc.wait()
 
     for line in lines:

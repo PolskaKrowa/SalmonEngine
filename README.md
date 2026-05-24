@@ -1,3 +1,6 @@
+> [!CAUTION]
+> SalmonEngine's NNUE branch ***requires*** the existance of a .bin file which contains the model weights, and does not (and will not) come with hard-coded weights inside of the program binary. Currently the bot will initialise random weights on program start, which may feel like the engine isn't good at chess. In the not too distant future, i will provide pretuned model weights in the repository source and releases page.
+
 # SalmonEngine 🐟
 
 A ~~traditional~~ chess engine built in C, designed to be ~~**understandable, transparent, and easy to learn from**. No neural networks, no black boxes — just pure chess logic you can read, follow, and modify without a PhD in machine learning.~~ good.
@@ -63,6 +66,10 @@ Pre-compiled binaries for Linux, macOS, and Windows across x86-64 and ARM64 are 
 | macOS          | ARM64       | Apple Silicon|
 
 > If you're not sure which to pick, use the `x86_64` build. Use `x86_64_v3` if your CPU is from 2013 or later and you want better performance.
+
+> [!NOTE]
+> Windows users are advised to use the pre-built binaries and not to compile the program themselves.
+> If you can figure out how to juggle around MSYS2 or cygwin to build this locally, then go for it. (Don't complain about the difficulty for building on windows, It's not my fault that microshaft is a piece of ████)
 
 ### Build Options
 

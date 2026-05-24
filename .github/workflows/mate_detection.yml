@@ -19,4 +19,4 @@ jobs:
         python3 tests/test_mate.py \
           --engine src/engine \
           --positions tests/mate_positions.csv \
-          --movetime 2000
+          --depth 14

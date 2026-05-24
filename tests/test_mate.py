@@ -6,7 +6,7 @@ from pathlib import Path
 PASS = "\033[32mPASS\033[0m"
 FAIL = "\033[31mFAIL\033[0m"
 
-def query_engine(engine_path: str, fen: str, movetime_ms: int = 2000) -> str:
+def query_engine(engine_path: str, fen: str, depth: int = 14) -> str:
     proc = subprocess.Popen(
         [engine_path],
         stdin=subprocess.PIPE,
@@ -25,16 +25,17 @@ def query_engine(engine_path: str, fen: str, movetime_ms: int = 2000) -> str:
             line = line.rstrip()
             lines.append(line)
             if line.startswith(token):
-                return lines
+                break  # <-- stop reading immediately, don't wait for more
         return lines
 
     send("uci")
     read_until("uciok")
     send("ucinewgame")
     send(f"position fen {fen}")
-    send(f"go movetime {movetime_ms}")
+    send(f"go depth {depth}")
     lines = read_until("bestmove")
-    send("quit")
+    proc.stdin.close()
+    proc.stdout.close()
     proc.wait()
 
     for line in lines:
@@ -44,7 +45,7 @@ def query_engine(engine_path: str, fen: str, movetime_ms: int = 2000) -> str:
     return ""
 
 
-def run(engine_path: str, positions_csv: str, movetime_ms: int) -> bool:
+def run(engine_path: str, positions_csv: str, depth: int) -> bool:
     rows = list(csv.DictReader(Path(positions_csv).read_text().splitlines()))
     passed = failed = 0
 
@@ -52,7 +53,7 @@ def run(engine_path: str, positions_csv: str, movetime_ms: int) -> bool:
         fen      = row["fen"]
         expected = row["best_move"].strip()
         label    = row.get("label", fen)
-        actual   = query_engine(engine_path, fen, movetime_ms)
+        actual   = query_engine(engine_path, fen, depth)
 
         if actual == expected:
             print(f"{PASS}  {label}  (played {actual})")
@@ -71,7 +72,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--engine",    required=True)
     p.add_argument("--positions", default="tests/mate_positions.csv")
-    p.add_argument("--movetime",  type=int, default=2000)
+    p.add_argument("--depth",  type=int, default=14)
     args = p.parse_args()
 
-    sys.exit(0 if run(args.engine, args.positions, args.movetime) else 1)
+    sys.exit(0 if run(args.engine, args.positions, args.depth) else 1)

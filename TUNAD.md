@@ -238,14 +238,14 @@ If any of these still prompt for a password, check that:
 
 Because each machine compiles its own binary, architecture differences (x86_64 vs ARM, Linux vs macOS) are handled automatically by Tunad's `configure` script.
 
-### 1. Copy the Tunad source to every machine
+### 1. Copy the SalmonEngine source to every machine
 
 From the head node:
 
 ```bash
 for node in node1 node2 node3; do
     echo "Copying source to $node..."
-    scp -r /path/to/tunad ${node}:~/tunad
+    scp -r /path/to/SalmonEngine ${node}:~/SalmonEngine
 done
 ```
 
@@ -254,14 +254,14 @@ done
 ```bash
 for node in node1 node2 node3; do
     echo "Building on $node..."
-    ssh ${node} "cd ~/tunad && ./configure --enable-dist-tuner && make -j$(nproc)"
+    ssh ${node} "cd ~/SalmonEngine && ./configure --enable-dist-tuner && make -j$(nproc)"
 done
 ```
 
 Also build on the head node itself:
 
 ```bash
-cd /path/to/tunad && ./configure --enable-dist-tuner && make -j$(nproc)
+cd /path/to/SalmonEngine && ./configure --enable-dist-tuner && make -j$(nproc)
 ```
 
 Each machine now has a natively compiled binary at `~/SalmonEngine/src/tunad` (or wherever `make` places the output).

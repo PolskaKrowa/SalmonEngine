@@ -243,40 +243,122 @@ int dist_checkpoint_save(DistCtx *ctx, const NNUENet *net, const char *path,
         return 0;
     }
 
-    /* ── Rank 0: write payload then HMAC tag ─────────────────────────── */
+    /* ── Rank 0 only ─────────────────────────────────────────────────────
+     *
+     * Strategy: delegate serialisation entirely to nnue_save() so the on-disk
+     * format is identical to what the engine reads natively (magic, version,
+     * architecture header, then weight arrays).  The HMAC tag is appended
+     * after the NNUE payload; dist_checkpoint_load() knows to strip it.
+     *
+     * Steps:
+     *   1. nnue_save() → a uniquely named temp file  (handles its own atomic
+     *      rename internally, so we get a fully flushed, valid NNUE file)
+     *   2. Read the temp file back into a heap buffer
+     *   3. Compute HMAC-SHA256 over those bytes
+     *   4. Write [nnue_payload][hmac_tag] to a second temp file, then rename
+     *      to `path` (atomic on POSIX)
+     */
 
-    FILE *f = fopen(path, "wb");
-    if (!f) {
-        fprintf(stderr, "[dist master] Cannot open checkpoint for writing: "
-                        "%s — %s\n", path, strerror(errno));
+    char nnue_tmp[512];
+    snprintf(nnue_tmp, sizeof nnue_tmp, "%s.nnue_tmp", path);
+
+    if (nnue_save(net, nnue_tmp) != 0) {
+        fprintf(stderr, "[dist master] nnue_save failed while saving "
+                        "checkpoint '%s'\n", path);
         result = -1;
         goto barrier;
     }
 
-    if (fwrite(net, sizeof *net, 1, f) != 1) {
-        fprintf(stderr, "[dist master] Short write to checkpoint: %s\n", path);
-        result = -1;
-        goto close;
+    {
+        /* ── Read the nnue_save output back as raw bytes ─────────────── */
+        FILE *f = fopen(nnue_tmp, "rb");
+        if (!f) {
+            fprintf(stderr, "[dist master] Cannot re-open temp NNUE file "
+                            "'%s': %s\n", nnue_tmp, strerror(errno));
+            remove(nnue_tmp);
+            result = -1;
+            goto barrier;
+        }
+
+        if (fseek(f, 0, SEEK_END) != 0) {
+            fprintf(stderr, "[dist master] fseek failed on '%s'\n", nnue_tmp);
+            fclose(f); remove(nnue_tmp);
+            result = -1;
+            goto barrier;
+        }
+        long nnue_size = ftell(f);
+        rewind(f);
+
+        if (nnue_size <= 0) {
+            fprintf(stderr, "[dist master] Unexpected size (%ld) for '%s'\n",
+                    nnue_size, nnue_tmp);
+            fclose(f); remove(nnue_tmp);
+            result = -1;
+            goto barrier;
+        }
+
+        unsigned char *buf = malloc((size_t)nnue_size);
+        if (!buf) {
+            fprintf(stderr, "[dist master] OOM reading NNUE temp file\n");
+            fclose(f); remove(nnue_tmp);
+            result = -1;
+            goto barrier;
+        }
+
+        if ((long)fread(buf, 1, (size_t)nnue_size, f) != nnue_size) {
+            fprintf(stderr, "[dist master] Short read from '%s'\n", nnue_tmp);
+            free(buf); fclose(f); remove(nnue_tmp);
+            result = -1;
+            goto barrier;
+        }
+        fclose(f);
+        remove(nnue_tmp);
+
+        /* ── Compute HMAC-SHA256 over the NNUE file bytes ────────────── */
+        unsigned char tag[DIST_HMAC_LEN];
+        if (compute_hmac_sha256(key, buf, (size_t)nnue_size, tag) != 0) {
+            fprintf(stderr, "[dist master] HMAC-SHA256 computation failed\n");
+            free(buf);
+            result = -1;
+            goto barrier;
+        }
+
+        /* ── Atomically write [nnue_payload][hmac_tag] ───────────────── */
+        char cp_tmp[512];
+        snprintf(cp_tmp, sizeof cp_tmp, "%s.tmp", path);
+
+        FILE *out = fopen(cp_tmp, "wb");
+        if (!out) {
+            fprintf(stderr, "[dist master] Cannot open checkpoint for writing: "
+                            "%s — %s\n", cp_tmp, strerror(errno));
+            free(buf);
+            result = -1;
+            goto barrier;
+        }
+
+        bool write_ok = (fwrite(buf, 1, (size_t)nnue_size, out)
+                                == (size_t)nnue_size)
+                     && (fwrite(tag, DIST_HMAC_LEN, 1, out) == 1);
+        free(buf);
+        fflush(out);
+        fclose(out);
+
+        if (!write_ok) {
+            fprintf(stderr, "[dist master] Short write to checkpoint '%s'\n",
+                    cp_tmp);
+            remove(cp_tmp);
+            result = -1;
+            goto barrier;
+        }
+
+        if (rename(cp_tmp, path) != 0) {
+            fprintf(stderr, "[dist master] rename('%s' → '%s') failed: %s\n",
+                    cp_tmp, path, strerror(errno));
+            remove(cp_tmp);
+            result = -1;
+        }
     }
 
-    unsigned char tag[DIST_HMAC_LEN];
-    if (compute_hmac_sha256(key, net, sizeof *net, tag) != 0) {
-        fprintf(stderr, "[dist master] HMAC-SHA256 computation failed\n");
-        result = -1;
-        goto close;
-    }
-
-    if (fwrite(tag, DIST_HMAC_LEN, 1, f) != 1) {
-        fprintf(stderr, "[dist master] Short write of HMAC tag: %s\n", path);
-        result = -1;
-        goto close;
-    }
-
-    /* fflush + fclose ensures the file is on disk before the barrier. */
-    fflush(f);
-
-close:
-    fclose(f);
 barrier:
     MPI_Barrier(ctx->comm);  /* signal non-masters that the file is ready */
     return result;
@@ -285,43 +367,127 @@ barrier:
 int dist_checkpoint_load(DistCtx *ctx, NNUENet *net, const char *path,
                           const unsigned char key[DIST_HMAC_KEY_LEN]) {
     int load_err = 0;
-    unsigned char stored_tag[DIST_HMAC_LEN] = {0};
 
-    /* Rank 0 reads, everyone else receives. */
+    /*
+     * Rank 0 reads and verifies; all other ranks wait, then receive the
+     * parsed network via MPI_Bcast.
+     *
+     * Strategy: mirror what dist_checkpoint_save() wrote —
+     *   [nnue_payload (nnue_save() format)][DIST_HMAC_LEN bytes of HMAC tag]
+     *
+     * Steps (rank 0 only):
+     *   1. Read the whole file into a heap buffer
+     *   2. Split at [total_size − DIST_HMAC_LEN]
+     *   3. Verify HMAC-SHA256 over the NNUE payload bytes
+     *   4. Write the payload to a temp file, call nnue_load() on it
+     *      (nnue_load validates magic, version, and architecture dimensions)
+     *   5. Remove the temp file
+     */
+
     if (ctx->rank == 0) {
         FILE *f = fopen(path, "rb");
         if (!f) {
             load_err = -1;
-        } else {
-            if (fread(net, sizeof *net, 1, f) != 1)
-                load_err = -1;
-            else if (fread(stored_tag, DIST_HMAC_LEN, 1, f) != 1)
-                load_err = -1;
-            fclose(f);
+            goto bcast_err;
         }
+
+        if (fseek(f, 0, SEEK_END) != 0) {
+            fclose(f);
+            load_err = -1;
+            goto bcast_err;
+        }
+        long total = ftell(f);
+        rewind(f);
+
+        long nnue_size = total - (long)DIST_HMAC_LEN;
+        if (nnue_size <= 0) {
+            fprintf(stderr,
+                "[dist master] Checkpoint '%s' is too small to contain a "
+                "valid NNUE payload + HMAC tag (total=%ld bytes)\n",
+                path, total);
+            fclose(f);
+            load_err = -1;
+            goto bcast_err;
+        }
+
+        unsigned char *buf = malloc((size_t)total);
+        if (!buf) {
+            perror("[dist master] malloc in dist_checkpoint_load");
+            fclose(f);
+            load_err = -1;
+            goto bcast_err;
+        }
+
+        if ((long)fread(buf, 1, (size_t)total, f) != total) {
+            fprintf(stderr, "[dist master] Short read from checkpoint '%s'\n",
+                    path);
+            free(buf); fclose(f);
+            load_err = -1;
+            goto bcast_err;
+        }
+        fclose(f);
+
+        /* ── HMAC verification over the NNUE payload bytes ───────────── */
+        const unsigned char *stored_tag  = buf + nnue_size;
+        unsigned char        computed_tag[DIST_HMAC_LEN];
+
+        if (compute_hmac_sha256(key, buf, (size_t)nnue_size, computed_tag) != 0) {
+            fprintf(stderr, "[dist master] HMAC-SHA256 computation failed "
+                            "during load of '%s'\n", path);
+            free(buf);
+            load_err = -1;
+            goto bcast_err;
+        }
+
+        if (!hmac_eq_ct(stored_tag, computed_tag)) {
+            fprintf(stderr,
+                "[dist master] HMAC-SHA256 verification FAILED for '%s'.\n"
+                "  The checkpoint may be corrupted or was written with a\n"
+                "  different key.  Refusing to load — net zeroed for safety.\n",
+                path);
+            free(buf);
+            memset(net, 0, sizeof *net);
+            load_err = -2;
+            goto bcast_err;
+        }
+
+        /* ── Write NNUE payload to a temp file for nnue_load() ───────── */
+        /*
+         * nnue_load() validates magic, version, and architecture dimensions,
+         * giving us a second layer of structural integrity on top of the HMAC.
+         */
+        char tmp[512];
+        snprintf(tmp, sizeof tmp, "%s.nnue_tmp", path);
+
+        FILE *tf = fopen(tmp, "wb");
+        if (!tf ||
+            fwrite(buf, 1, (size_t)nnue_size, tf) != (size_t)nnue_size) {
+            fprintf(stderr, "[dist master] Failed to write temp NNUE file "
+                            "'%s': %s\n", tmp, strerror(errno));
+            if (tf) { fclose(tf); remove(tmp); }
+            free(buf);
+            load_err = -1;
+            goto bcast_err;
+        }
+        fclose(tf);
+        free(buf);
+
+        if (nnue_load(net, tmp) != 0) {
+            fprintf(stderr, "[dist master] nnue_load failed for checkpoint "
+                            "'%s' (NNUE payload from '%s')\n", path, tmp);
+            remove(tmp);
+            load_err = -1;
+            goto bcast_err;
+        }
+        remove(tmp);
     }
 
+bcast_err:
     MPI_Bcast(&load_err, 1, MPI_INT, 0, ctx->comm);
     if (load_err != 0)
-        return -1;
+        return load_err;
 
     MPI_Bcast(net, (int)sizeof *net, MPI_BYTE, 0, ctx->comm);
-    MPI_Bcast(stored_tag, DIST_HMAC_LEN, MPI_BYTE, 0, ctx->comm);
-
-    unsigned char computed_tag[DIST_HMAC_LEN];
-    if (compute_hmac_sha256(key, net, sizeof *net, computed_tag) != 0)
-        return -1;
-
-    if (!hmac_eq_ct(stored_tag, computed_tag)) {
-        fprintf(stderr,
-            "[dist rank %d] HMAC-SHA256 verification FAILED for '%s'.\n"
-            "  The checkpoint may be corrupted or was written with a\n"
-            "  different key.  Refusing to load — net zeroed for safety.\n",
-            ctx->rank, path);
-        /* Zero the network so the caller can detect a bad load and reinit. */
-        memset(net, 0, sizeof *net);
-        return -2;
-    }
     return 0;
 }
 

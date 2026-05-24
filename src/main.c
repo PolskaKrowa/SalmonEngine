@@ -24,7 +24,15 @@ int main(void) {
     /* One-time initialisation */
     bitboard_init();
     board_init();
-    if (nnue_load(&g_nnue, "nnue.bin") != 0) nnue_init_random(&g_nnue);
+
+    g_nnue = nnue_alloc();
+    
+    if (!g_nnue) {
+        fprintf(stderr, "Failed to allocate NNUE net\n");
+        return 1;
+    }
+
+    if (nnue_load(g_nnue, "nnue.bin") != 0) nnue_init_random(g_nnue);
     search_init();
 
     /* Enter UCI command loop */

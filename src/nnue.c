@@ -183,6 +183,7 @@ int nnue_eval_from_accum(const NNUENet *net, const NNUEAccum *acc, int stm) {
 
 /* ── High-level evaluation ───────────────────────────────────────── */
 int nnue_eval(const NNUENet *net, const Board *b) {
+    if (!net || !b) return 0;
     NNUEAccum acc;
     nnue_accum_refresh(net, b, &acc);
     return nnue_eval_from_accum(net, &acc, b->side);
@@ -269,6 +270,7 @@ err:
 }
 
 int nnue_load(NNUENet *net, const char *path) {
+    if (!net) { fprintf(stderr, "nnue_load: net not initialised\n"); return -1; }
     FILE *f = fopen(path, "rb");
     if (!f) { perror("nnue_load: fopen"); return -1; }
 

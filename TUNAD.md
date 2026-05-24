@@ -254,14 +254,14 @@ done
 ```bash
 for node in node1 node2 node3; do
     echo "Building on $node..."
-    ssh ${node} "cd ~/tunad && ./configure && make -j$(nproc)"
+    ssh ${node} "cd ~/tunad && ./configure --enable-dist-tuner && make -j$(nproc)"
 done
 ```
 
 Also build on the head node itself:
 
 ```bash
-cd /path/to/tunad && ./configure && make -j$(nproc)
+cd /path/to/tunad && ./configure --enable-dist-tuner && make -j$(nproc)
 ```
 
 Each machine now has a natively compiled binary at `~/SalmonEngine/src/tunad` (or wherever `make` places the output).
@@ -313,7 +313,7 @@ mpirun --mca orte_base_help_aggregate 0 --app appfile.txt
 
 - **Firewall popups:** The first time `mpirun` tries to accept network connections, macOS may prompt you. Click "Allow", or pre-authorize it under System Settings → Network → Firewall → Options.
 - **SIP (System Integrity Protection)** can block inter-process communication in some configurations. If you see permission errors that don't make obvious sense, this is worth looking into.
-- **macOS uses clang under the hood**, but `mpicc` wraps it transparently — the `./configure && make` workflow is identical to Linux.
+- **macOS uses clang under the hood**, but `mpicc` wraps it transparently — the `./configure --enable-dist-tuner && make` workflow is identical to Linux.
 
 ---
 

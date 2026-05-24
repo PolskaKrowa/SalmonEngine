@@ -67,6 +67,10 @@ Pre-compiled binaries for Linux, macOS, and Windows across x86-64 and ARM64 are 
 
 > If you're not sure which to pick, use the `x86_64` build. Use `x86_64_v3` if your CPU is from 2013 or later and you want better performance.
 
+> [!NOTE]
+> Windows users are advised to use the pre-built binaries and not to compile the program themselves.
+> If you can figure out how to juggle around MSYS2 or cygwin to build this locally, then go for it. (Don't complain about the difficulty for building on windows, It's not my fault that microshaft is a piece of ████)
+
 ### Build Options
 
 ```bash

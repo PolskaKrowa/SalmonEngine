@@ -298,6 +298,10 @@ int quiesce(Board *b, int alpha, int beta, int ply, SearchInfo *si) {
     si->nodes++;
     if (ply > si->seldepth) si->seldepth = ply;
 
+    /* Hard ceiling: prevent move_stack overflow and infinite recursion */
+    if (ply >= MAX_PLY)
+        return evaluate(b);
+
     bool in_chk = in_check(b);
 
     int stand_pat = evaluate(b);

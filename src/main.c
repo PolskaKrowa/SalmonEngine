@@ -13,6 +13,7 @@
 #include "board.h"
 #include "search.h"
 #include "uci.h"
+#include "nnue.h"
 #include <stdio.h>
 
 int main(void) {
@@ -23,6 +24,7 @@ int main(void) {
     /* One-time initialisation */
     bitboard_init();
     board_init();
+    if (nnue_load(&g_nnue, "nnue.bin") != 0) nnue_init_random(&g_nnue);
     search_init();
 
     /* Enter UCI command loop */

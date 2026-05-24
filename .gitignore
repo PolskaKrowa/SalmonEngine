@@ -23,8 +23,8 @@ config.status
 engine
 tuna
 tunad
+suptuna
 build-aux/
-*.bin
 hostfile
 
 # tilda means old according to autoconf.

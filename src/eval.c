@@ -3,7 +3,7 @@
  *
  * All hand-crafted heuristics (PST, mobility, pawn structure, king safety,
  * etc.) are replaced by a forward pass through the global NNUE network
- * g_nnue.  The network is a float32 HalfKA NNUE trained by tune.c.
+ * g_nnue.
  *
  * Startup sequence (in main / engine_init):
  *   1. bitboard_init();

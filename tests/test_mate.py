@@ -16,8 +16,11 @@ def query_engine(engine_path: str, fen: str, movetime_ms: int = 2000) -> str:
     )
 
     def send(cmd: str):
-        proc.stdin.write(cmd + "\n")
-        proc.stdin.flush()
+        try:
+            proc.stdin.write(cmd + "\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
 
     def read_until(token: str) -> list[str]:
         lines = []

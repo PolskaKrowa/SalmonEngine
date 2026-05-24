@@ -173,6 +173,8 @@ void board_print(const Board *b) {
  * ────────────────────────────────────────────── */
 bool is_square_attacked(const Board *b, Square sq, Color attacker) {
     Bitboard occ = b->occ[2];
+    /* Protect against invalid square (NO_SQ==64) */
+    if (sq == NO_SQ) return false;
 
     if (PAWN_ATTACKS[attacker ^ 1][sq] & b->pieces[attacker][PAWN])   return true;
     if (KNIGHT_ATTACKS[sq]             & b->pieces[attacker][KNIGHT])  return true;
@@ -185,7 +187,9 @@ bool is_square_attacked(const Board *b, Square sq, Color attacker) {
 }
 
 bool in_check(const Board *b) {
-    int king_sq = bb_lsb(b->pieces[b->side][KING]);
+    Bitboard king_bb = b->pieces[b->side][KING];
+    if (!king_bb) return false; /* guard against missing king */
+    int king_sq = bb_lsb(&king_bb);
     return is_square_attacked(b, (Square)king_sq, (Color)(b->side ^ 1));
 }
 

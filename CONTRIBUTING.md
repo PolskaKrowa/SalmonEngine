@@ -87,8 +87,6 @@ SalmonEngine is plain C (C2x). Keep new code consistent with what's already ther
 
 If you're tweaking `eval.c`, include perft results before and after to confirm movegen is untouched, and if you have self-play Elo data (via cutechess or similar) include that too. Even informal "tested at 10+0.1, +15 ± 20 Elo" is useful context.
 
-There is a github workflow that *should* test your changes against the main branch engine and report results for you, This is simply to provide extra information if you fail to provide your own results for whatever reason.
-
 ### Search Changes
 
 Search changes are the trickiest to evaluate. Try to:

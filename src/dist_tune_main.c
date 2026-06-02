@@ -33,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <unistd.h>
 
 /* ── Defaults ────────────────────────────────────────────────────────────── */
 #define DEFAULT_ITERATIONS      50

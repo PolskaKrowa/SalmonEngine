@@ -68,7 +68,7 @@ tuna_CFLAGS  = $(AM_CFLAGS) -DTUNE_STANDALONE
 tuna_LDADD   = -lm $(OPENBLAS_LIBS) -lpthread
 
 bin_PROGRAMS += suptuna
-suptuna_SOURCES = $(ENGINE_SOURCES) uci.c supervised_tune.c
+suptuna_SOURCES = $(ENGINE_SOURCES) search.c eval.c tt.c uci.c book.c supervised_tune.c
 suptuna_CFLAGS  = $(AM_CFLAGS) -DSUPERVISED_STANDALONE
 suptuna_LDADD   = -lm $(OPENBLAS_LIBS) -lpthread
 endif

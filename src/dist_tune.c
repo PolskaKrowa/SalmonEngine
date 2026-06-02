@@ -135,6 +135,10 @@ void dist_barrier(DistCtx *ctx) {
 void dist_allreduce_gradients(NNUEGrad *g) {
     if (!g_dist || g_dist->size <= 1) return;  /* single node: nothing to do */
 
+    _Static_assert(sizeof(NNUEGrad) == sizeof(float) * NNUE_TOTAL_PARAMS,
+                "NNUEGrad must be a packed float array for MPI_Allreduce; "
+                "update dist_tune.c if the struct layout changes.");
+
     int rc = MPI_Allreduce(MPI_IN_PLACE,
                             (float *)g,
                             NNUE_TOTAL_PARAMS,

@@ -613,6 +613,7 @@ typedef struct {
     int              start, end;
     NNUEGrad        *grad;
     double           partial_loss;
+    int              n_processed;   /* Bug 2 fix: track examples that weren't skipped */
     int              n_neg;
     float            margin;
     unsigned int     rng;
@@ -621,24 +622,48 @@ typedef struct {
 static void *sup_grad_worker_fn(void *arg) {
     SupGradWorker *w = (SupGradWorker *)arg;
     double loss = 0.0;
+    int    n_processed = 0;
+    int    n_skip_fen = 0, n_skip_move = 0, n_skip_legal = 0;
     Board b;
 
     for (int i = w->start; i < w->end; i++) {
-        if (SUP_BOARD_FROM_FEN(&b, w->examples[i].fen) != 0) {
-            /* Board initialisation failed — skip silently */
+        if (SUP_BOARD_FROM_FEN(&b, w->examples[i].fen) == 0) {
+            /* board_from_fen returns non-zero on success in this engine */
+            if (++n_skip_fen <= 3)
+                fprintf(stderr, "[SKIP][thread] board_from_fen failed: '%s'\n",
+                        w->examples[i].fen);
             continue;
         }
         Move best = SUP_MOVE_FROM_UCI(&b, w->examples[i].best_move);
         if (!best) {
-            /* Move parse failed — skip */
+            if (++n_skip_move <= 3)
+                fprintf(stderr, "[SKIP][thread] str_to_move failed: move='%s' fen='%s'\n",
+                        w->examples[i].best_move, w->examples[i].fen);
             continue;
         }
-        if (!is_legal(&b, best)) continue;
+        if (!is_legal(&b, best)) {
+            if (++n_skip_legal <= 3)
+                fprintf(stderr, "[SKIP][thread] is_legal rejected: move='%s' fen='%s'\n",
+                        w->examples[i].best_move, w->examples[i].fen);
+            continue;
+        }
 
+        n_processed++;
         loss += sup_example_gradient(w->net, &b, best,
                                       w->grad, w->n_neg, w->margin, &w->rng);
     }
-    w->partial_loss = loss;
+
+    /* Bug 2 fix: report skip counts once per thread if anything was dropped */
+    int n_total = w->end - w->start;
+    if (n_skip_fen + n_skip_move + n_skip_legal > 0)
+        fprintf(stderr,
+                "[BATCH][thread] processed=%d/%d  "
+                "skip_fen=%d  skip_move=%d  skip_legal=%d\n",
+                n_processed, n_total,
+                n_skip_fen, n_skip_move, n_skip_legal);
+
+    w->partial_loss  = loss;
+    w->n_processed   = n_processed;
     return NULL;
 }
 
@@ -660,16 +685,47 @@ static double sup_batch_gradient(const NNUENet *net,
     if (nthreads == 1) {
         /* Fast path: no thread overhead */
         double loss = 0.0;
+        int    n_processed = 0;
+        int    n_skip_fen = 0, n_skip_move = 0, n_skip_legal = 0;
         Board b;
         for (int i = 0; i < count; i++) {
-            if (SUP_BOARD_FROM_FEN(&b, examples[i].fen) != 0) continue;
+            if (SUP_BOARD_FROM_FEN(&b, examples[i].fen) == 0) {
+                /* board_from_fen returns non-zero on success in this engine;
+                 * flip to == 0 to catch genuine failures. */
+                if (++n_skip_fen <= 3)
+                    fprintf(stderr,
+                            "[SKIP] board_from_fen failed: '%s'\n",
+                            examples[i].fen);
+                continue;
+            }
             Move best = SUP_MOVE_FROM_UCI(&b, examples[i].best_move);
-            if (!best) continue;
-            if (!is_legal(&b, best)) continue;
+            if (!best) {
+                if (++n_skip_move <= 3)
+                    fprintf(stderr,
+                            "[SKIP] str_to_move failed: move='%s' fen='%s'\n",
+                            examples[i].best_move, examples[i].fen);
+                continue;
+            }
+            if (!is_legal(&b, best)) {
+                if (++n_skip_legal <= 3)
+                    fprintf(stderr,
+                            "[SKIP] is_legal rejected: move='%s' fen='%s'\n",
+                            examples[i].best_move, examples[i].fen);
+                continue;
+            }
+            n_processed++;
             loss += sup_example_gradient(net, &b, best,
                                           grad_out, n_neg, margin, rng);
         }
-        return loss / (double)count;
+        /* Bug 3 fix: report skip summary and normalise by n_processed, not
+         * count, so the loss isn't diluted by silently dropped examples. */
+        if (n_skip_fen + n_skip_move + n_skip_legal > 0)
+            fprintf(stderr,
+                    "[BATCH] processed=%d/%d  "
+                    "skip_fen=%d  skip_move=%d  skip_legal=%d\n",
+                    n_processed, count,
+                    n_skip_fen, n_skip_move, n_skip_legal);
+        return n_processed > 0 ? loss / (double)n_processed : 0.0;
     }
 
     /* Multi-threaded path */
@@ -690,6 +746,7 @@ static double sup_batch_gradient(const NNUENet *net,
         ctxs[t].end          = (t == nthreads - 1) ? count : (t + 1) * slice;
         ctxs[t].grad         = tgrads[t];
         ctxs[t].partial_loss = 0.0;
+        ctxs[t].n_processed  = 0;
         ctxs[t].n_neg        = n_neg;
         ctxs[t].margin       = margin;
         /* Give each thread a distinct PRNG stream */
@@ -698,16 +755,19 @@ static double sup_batch_gradient(const NNUENet *net,
         pthread_create(&threads[t], NULL, sup_grad_worker_fn, &ctxs[t]);
     }
 
-    double total_loss = 0.0;
+    double total_loss      = 0.0;
+    int    total_processed = 0;
     for (int t = 0; t < nthreads; t++) {
         pthread_join(threads[t], NULL);
         sup_grad_add(grad_out, tgrads[t]);
-        total_loss += ctxs[t].partial_loss;
+        total_loss      += ctxs[t].partial_loss;
+        total_processed += ctxs[t].n_processed;
         free(tgrads[t]);
     }
     free(threads); free(ctxs); free(tgrads);
 
-    return total_loss / (double)count;
+    /* Bug 3 fix: normalise by examples that were actually processed */
+    return total_processed > 0 ? total_loss / (double)total_processed : 0.0;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════

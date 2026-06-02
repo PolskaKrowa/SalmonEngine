@@ -15,6 +15,10 @@ engine_SOURCES = \
     tt.c \
     uci.c
 
+if ENABLE_EVAL_DEBUG
+engine_SOURCES += eval_debug.c
+endif
+
 engine_LDADD = -lm
 
 # ── Tuner binary (only built when --enable-tuner is passed) ───

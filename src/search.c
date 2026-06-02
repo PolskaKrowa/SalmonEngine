@@ -38,6 +38,10 @@
 #include <math.h>
 #include <limits.h>
 
+#ifdef EVAL_DEBUG
+#  include "eval_debug.h"
+#endif
+
 /* ──────────────────────────────────────────────
  *  sentinel for eval_stack when in check.
  *  Must be outside the normal eval range so the improving heuristic
@@ -786,6 +790,11 @@ void search(Board *b, SearchLimits *lim) {
     si.limits     = lim;
     si.start_time = clock();
 
+#ifdef EVAL_DEBUG
+    /* Reset top/bottom lists so each search produces a fresh dump. */
+    eval_debug_init();
+#endif
+
     if (!lim->infinite && lim->movetime == 0) {
         int time_left = (b->side == WHITE) ? lim->wtime : lim->btime;
         int inc       = (b->side == WHITE) ? lim->winc  : lim->binc;
@@ -891,6 +900,10 @@ done:
         printf("bestmove %s\n", mv_str);
         fflush(stdout);
     }
+
+#ifdef EVAL_DEBUG
+    eval_debug_dump("eval_debug.txt");
+#endif
 }
 
 void search_init(void) {

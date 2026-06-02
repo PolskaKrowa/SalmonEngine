@@ -4,6 +4,7 @@
 #  Run:  autoreconf --install
 #  Then: ./configure [--prefix=/usr/local] [--enable-debug]
 #                    [--enable-sanitize] [--enable-tuner]
+#                    [--enable-eval-debug]
 # -------------------------------------------------------------
 
 AC_INIT([salmon], [2.0], [], [salmon-engine])
@@ -57,6 +58,10 @@ AC_ARG_ENABLE([tuner],
     [AS_HELP_STRING([--enable-tuner], [also build the tuner binary (bin/tuna)])],
     [enable_tuner=$enableval], [enable_tuner=no])
 
+AC_ARG_ENABLE([eval-debug],
+    [AS_HELP_STRING([--enable-eval-debug], [build with evaluation debugging])],
+    [enable_eval_debug=$enableval], [enable_eval_debug=no])
+
 AM_CONDITIONAL([ENABLE_TUNER], [test "x$enable_tuner" = "xyes"])
 
 # Set CFLAGS / LDFLAGS based on selected mode
@@ -72,6 +77,13 @@ else
     LDFLAGS="$LDFLAGS -flto"
     AC_MSG_NOTICE([Release build enabled])
 fi
+
+if test "x$enable_eval_debug" = "xyes"; then
+    CFLAGS="$CFLAGS -DEVAL_DEBUG"
+    AC_MSG_NOTICE([Evaluation debug enabled])
+fi
+
+AM_CONDITIONAL([ENABLE_EVAL_DEBUG], [test "x$enable_eval_debug" = "xyes"])
 
 # Generate files
 AC_CONFIG_FILES([Makefile src/Makefile])

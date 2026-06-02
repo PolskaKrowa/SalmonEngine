@@ -45,6 +45,10 @@
 #include <stdlib.h>
 #include <math.h>
 
+#ifdef EVAL_DEBUG
+#  include "eval_debug.h"
+#endif
+
 static const int MATERIAL_MG[6] = { 82, 344, 358, 480, 1022, 0 };
 static const int MATERIAL_EG[6] = { 94, 338, 329, 546, 924, 0 };
 
@@ -1119,22 +1123,51 @@ int evaluate(const Board *b) {
     int proxy = lazy_score(b, phase);
     if (abs(proxy) > LAZY_THRESHOLD) {
         /* Still apply the side-to-move flip for consistency */
-        return (b->side == WHITE) ? proxy : -proxy;
+        int lazy_ret = (b->side == WHITE) ? proxy : -proxy;
+
+#ifdef EVAL_DEBUG
+        /* Record the lazy position so we can spot if it skews the lists */
+        EvalBreakdown __dbg_lazy = {0};
+        __dbg_lazy.phase       = phase;
+        __dbg_lazy.side        = (int)b->side;
+        __dbg_lazy.lazy        = true;
+        __dbg_lazy.final_score = lazy_ret;
+        eval_debug_record(b, &__dbg_lazy);
+#endif
+        return lazy_ret;
     }
 
     int mg = 0, eg = 0;
+
+    /* ── Debug scaffolding ──────────────────────────────────────────────
+     * __dbg accumulates per-stage contributions.  __snap_mg / __snap_eg
+     * are "before" snapshots used to compute each stage's delta.
+     * All of this compiles away completely without -DEVAL_DEBUG.
+     */
+#ifdef EVAL_DEBUG
+    EvalBreakdown __dbg = {0};
+    __dbg.phase = phase;
+    __dbg.side  = (int)b->side;
+    int __snap_mg, __snap_eg;
+#endif
 
     /* ── Material imbalance (quadratic polynomial, SF 11) ─────────────
      * Accounts for piece-combination interactions: bishop pair value,
      * rook vs. two minors, etc.  Applied once per position, not per side.
      */
+#ifdef EVAL_DEBUG
+    __snap_mg = mg;
+#endif
     mg += material_imbalance(b);
+#ifdef EVAL_DEBUG
+    __dbg.imbalance = mg - __snap_mg;
+#endif
 
     for (int c = 0; c < 2; c++) {
         int sign = (c == WHITE) ? 1 : -1;
         int c_mg = 0, c_eg = 0;
 
-        /* Material + PST */
+        /* ── Material + PST ── */
         for (int pt = 0; pt < 6; pt++) {
             Bitboard bb = b->pieces[c][pt];
             while (bb) {
@@ -1144,42 +1177,97 @@ int evaluate(const Board *b) {
                 c_eg += MATERIAL_EG[pt] + PST_EG[pt][psq];
             }
         }
+#ifdef EVAL_DEBUG
+        /* Material+PST is the baseline (starts from 0), capture directly */
+        __dbg.material_mg[c] = c_mg;
+        __dbg.material_eg[c] = c_eg;
+        __snap_mg = c_mg;  __snap_eg = c_eg;
+#endif
 
-        /* Pawn structure (doubled, isolated, backward, passed) */
+        /* ── Pawn structure (doubled, isolated, backward, passed) ── */
         eval_pawns(b, (Color)c, &c_mg, &c_eg);
+#ifdef EVAL_DEBUG
+        __dbg.pawns_mg[c] = c_mg - __snap_mg;
+        __dbg.pawns_eg[c] = c_eg - __snap_eg;
+        __snap_mg = c_mg;  __snap_eg = c_eg;
+#endif
 
-        /* Piece mobility — non-linear per-count SF 11 tables */
+        /* ── Piece mobility — non-linear per-count SF 11 tables ── */
         eval_mobility(b, (Color)c, &c_mg, &c_eg);
+#ifdef EVAL_DEBUG
+        __dbg.mobility_mg[c] = c_mg - __snap_mg;
+        __dbg.mobility_eg[c] = c_eg - __snap_eg;
+        __snap_mg = c_mg;  __snap_eg = c_eg;
+#endif
 
-        /* Rook bonuses (open file, semi-open, 7th rank, TrappedRook) */
+        /* ── Rook bonuses (open file, semi-open, 7th rank, TrappedRook) ── */
         eval_rooks(b, (Color)c, &c_mg, &c_eg);
+#ifdef EVAL_DEBUG
+        __dbg.rooks_mg[c] = c_mg - __snap_mg;
+        __dbg.rooks_eg[c] = c_eg - __snap_eg;
+        __snap_mg = c_mg;  __snap_eg = c_eg;
+#endif
 
-        /* Outpost bonuses for knights and bishops */
+        /* ── Outpost bonuses for knights and bishops ── */
         eval_outposts(b, (Color)c, &c_mg, &c_eg);
+#ifdef EVAL_DEBUG
+        __dbg.outposts_mg[c] = c_mg - __snap_mg;
+        __dbg.outposts_eg[c] = c_eg - __snap_eg;
+        __snap_mg = c_mg;  __snap_eg = c_eg;
+#endif
 
-        /* Bishop pair */
+        /* ── Bishop pair ── */
         if (bb_popcount(b->pieces[c][BISHOP]) >= 2) {
             c_mg += BISHOP_PAIR_MG;
             c_eg += BISHOP_PAIR_EG;
         }
+#ifdef EVAL_DEBUG
+        __dbg.bishop_pair_mg[c] = c_mg - __snap_mg;
+        __dbg.bishop_pair_eg[c] = c_eg - __snap_eg;
+        __snap_mg = c_mg;  __snap_eg = c_eg;
+#endif
 
-        /* WeakQueen: penalty when enemy sliders x-ray through our queen */
+        /* ── WeakQueen: penalty when enemy sliders x-ray through our queen ── */
         eval_queen_weak(b, (Color)c, &c_mg, &c_eg);
+#ifdef EVAL_DEBUG
+        __dbg.weak_queen_mg[c] = c_mg - __snap_mg;
+        __dbg.weak_queen_eg[c] = c_eg - __snap_eg;
+        __snap_mg = c_mg;  __snap_eg = c_eg;
+#endif
 
-        /* KingProtector: minor pieces far from own king incur a penalty */
+        /* ── KingProtector: minor pieces far from own king incur a penalty ── */
         eval_king_protector(b, (Color)c, &c_mg, &c_eg);
+#ifdef EVAL_DEBUG
+        __dbg.king_protector_mg[c] = c_mg - __snap_mg;
+        __dbg.king_protector_eg[c] = c_eg - __snap_eg;
+        __snap_mg = c_mg;  __snap_eg = c_eg;
+#endif
 
-        /* MinorBehindPawn: minor pieces sheltered behind friendly pawns */
+        /* ── MinorBehindPawn: minor pieces sheltered behind friendly pawns ── */
         eval_minor_behind_pawn(b, (Color)c, &c_mg, &c_eg);
+#ifdef EVAL_DEBUG
+        __dbg.minor_behind_mg[c] = c_mg - __snap_mg;
+        __dbg.minor_behind_eg[c] = c_eg - __snap_eg;
+        __snap_mg = c_mg;  __snap_eg = c_eg;
+#endif
 
         /*
-         * King safety: shield + open files + distance-weighted enemy
-         * attacks (MG) + king-proximity activity bonus (EG).
+         * ── King safety: shield + open files + distance-weighted enemy
+         *    attacks (MG) + king-proximity activity bonus (EG). ──
          */
         eval_king_safety(b, (Color)c, &c_mg, &c_eg);
+#ifdef EVAL_DEBUG
+        __dbg.king_safety_mg[c] = c_mg - __snap_mg;
+        __dbg.king_safety_eg[c] = c_eg - __snap_eg;
+        __snap_mg = c_mg;  __snap_eg = c_eg;
+#endif
 
-        /* Tactical threats: hanging pieces, fork potential, skewers */
+        /* ── Tactical threats: hanging pieces, fork potential, skewers ── */
         eval_threats(b, (Color)c, &c_mg, &c_eg);
+#ifdef EVAL_DEBUG
+        __dbg.threats_mg[c] = c_mg - __snap_mg;
+        __dbg.threats_eg[c] = c_eg - __snap_eg;
+#endif
 
         mg += sign * c_mg;
         eg += sign * c_eg;
@@ -1204,5 +1292,18 @@ int evaluate(const Board *b) {
 #endif
 
     /* Return from side-to-move perspective */
-    return (b->side == WHITE) ? score : -score;
+    int final_score = (b->side == WHITE) ? score : -score;
+
+#ifdef EVAL_DEBUG
+    /*
+     * taper() and initiative() are pure functions — calling them again
+     * for debug capture is safe and identical to the calls above.
+     */
+    __dbg.tempo       = taper(TEMPO_BONUS_MG, TEMPO_BONUS_EG, phase);
+    __dbg.initiative  = initiative(b, mg, eg);
+    __dbg.final_score = final_score;
+    eval_debug_record(b, &__dbg);
+#endif
+
+    return final_score;
 }

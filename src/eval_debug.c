@@ -257,7 +257,7 @@ static int cmp_asc(const void *a, const void *b) {
  * ───────────────────────────────────────────────────────────────── */
 
 void eval_debug_dump(const char *filename) {
-    FILE *f = fopen(filename, "w");
+    FILE *f = fopen(filename, "a");
     if (!f) {
         fprintf(stderr, "[eval_debug] Cannot open '%s' for writing\n", filename);
         return;

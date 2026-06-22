@@ -228,9 +228,11 @@ jobs:
           merge-multiple: true
 
       - name: upload to release
+        if: github.event.release.tag_name != ''
         uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          tag_name: ${{ github.event.release.tag_name }}
           files: release-assets/**
           overwrite: true

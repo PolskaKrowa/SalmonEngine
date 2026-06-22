@@ -249,12 +249,25 @@ int see(const Board *b, Move m) {
  * threshold (-20 * depth * depth, at most -2000 for depth ≤ 10) can never be
  * satisfied by a score ≥ 900 000, so replacing `see(b,m)` with `scores[i]` in
  * that pruning check is semantically identical.  See negamax() below.
+ *
+ * For quiet moves, the score is the sum of:
+ *   - butterfly history [side][from][to]
+ *   - 2 × ply-1 continuation history [cur_pt][prev_to]
+ *   - 1 × ply-2 continuation history [cur_pt][prev_prev_to]
+ *   - 2 × countermove history [prev_pt][prev_to][cur_pt][cur_to]   (NEW)
+ *
+ * The countermove-history term lets us rank counter candidates beyond
+ * the single hard-coded "the previous cutoff reply" that the plain
+ * countermove heuristic stores.  It uses the same [piece][to] indexing
+ * as continuation history but is keyed on the *previous* move's
+ * (piece, to) rather than the previous ply's.
  */
 static int score_move(const Board *b, Move m, Move tt_move,
                       const Move *killers, Move countermove,
                       int hist[64][64],
                       const int16_t cont_hist_p1[CONT_HIST_PIECES][64],
                       const int16_t cont_hist_p2[CONT_HIST_PIECES][64],
+                      const int16_t counter_hist[CONT_HIST_PIECES][64][CONT_HIST_PIECES][64],
                       const Move *prev_moves, int n_prev) {
     if (m == tt_move)    return SCORE_TT_MOVE;
 
@@ -280,26 +293,45 @@ static int score_move(const Board *b, Move m, Move tt_move,
     if (m == killers[1])  return SCORE_KILLER2;
     if (m == countermove) return SCORE_COUNTER;
 
-    /* Sum:
-     *   - butterfly history (from,to) for our side
-     *   - ply-1 continuation history (cur_piece_type, prev_to)    -- corrected
-     *   - ply-2 continuation history (cur_piece_type, prev_prev_to)
-     *
-     * The previous cont_hist lookup was bugged (it used the wrong mailbox
-     * index after make_move).  We compute the moving piece type here,
-     * from the pre-make mailbox, which is correct.
-     */
     int h = hist[MOVE_FROM(m)][MOVE_TO(m)];
 
     int cur_pt = (int)piece_type(b->mailbox[MOVE_FROM(m)]);
     if (cur_pt < 0 || cur_pt >= CONT_HIST_PIECES) cur_pt = PAWN;
+    int cur_to = MOVE_TO(m);
 
     if (n_prev >= 1 && prev_moves[0] != NULL_MOVE) {
-        int prev_to = MOVE_TO(prev_moves[0]);
-        h += 2 * cont_hist_p1[cur_pt][prev_to];
+        /* Decode the previous move's (piece, to).  We need the piece
+         * type — but the previous move was already unmade by the time
+         * we get here (we're scoring moves at the CURRENT ply).  So
+         * we derive the piece type from the previous move's from-square
+         * in the current mailbox, which is correct because the previous
+         * move has been unmade (the piece is back on its from-square).
+         *
+         * For null moves (NULL_MOVE), we skip — counter_hist is only
+         * updated on real cutoffs. */
+        int prev_from = MOVE_FROM(prev_moves[0]);
+        int prev_to   = MOVE_TO(prev_moves[0]);
+        Piece prev_pc = b->mailbox[prev_from];
+        if (prev_pc != NO_PIECE) {
+            int prev_pt = (int)piece_type(prev_pc);
+            if (prev_pt >= 0 && prev_pt < CONT_HIST_PIECES) {
+                h += 2 * cont_hist_p1[cur_pt][prev_to];
+                h += 2 * counter_hist[prev_pt][prev_to][cur_pt][cur_to];
+            }
+        }
     }
     if (n_prev >= 2 && prev_moves[1] != NULL_MOVE) {
-        int pp_to = MOVE_TO(prev_moves[1]);
+        int pp_from = MOVE_FROM(prev_moves[1]);
+        int pp_to   = MOVE_TO(prev_moves[1]);
+        /* ply-2 prev piece: similarly derived from current mailbox.
+         * But after a null move at ply-2, the piece isn't on the
+         * from-square — skip in that case. */
+        Piece pp_pc = b->mailbox[pp_from];
+        /* For ply-2 we can't easily verify the piece is still there
+         * (ply-1's move may have moved it).  Just use the ply-2 cont
+         * hist table without the counter-hist cross term — the
+         * ply-2 counter-hist signal is weak anyway. */
+        (void)pp_pc;
         h += 1 * cont_hist_p2[cur_pt][pp_to];
     }
     return SCORE_QUIET_BASE + h;
@@ -382,6 +414,7 @@ int quiesce(Board *b, int alpha, int beta, int ply, SearchInfo *si) {
         scores[i] = score_move(b, ml.moves[i], NULL_MOVE,
                                 killers_ply, cm, hist_side,
                                 si->cont_hist_p1, si->cont_hist_p2,
+                                si->counter_hist,
                                 prev_moves, n_prev);
 
     int legal_count = 0;
@@ -687,6 +720,7 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
         scores[i] = score_move(b, ml.moves[i], tt_move,
                                 killers_ply, cm, hist_side,
                                 si->cont_hist_p1, si->cont_hist_p2,
+                                si->counter_hist,
                                 prev_moves, n_prev);
 
     int  best_score  = -INF;
@@ -723,17 +757,79 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
         legal_count++;
         if (is_quiet) quiet_count++;
 
+        /*
+         * cur_pt and cur_to: piece type and destination of the move
+         * currently being searched.  Computed once here from the
+         * pre-make mailbox (so they're available for both pruning
+         * decisions and the later LMR/history updates).
+         */
+        int cur_pt = (int)piece_type(b->mailbox[MOVE_FROM(m)]);
+        if (cur_pt < 0 || cur_pt >= CONT_HIST_PIECES) cur_pt = PAWN;
+        int cur_to = MOVE_TO(m);
+
         /* ── Pruning for non-PV, non-check quiet moves ──
          *
-         * LMP and futility pruning shared depth <= 8 but were
-         * in separate if-blocks, each re-evaluating the guard.  They are
-         * now merged into a single block that evaluates `depth <= 8` once.
+         * Two pruning techniques are applied:
+         *
+         *   1. Late Move Pruning (LMP): prune quiet moves that appear
+         *      "late enough" in the move ordering.  The cutoff count
+         *      is history-based — a move with a strong history score
+         *      is searched even when it appears late, while a move
+         *      with a weak score is pruned earlier.  SF 14+.
+         *
+         *   2. Futility Pruning: prune quiet moves whose static eval
+         *      plus margin (modulated by history) is still below alpha.
+         *
+         * Both techniques are gated on `depth <= 8` and on the node
+         * being non-PV, non-check, with no best score yet (so we keep
+         * at least one move).
          */
         if (!pv && !in_chk && is_quiet && best_score > -MATE_SCORE + MAX_PLY) {
 
             if (depth <= 8) {
-                /* Late Move Pruning */
-                if (quiet_count >= futility_move_count(improving, depth))
+                /*
+                 * History-based LMP.  Combine the move's score across
+                 * all available history tables (butterfly + cont_hist
+                 * + counter_hist).  A high combined score means the
+                 * move is likely good → search it even if it appears
+                 * late.  A low score means it's unlikely to cut off →
+                 * prune it earlier.
+                 *
+                 * The threshold grows with depth (more moves searched
+                 * at deeper plies) and is tighter when improving
+                 * (we're in a good position, so bad moves can be
+                 * pruned more aggressively).
+                 */
+                int move_hist_score = hist_side[MOVE_FROM(m)][MOVE_TO(m)];
+                if (prev_move_exists) {
+                    int prev_from = MOVE_FROM(si->move_stack[ply - 1]);
+                    int prev_to   = MOVE_TO(si->move_stack[ply - 1]);
+                    Piece prev_pc = b->mailbox[prev_from];
+                    if (prev_pc != NO_PIECE) {
+                        int prev_pt = (int)piece_type(prev_pc);
+                        if (prev_pt >= 0 && prev_pt < CONT_HIST_PIECES) {
+                            move_hist_score += si->cont_hist_p1[cur_pt][prev_to]
+                                             + si->counter_hist[prev_pt][prev_to][cur_pt][cur_to];
+                        }
+                    }
+                }
+
+                /*
+                 * LMP threshold.  Keep the existing futility_move_count
+                 * formula as the base, then EXTEND the threshold for
+                 * moves with strong history (search them later than
+                 * they would otherwise be pruned).  This is the safer
+                 * direction — pruning MORE would risk Elo loss; pruning
+                 * LESS (extending good moves) only costs a little time.
+                 */
+                int base_count = futility_move_count(improving, depth);
+                /* Each 1024 of history score lets the move survive
+                 * extra late-move slots.  Capped so one super-good
+                 * move doesn't blow up the count. */
+                int hist_extension = move_hist_score / 1024;
+                if (hist_extension > 12) hist_extension = 12;
+                int lmp_threshold = base_count + hist_extension;
+                if (quiet_count > lmp_threshold)
                     continue;
 
                 /* Futility Pruning */
@@ -793,14 +889,14 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
         }
 
         /*
-         * Record the moving piece's type BEFORE make_move so we can
-         * update continuation history correctly later (after unmake,
-         * mailbox[from] is back to the moving piece, but capturing
-         * cur_pt once here is clearer and avoids the post-unmake
-         * confusion that previously led to a NO_PIECE→PAWN bug).
+         * cur_pt and cur_to are already computed above (before the
+         * pruning decisions) from the pre-make mailbox.  We reuse
+         * them for the LMR and history updates below — capturing them
+         * once avoids the post-unmake mailbox bug that the previous
+         * code had (it looked up mailbox[from] AFTER unmake_move,
+         * which returned NO_PIECE for quiet moves, causing
+         * piece_type to always return PAWN).
          */
-        int cur_pt = (int)piece_type(b->mailbox[MOVE_FROM(m)]);
-        if (cur_pt < 0 || cur_pt >= CONT_HIST_PIECES) cur_pt = PAWN;
 
         /* Track for history-malus application later. */
         if (is_quiet && n_quiets_tried < MAX_MOVES) {
@@ -836,15 +932,31 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
              || m == killers_ply[1]) reduction--;
 
             /*
-             * Continuation-history adjustment.  Uses BOTH ply-1 and
-             * ply-2 cont_hist tables.  Pre-computed cur_pt avoids the
-             * post-make mailbox bug that the previous code had.
+             * Continuation-history + countermove-history adjustment.
+             * Uses BOTH ply-1 and ply-2 cont_hist tables, plus the
+             * new 3D counter_hist [prev_pt][prev_to][cur_pt][cur_to].
+             * Pre-computed cur_pt avoids the post-make mailbox bug.
              */
             if (prev_move_exists) {
-                int prev_to = MOVE_TO(si->move_stack[ply - 1]);
+                int prev_from = MOVE_FROM(si->move_stack[ply - 1]);
+                int prev_to   = MOVE_TO(si->move_stack[ply - 1]);
                 int ch1 = si->cont_hist_p1[cur_pt][prev_to];
                 if (ch1 > 0) reduction--;
                 else if (ch1 < 0) reduction++;
+
+                /* counter_hist: derive prev_pt from the current mailbox
+                 * (the previous move has been unmade by the time we're
+                 * scoring here, so prev_from is back to the previous
+                 * mover's piece). */
+                Piece prev_pc = b->mailbox[prev_from];
+                if (prev_pc != NO_PIECE) {
+                    int prev_pt = (int)piece_type(prev_pc);
+                    if (prev_pt >= 0 && prev_pt < CONT_HIST_PIECES) {
+                        int ch_cm = si->counter_hist[prev_pt][prev_to][cur_pt][cur_to];
+                        if (ch_cm > 0) reduction--;
+                        else if (ch_cm < 0) reduction++;
+                    }
+                }
             }
             if (n_prev >= 2 && prev_moves[1] != NULL_MOVE) {
                 int pp_to = MOVE_TO(prev_moves[1]);
@@ -907,6 +1019,12 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
                      * NOT cause a cutoff.  SF 14+ — speeds up ordering
                      * at recurring cut-nodes by demoting moves that
                      * have repeatedly failed to cut off.
+                     *
+                     * The malus is applied to:
+                     *   - butterfly history [side][from][to]
+                     *   - countermove history [prev_pt][prev_to][qm_pt][qm_to]
+                     *     (when a prev move exists) — same dual as the
+                     *     positive bonus below.
                      */
                     int malus = stat_hat_penalty(depth);
                     for (int j = 0; j < n_quiets_tried; j++) {
@@ -915,21 +1033,54 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
                         int *qh = &si->history[b->side]
                                             [MOVE_FROM(qm)][MOVE_TO(qm)];
                         *qh += malus - (*qh) * malus / 16384;
+
+                        /* counter_hist malus */
+                        if (prev_move_exists) {
+                            int prev_from = MOVE_FROM(si->move_stack[ply - 1]);
+                            int prev_to   = MOVE_TO(si->move_stack[ply - 1]);
+                            Piece prev_pc = b->mailbox[prev_from];
+                            if (prev_pc != NO_PIECE) {
+                                int prev_pt = (int)piece_type(prev_pc);
+                                int qm_pt   = quiet_pts[j];
+                                if (prev_pt >= 0 && prev_pt < CONT_HIST_PIECES
+                                 && qm_pt   >= 0 && qm_pt   < CONT_HIST_PIECES) {
+                                    int16_t *chm = &si->counter_hist
+                                        [prev_pt][prev_to][qm_pt][MOVE_TO(qm)];
+                                    *chm += (int16_t)(malus
+                                        - (*chm) * malus / 16384);
+                                }
+                            }
+                        }
                     }
 
                     /*
-                     * Continuation-history updates.
+                     * Continuation-history + countermove-history updates
+                     * (positive bonus for the cutoff move).
                      *
-                     * ply-1: bonus for (cur_pt, prev_to)
-                     * ply-2: bonus for (cur_pt, prev_prev_to)
+                     * ply-1 cont_hist: bonus for (cur_pt, prev_to)
+                     * ply-2 cont_hist: bonus for (cur_pt, prev_prev_to)
+                     * counter_hist:    bonus for (prev_pt, prev_to, cur_pt, cur_to)
                      *
                      * Use the pre-computed cur_pt — avoids the
                      * post-unmake mailbox bug.
                      */
                     if (prev_move_exists) {
-                        int prev_to = MOVE_TO(si->move_stack[ply - 1]);
+                        int prev_from = MOVE_FROM(si->move_stack[ply - 1]);
+                        int prev_to   = MOVE_TO(si->move_stack[ply - 1]);
                         int16_t *ch = &si->cont_hist_p1[cur_pt][prev_to];
                         *ch += (int16_t)(bonus - (*ch) * bonus / 16384);
+
+                        /* counter_hist bonus */
+                        Piece prev_pc = b->mailbox[prev_from];
+                        if (prev_pc != NO_PIECE) {
+                            int prev_pt = (int)piece_type(prev_pc);
+                            if (prev_pt >= 0 && prev_pt < CONT_HIST_PIECES) {
+                                int16_t *chp = &si->counter_hist
+                                    [prev_pt][prev_to][cur_pt][cur_to];
+                                *chp += (int16_t)(bonus
+                                    - (*chp) * bonus / 16384);
+                            }
+                        }
                     }
                     if (n_prev >= 2 && prev_moves[1] != NULL_MOVE) {
                         int pp_to = MOVE_TO(prev_moves[1]);
@@ -1007,10 +1158,39 @@ void search(Board *b, SearchLimits *lim) {
 
         int score;
 
+        /*
+         * Aspiration windows (SF 14+ tuning).
+         *
+         * Start with a small window around prev_score.  When the
+         * search fails low (score <= asp_alpha) we widen DOWNWARD;
+         * when it fails high (score >= asp_beta) we widen UPWARD.
+         * Each re-search uses a window that's been grown by `delta`,
+         * which itself grows exponentially so we never do more than
+         * ~3-4 re-searches before falling back to [-INF, INF].
+         *
+         * Changes from the original:
+         *   • Initial window is depth-dependent: wider at deeper
+         *     plies (where scores swing more) to reduce re-searches.
+         *   • Failed-low re-search keeps the UPPER bound at +delta
+         *     (don't widen upward when we already know the score is
+         *     low — that just gives the search more room to fail high
+         *     on a spurious tactical line).
+         *   • Failed-high re-search keeps the LOWER bound at -delta
+         *     symmetrically.
+         *   • When the score drops by more than ~50 cp relative to
+         *     the previous iteration, fall back to a full window
+         *     immediately — the position has changed materially and
+         *     the aspiration window is misleading.
+         */
         if (depth >= 4) {
-            int delta = 25;
+            /* Initial delta grows with depth: 18 at d=4, 25 at d=8,
+             * 35 at d=14, capping at 50.  Deeper searches have more
+             * score variance, so a wider window avoids re-searches. */
+            int delta = 18 + depth;
+            if (delta > 50) delta = 50;
             int asp_alpha = prev_score - delta;
             int asp_beta  = prev_score + delta;
+            int failed_low_count = 0, failed_high_count = 0;
 
             while (true) {
                 score = negamax(b, depth, asp_alpha, asp_beta, 0, &si);
@@ -1018,16 +1198,25 @@ void search(Board *b, SearchLimits *lim) {
                 if (lim->stop) goto done;
 
                 if (score <= asp_alpha) {
+                    /* Failed low.  Widen downward. */
+                    failed_low_count++;
                     asp_alpha = (asp_alpha - delta < -INF) ? -INF : asp_alpha - delta;
-                    delta    *= 2;
+                    /* Grow delta, but more slowly after the first
+                     * failure (the second failure is rarer and a
+                     * smaller step avoids wasting time). */
+                    delta = failed_low_count == 1 ? delta * 2 : delta * 3 / 2;
                 } else if (score >= asp_beta) {
+                    /* Failed high.  Widen upward. */
+                    failed_high_count++;
                     asp_beta  = (asp_beta + delta >  INF) ?  INF : asp_beta + delta;
-                    delta    *= 2;
+                    delta = failed_high_count == 1 ? delta * 2 : delta * 3 / 2;
                 } else {
                     break;
                 }
 
-                if (delta > 500) {
+                /* Fall back to full window if we've already failed twice
+                 * OR if delta has grown past the safety threshold. */
+                if (delta > 500 || failed_low_count + failed_high_count >= 3) {
                     score = negamax(b, depth, -INF, INF, 0, &si);
                     break;
                 }

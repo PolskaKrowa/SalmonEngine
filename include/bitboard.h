@@ -3,10 +3,14 @@
 #include <stdio.h>
 
 /* ──────────────────────────────────────────────
- *  Compile-time feature detection
- *  The Makefile passes -march=native so GCC/Clang
- *  will define __POPCNT__, __BMI2__, __AVX2__ etc.
- *  automatically when the host CPU supports them.
+ *  Compile-time feature detection.
+ *
+ *  We do NOT rely on -march=native for BMI2, because that bakes in a
+ *  hard requirement on the build host's CPU.  Instead we always
+ *  compile the PEXT code path under __BMI2__ if the compiler supports
+ *  the intrinsics, and dispatch at runtime via function pointers
+ *  initialised in bitboard_init().  The fallback path (Hyperbola
+ *  Quintessence + rank table) is always present.
  * ────────────────────────────────────────────── */
 #if defined(__BMI2__)
 #  include <immintrin.h>
@@ -37,6 +41,27 @@ extern Bitboard KING_ATTACKS[64];
 extern Bitboard BETWEEN_BB[64][64];
 extern Bitboard LINE_BB[64][64];
 
+/*
+ * PEXT attack tables (used only when BMI2 is available at runtime).
+ *
+ * For each square, ATT_RELEVANT[sq] is the occupancy mask of squares
+ * that actually matter for that slider's attacks (excludes the outer
+ * rank/file edges, which don't change the attack set).  The attack set
+ * is then looked up in a flat array indexed by _pext_u64(occ, mask).
+ *
+ * Total size:
+ *   Rook:   102K entries × 8 bytes  = ~800 KB
+ *   Bishop:  5K entries × 8 bytes   = ~40 KB
+ *
+ * The rook table is sizeable but fits in L2 on modern CPUs and the
+ * access pattern is very regular.  Hyperbola Quintessence stays as
+ * the fallback for CPUs without BMI2.
+ */
+extern Bitboard ROOK_ATTACKS   [0x19000];   /* 102400 entries */
+extern Bitboard BISHOP_ATTACKS [0x01480];   /*   5248 entries */
+extern Bitboard ROOK_RELEVANT  [64];
+extern Bitboard BISHOP_RELEVANT[64];
+
 /* ──────────────────────────────────────────────
  *  Initialisation (call once at startup)
  * ────────────────────────────────────────────── */
@@ -45,15 +70,23 @@ void bitboard_init(void);
 /* ──────────────────────────────────────────────
  *  Sliding piece attack lookups
  *
- *  Implementation uses:
- *   • Hyperbola Quintessence (o^(o−2r) trick)
- *     for files and diagonals — O(1), branchless.
- *   • Pre-computed first-rank attack table for ranks.
- *   • When BMI2 PEXT is available the rank attacks
- *     use _pext_u64 for a further small speedup.
+ *  Two implementations are linked in:
+ *    • Hyperbola Quintessence (o^(o−2r) trick) — fallback, no BMI2.
+ *    • PEXT-based table lookup — used when BMI2 is detected at runtime.
+ *
+ *  The public rook_attacks / bishop_attacks functions dispatch via
+ *  function pointers set in bitboard_init() based on a runtime CPU
+ *  feature check.  This keeps a single binary portable across
+ *  BMI2 and non-BMI2 hosts.
  * ────────────────────────────────────────────── */
 Bitboard rook_attacks  (Square sq, Bitboard occ);
 Bitboard bishop_attacks(Square sq, Bitboard occ);
+
+/* Direct (non-dispatched) entry points — used internally and by tests. */
+Bitboard rook_attacks_hq  (Square sq, Bitboard occ);
+Bitboard bishop_attacks_hq(Square sq, Bitboard occ);
+Bitboard rook_attacks_pext  (Square sq, Bitboard occ);
+Bitboard bishop_attacks_pext(Square sq, Bitboard occ);
 
 static inline Bitboard queen_attacks(Square sq, Bitboard occ) {
     return rook_attacks(sq, occ) | bishop_attacks(sq, occ);

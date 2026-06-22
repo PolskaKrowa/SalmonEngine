@@ -47,6 +47,24 @@ typedef struct {
 #define CONT_HIST_PIECES 6
 #define CONT_HIST_MAX    16384
 
+/*
+ * Countermove history: [piece_type][to_square] → best counter-move score.
+ *
+ * The plain countermove heuristic stores a single best reply for each
+ * (piece, to) pair.  The 3D countermove history additionally stores a
+ * SCORE for every potential counter, indexed by the counter's own
+ * (piece, to).  This gives the move ordering a much richer signal:
+ * instead of "this move was the previous cutoff reply", it's "this
+ * move has historically been good in this context".
+ *
+ * Total size: 6 * 64 * 6 * 64 * 2 bytes = 294,912 bytes (~288 KB).
+ * The access pattern is regular enough that L1/L2 hit rates stay high.
+ *
+ * We use int16_t to keep the table compact.  Saturating arithmetic in
+ * the update prevents overflow — same formula as the butterfly history.
+ */
+static const int COUNTER_HIST_MAX = 16384;  /* |score| clamp before store */
+
 /* ── Per-search state ── */
 typedef struct {
     SearchLimits *limits;
@@ -60,6 +78,14 @@ typedef struct {
     int  history   [2][64][64];        /* butterfly history [side][from][to]  */
     int16_t cont_hist_p1 [CONT_HIST_PIECES][64]; /* ply-1 continuation history */
     int16_t cont_hist_p2 [CONT_HIST_PIECES][64]; /* ply-2 continuation history */
+    /*
+     * counter_hist: [prev_piece][prev_to][cur_piece][cur_to].
+     * Replaces the single-move countermove table for *scoring*.
+     * The plain `countermove[from][to]` table stays for the killer-style
+     * exact-match bonus, but counter_hist provides the per-move *score*
+     * that lets us rank multiple counter candidates.
+     */
+    int16_t counter_hist [CONT_HIST_PIECES][64][CONT_HIST_PIECES][64];
     Move killers   [MAX_PLY][2];
     Move countermove[64][64];
 

@@ -397,6 +397,50 @@ static void eval_pawns_uncached(const Board *b, Color us, int *mg, int *eg) {
             int bonus_rank = (us == WHITE) ? rank : (7 - rank);
             *mg += PASSED_PAWN_BONUS_MG[bonus_rank];
             *eg += PASSED_PAWN_BONUS_EG[bonus_rank];
+
+            /*
+             * ── King-distance term (EG only — MG tactics handled by search) ──
+             *
+             * A passed pawn is more valuable when:
+             *   - our own king is close to the promotion square (defends it)
+             *   - the enemy king is far from the promotion square (can't catch it)
+             * The metric is the difference in Chebyshev distances to the
+             * promotion square.  Each unit of difference is ~5 cp EG.
+             *
+             * Promotion square = the back-rank square on the pawn's file.
+             */
+            int promo_sq = (us == WHITE) ? (file | 56) : file;
+            int our_king = bb_lsb(b->pieces[us  ][KING]);
+            int opp_king = bb_lsb(b->pieces[them][KING]);
+            int d_our = chebyshev(our_king, promo_sq);
+            int d_opp = chebyshev(opp_king, promo_sq);
+            /* Closer = smaller d.  Each unit of (d_opp - d_our) helps
+             * by ~5 cp.  Clamp to avoid runaway scores on far-apart
+             * kings. */
+            int king_dist_bonus = 5 * (d_opp - d_our);
+            if (king_dist_bonus >  60) king_dist_bonus =  60;
+            if (king_dist_bonus < -60) king_dist_bonus = -60;
+            *eg += king_dist_bonus;
+
+            /*
+             * ── Blockage penalty ──
+             *
+             * An enemy non-pawn piece sitting on the square directly
+             * in front of the passer suppresses its advance.  An enemy
+             * KING blockading is the worst (it can never be chased
+             * away by the pawn itself).
+             */
+            int block_sq = (us == WHITE) ? sq + 8 : sq - 8;
+            if (block_sq >= 0 && block_sq < 64) {
+                Bitboard blocker = b->occ[them] & SQUARE_BB[block_sq];
+                if (blocker
+                    && !(b->pieces[them][PAWN] & SQUARE_BB[block_sq])) {
+                    *mg -= 12;
+                    *eg -= 24;
+                    if (b->pieces[them][KING] & SQUARE_BB[block_sq])
+                        *eg -= 18;  /* enemy king blockading = ~dead passer */
+                }
+            }
         }
 
         /*
@@ -465,8 +509,29 @@ static void eval_pawns(const Board *b, Color us, int *mg, int *eg) {
 }
 
 static void eval_mobility(const Board *b, Color us, int *mg, int *eg) {
+    Color them = us ^ 1;
     Bitboard occ    = b->occ[2];
     Bitboard not_us = ~b->occ[us];
+
+    /*
+     * Squares attacked by enemy pawns are unsafe — moving a piece
+     * there would just give it away.  SF/Ethereal's mobility excludes
+     * these squares; the original code counted them, overvaluing
+     * pieces that hover in front of the enemy pawn chain (especially
+     * knights and bishops on the rim).
+     *
+     * Compute the enemy-pawn attack set once:
+     *   - WHITE pawns attack NE (+9) and NW (+7), with file-edge masks.
+     *   - BLACK pawns attack SE (-7) and SW (-9), symmetric.
+     */
+    Bitboard ep = b->pieces[them][PAWN];
+    Bitboard epa;
+    if (them == WHITE) {
+        epa = ((ep & ~FILE_BB[0]) << 7) | ((ep & ~FILE_BB[7]) << 9);
+    } else {
+        epa = ((ep & ~FILE_BB[7]) >> 7) | ((ep & ~FILE_BB[0]) >> 9);
+    }
+    Bitboard safe = not_us & ~epa;
 
     for (int pt = KNIGHT; pt <= QUEEN; pt++) {
         Bitboard pieces = b->pieces[us][pt];
@@ -480,7 +545,9 @@ static void eval_mobility(const Board *b, Color us, int *mg, int *eg) {
                 case QUEEN:  atk = queen_attacks  ((Square)sq, occ); break;
                 default: break;
             }
-            int mob = bb_popcount(atk & not_us);
+            /* Use SAFE squares (excluding enemy-pawn-attacked) for the
+             * mobility count.  This is the SF/Ethereal convention. */
+            int mob = bb_popcount(atk & safe);
             if (mob > MOB_MAX[pt]) mob = MOB_MAX[pt];
             *mg += MOB_MG_TABLE[pt][mob];
             *eg += MOB_EG_TABLE[pt][mob];
@@ -525,8 +592,13 @@ static void eval_rooks(const Board *b, Color us, int *mg, int *eg) {
             if (mob <= 3) {
                 int king_sq = bb_lsb(b->pieces[us][KING]);
                 int kf = king_sq & 7;
-                /* Penalise when the rook is hemmed in on the same side as king */
-                if ((kf < 4) == (file < kf)) {
+                /* Penalise when the rook is hemmed in on the same
+                 * flank as its own king.  The previous test
+                 * `(kf < 4) == (file < kf)` was wrong — it tested
+                 * "rook strictly left of king" rather than "same flank".
+                 * Correct test: both on queenside (file < 4 and kf < 4)
+                 * or both on kingside (file >= 4 and kf >= 4). */
+                if ((kf < 4) == (file < 4)) {
                     *mg -= 52;
                     *eg -= 10;
                 }
@@ -678,6 +750,41 @@ static void eval_king_safety(const Board *b, Color us, int *mg, int *eg) {
     }
 
     /*
+     * ── 1b. Pawn storm: enemy pawns advancing on the king's files ──
+     *
+     * Pawns are the single most important danger signal in classical
+     * king safety — a pawn storm opens files toward the king and is
+     * the precursor to most mating attacks.  We scan the three files
+     * around the king (king's file ± 1) for enemy pawns and credit a
+     * penalty proportional to how advanced each pawn is toward our
+     * king.  A pawn on the king's own file (no friendly pawn shield
+     * possible) is extra-dangerous.
+     *
+     * This term is MG-only: in the endgame the kings walk out and
+     * pawn storms are no longer mating threats.
+     */
+    {
+        Bitboard storm_files = FILE_BB[king_file];
+        if (king_file > 0) storm_files |= FILE_BB[king_file - 1];
+        if (king_file < 7) storm_files |= FILE_BB[king_file + 1];
+
+        Bitboard storm = b->pieces[them][PAWN] & storm_files;
+        while (storm) {
+            int s = bb_pop(&storm);
+            int r = s >> 3;
+            /* How many ranks has the stormer advanced toward our king?
+             * For us=WHITE the stormer comes from rank 6 down (BLACK pawns
+             * advance downward); we measure (king_rank - r) so a pawn
+             * adjacent to the king on rank 5 (king on rank 1) gives 4. */
+            int advanced = (us == WHITE) ? (king_rank - r) : (r - king_rank);
+            if (advanced >= 0) {
+                bool on_king_file = ((s & 7) == king_file);
+                *mg -= 6 * advanced + (on_king_file ? 8 : 0);
+            }
+        }
+    }
+
+    /*
      * ── 2. Distance-weighted enemy piece attacks on king zone ──
      *
      * King zone = king square + all king-move squares (up to 9 squares).
@@ -723,6 +830,27 @@ static void eval_king_safety(const Board *b, Color us, int *mg, int *eg) {
 
     /* Restore to effective 2×/1×/0.5× scale */
     attack_weight /= 2;
+
+    /*
+     * Scale danger by the attacker's offensive potential.  Without a
+     * queen, mate is essentially impossible — a lone knight or bishop
+     * reaching the king zone is not the same kind of threat as a
+     * queen-led attack.  We:
+     *   • Zero out the danger when the attacker has no queen AND no
+     *     rook (you need at least a major piece to mate).
+     *   • Quarter the danger when the attacker has rooks but no queen.
+     * This matches the SF convention and prevents false king-safety
+     * penalties in minor-piece endgames.
+     */
+    bool enemy_has_queen = (b->pieces[them][QUEEN] != 0);
+    if (!enemy_has_queen) {
+        if (b->pieces[them][ROOK] == 0) {
+            attack_count  = 0;
+            attack_weight = 0;
+        } else {
+            attack_weight /= 4;
+        }
+    }
 
     /* Quadratic penalty when 2+ coordinated pieces attack */
     if (attack_count >= 2) {
@@ -808,10 +936,18 @@ static void eval_threats(const Board *b, Color us, int *mg, int *eg) {
         while (pieces) {
             int sq = bb_pop(&pieces);
 
-            Bitboard enemy_atk = sq_attackers(b, sq, occ) & b->occ[them];
+            /*
+             * Compute attackers ONCE.  The previous code called
+             * sq_attackers twice (once for enemy_atk, once for
+             * friendly_def), which is the most expensive function
+             * in the file — calling it twice per piece was pure
+             * waste.
+             */
+            Bitboard all_atk = sq_attackers(b, sq, occ);
+            Bitboard enemy_atk = all_atk & b->occ[them];
             if (!enemy_atk) continue;   /* not attacked at all — safe */
 
-            Bitboard friendly_def = sq_attackers(b, sq, occ) & b->occ[us];
+            Bitboard friendly_def = all_atk & b->occ[us];
             /* (the piece on 'sq' itself doesn't appear in sq_attackers output,
                so no need to mask it out.) */
 
@@ -823,20 +959,25 @@ static void eval_threats(const Board *b, Color us, int *mg, int *eg) {
                 /*
                  * Defended, but attacked by a cheaper piece.  Walk the enemy
                  * attackers from cheapest (PAWN) upward; the first hit is the
-                 * minimum-value attacker.
+                 * minimum-value attacker.  Track BOTH the MG and EG minimums
+                 * — the EG material values differ enough from MG that using
+                 * MG-only understates the EG danger (e.g. a pawn attacking a
+                 * rook is a 546-94=452 cp EG swing, not 480-82=398 cp MG).
                  */
-                int min_atk_mg = 30000;
+                int min_atk_mg = 30000, min_atk_eg = 30000;
                 for (int apt = PAWN; apt <= QUEEN; apt++) {
                     if (b->pieces[them][apt] & enemy_atk) {
                         min_atk_mg = MATERIAL_MG[apt];
+                        min_atk_eg = MATERIAL_EG[apt];
                         break;
                     }
                 }
                 int piece_mg = MATERIAL_MG[pt];
+                int piece_eg = MATERIAL_EG[pt];
                 if (min_atk_mg < piece_mg) {
                     /* Partial penalty: proportional to value difference. */
                     *mg -= (piece_mg - min_atk_mg) / 6;
-                    *eg -= (piece_mg - min_atk_mg) / 6;
+                    *eg -= (piece_eg - min_atk_eg) / 6;
                 }
             }
         }
@@ -923,7 +1064,20 @@ static void eval_queen_weak(const Board *b, Color us, int *mg, int *eg) {
 
 /* ──────────────────────────────────────────────
  *  KingProtector — minor pieces far from own king incur a penalty
+ *
+ *  Tuning: knights need to stay close to the king (they're slow and
+ *  can't help defend from afar); bishops are less tied to the king
+ *  (they can defend diagonally from a distance).  We use SF-style
+ *  per-piece-type weights:
+ *    KNIGHT: 4 cp MG, 3 cp EG per unit of Chebyshev distance.
+ *    BISHOP: 2 cp MG, 2 cp EG per unit.
+ *  These are about half the previous values, which gave a 105 cp
+ *  penalty for a single minor piece on the other side of the board —
+ *  enough to swamp most positional terms.
  * ────────────────────────────────────────────── */
+static const int KP_MG[2] = { 4, 2 };   /* knight, bishop */
+static const int KP_EG[2] = { 3, 2 };
+
 static void eval_king_protector(const Board *b, Color us, int *mg, int *eg) {
     int king_sq = bb_lsb(b->pieces[us][KING]);
     for (int pt = KNIGHT; pt <= BISHOP; pt++) {
@@ -931,8 +1085,8 @@ static void eval_king_protector(const Board *b, Color us, int *mg, int *eg) {
         while (pieces) {
             int sq   = bb_pop(&pieces);
             int dist = chebyshev(sq, king_sq);
-            *mg -= 7 * dist;
-            *eg -= 8 * dist;
+            *mg -= KP_MG[pt - KNIGHT] * dist;
+            *eg -= KP_EG[pt - KNIGHT] * dist;
         }
     }
 }
@@ -1013,8 +1167,18 @@ static int initiative(const Board *b, int mg, int eg) {
     int wk = bb_lsb(b->pieces[WHITE][KING]);
     int bk = bb_lsb(b->pieces[BLACK][KING]);
 
-    int outflanking = ((wk & 7) - (bk & 7))
-                    - ((wk >> 3) - (bk >> 3));
+    /*
+     * Outflanking = |Δfile| - |Δrank|.
+     *
+     * The original code used a signed Δfile - Δrank, which gave
+     * nonsense values for kings far apart on one axis.  The correct
+     * definition is the absolute version: a high outflanking means
+     * the kings are far apart on one axis and close on the other
+     * (the winning side has the opposition).
+     */
+    int df = (wk & 7) - (bk & 7); if (df < 0) df = -df;
+    int dr = (wk >> 3) - (bk >> 3); if (dr < 0) dr = -dr;
+    int outflanking = df - dr;
 
     bool infiltration = (wk >> 3) > 3 || (bk >> 3) < 4;
 
@@ -1073,6 +1237,7 @@ static int initiative(const Board *b, int mg, int eg) {
     int u_raw = complexity + 50;
     int u = sign_mg * (u_raw < 0 ? u_raw : 0);
     if (u < -abs(mg)) u = -abs(mg);
+    if (u >  abs(mg)) u =  abs(mg);   /* don't let initiative flip mg's sign */
 
     int v = sign_eg * (complexity > -abs(eg) ? complexity : -abs(eg));
 
@@ -1216,9 +1381,16 @@ int evaluate(const Board *b) {
         __snap_mg = c_mg;  __snap_eg = c_eg;
 #endif
 
-        /* ── Bishop pair ── */
+        /*
+         * ── Bishop pair ──
+         *
+         * The MG bishop-pair value is already encoded in
+         * material_imbalance() via QuadOurs[0][0] = 1438 (≈ 90 cp MG
+         * after /16).  Adding BISHOP_PAIR_MG on top would double-count
+         * the MG term.  We apply only the EG bonus here, which the
+         * imbalance table does not cover (it's MG-only by design).
+         */
         if (bb_popcount(b->pieces[c][BISHOP]) >= 2) {
-            c_mg += BISHOP_PAIR_MG;
             c_eg += BISHOP_PAIR_EG;
         }
 #ifdef EVAL_DEBUG
@@ -1278,6 +1450,56 @@ int evaluate(const Board *b) {
 
     /* Tempo bonus */
     score += taper(TEMPO_BONUS_MG, TEMPO_BONUS_EG, phase);
+
+    /*
+     * ── Opposite-colored-bishops drawishness ──────────────────────
+     *
+     * Endgames with bishops of opposite colors are notoriously drawish:
+     * the side with the advantage cannot break through because the
+     * defender's bishop controls all the squares of the attacker's
+     * bishop's color.  When the position is materially simple enough
+     * that the bishops are the only non-pawn non-king pieces, we shrink
+     * the EG score by 25% toward zero.
+     *
+     * The OCB detection requires:
+     *   - exactly one bishop per side
+     *   - the two bishops are on opposite color complexes
+     *   - no knights / rooks / queens remain
+     *   - we're in the endgame phase (low non-pawn material)
+     *
+     * We apply this AFTER the taper so the reduction only fires when
+     * the position is sufficiently endgame-ish.  The taper already
+     * weighted the EG component heavily.
+     */
+    {
+        int wb = bb_popcount(b->pieces[WHITE][BISHOP]);
+        int bb_n = bb_popcount(b->pieces[BLACK][BISHOP]);
+        if (wb == 1 && bb_n == 1) {
+            /* Color complex check: a1 (sq 0) is dark; same-color squares
+             * have (sq ^ sq2) & 1 == 0.  Bishops on opposite colors
+             * have (sq_w ^ sq_b) & 1 == 1. */
+            int sq_w = bb_lsb(b->pieces[WHITE][BISHOP]);
+            int sq_b = bb_lsb(b->pieces[BLACK][BISHOP]);
+            bool ocb = ((sq_w ^ sq_b) & 1) != 0;
+
+            if (ocb) {
+                /* Only flag as OCB endgame when no other non-pawn
+                 * non-king pieces remain (otherwise it's a middlegame
+                 * with OCB, which is a different beast). */
+                Bitboard non_bishop_npk = b->occ[2]
+                    & ~b->pieces[WHITE][PAWN]   & ~b->pieces[BLACK][PAWN]
+                    & ~b->pieces[WHITE][KING]   & ~b->pieces[BLACK][KING]
+                    & ~b->pieces[WHITE][BISHOP] & ~b->pieces[BLACK][BISHOP];
+                if (non_bishop_npk == 0) {
+                    /* Shrink the absolute score by 25%.  We do this
+                     * on the *tapered* score so the effect scales
+                     * naturally with how endgame-ish the position is. */
+                    int sgn = (score > 0) - (score < 0);
+                    score -= sgn * (abs(score) / 4);
+                }
+            }
+        }
+    }
 
     /*
      * ── Initiative / complexity correction (SF 11) ────────────────────

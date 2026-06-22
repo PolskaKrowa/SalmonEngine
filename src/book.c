@@ -51,6 +51,7 @@ typedef struct {
 
 static BookEntry book_table[BOOK_SIZE];
 static bool      book_active = false;
+static bool      book_enabled = true;   /* can be toggled at runtime */
 
 /* ── Engine functions we need ───────────────────────────────────────── */
 extern void board_init(void);          /* reset to starting position   */
@@ -246,7 +247,7 @@ void book_init(void) {
 }
 
 Move book_probe(Board *b) {
-    if (!book_active) return NULL_MOVE;
+    if (!book_active || !book_enabled) return NULL_MOVE;
 
     unsigned  idx = (unsigned)(b->hash & (BOOK_SIZE - 1));
     BookEntry *e  = &book_table[idx];
@@ -266,4 +267,12 @@ Move book_probe(Board *b) {
     }
 
     return NULL_MOVE;   /* collision — don't play an illegal move */
+}
+
+void book_set_enabled(bool enabled) {
+    book_enabled = enabled;
+}
+
+bool book_is_enabled(void) {
+    return book_enabled;
 }

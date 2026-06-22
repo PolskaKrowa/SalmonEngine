@@ -2,6 +2,7 @@
 #include "uci.h"
 #include "movegen.h"
 #include "tt.h"
+#include "book.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -86,6 +87,7 @@ static void handle_uci(void) {
     printf("id author %s\n",  ENGINE_AUTHOR);
     printf("option name Hash type spin default %d min 1 max 2048\n",
            DEFAULT_HASH_MB);
+    printf("option name OwnBook type check default true\n");
     printf("uciok\n");
     fflush(stdout);
 }
@@ -160,7 +162,7 @@ static void handle_go(Board *b, const char *line) {
 }
 
 static void handle_setoption(const char *line) {
-    /* Only "Hash" is supported */
+    /* Supported: "Hash" (spin) and "OwnBook" (check) */
     const char *name = strstr(line, "name");
     const char *val  = strstr(line, "value");
     if (!name || !val) return;
@@ -171,6 +173,12 @@ static void handle_setoption(const char *line) {
         int mb = atoi(val);
         if (mb < 1) mb = 1;
         tt_init((size_t)mb);
+    } else if (strncasecmp(name, "ownbook", 7) == 0
+            || strncasecmp(name, "book", 4) == 0) {
+        /* Accept "true"/"false" or "1"/"0". */
+        bool enabled = (strncasecmp(val, "true", 4) == 0
+                     || strncasecmp(val, "1",    1) == 0);
+        book_set_enabled(enabled);
     }
 }
 

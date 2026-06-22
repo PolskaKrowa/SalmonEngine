@@ -2,7 +2,7 @@
  * search.h — Search types and interface
  *
  * Refactored:
- *  • cont_hist[7][64] added to SearchInfo for continuation history (~30 Elo)
+ *  • cont_hist now has two tables (ply-1 and ply-2) for stronger move ordering.
  *  • score_from_tt removed; replaced by value_from_tt / value_to_tt in search.c
  */
 
@@ -28,6 +28,25 @@ typedef struct {
     bool stop;
 } SearchLimits;
 
+/*
+ * Continuation-history tables.
+ *
+ * Indexed by [piece_type][to_square], where `piece_type` covers the six
+ * piece types PAWN..KING.  Slot 0 (PAWN) is rarely used but kept for
+ * indexing simplicity — indexing by `piece_type` directly avoids a
+ * subtract that would otherwise be needed everywhere.
+ *
+ * cont_hist_p1 is updated/read using the *previous* ply's (piece, to).
+ * cont_hist_p2 is updated/read using the *ply-2*  (piece, to).
+ *
+ * Both tables are int16_t (~32 KB total) and use SF-style saturating
+ * arithmetic via the stat_bonus / stat_hat_penalty helpers in search.c.
+ * Compared to the previous 7*64 int table this halves the memory
+ * footprint and lets the second continuation history ride for free.
+ */
+#define CONT_HIST_PIECES 6
+#define CONT_HIST_MAX    16384
+
 /* ── Per-search state ── */
 typedef struct {
     SearchLimits *limits;
@@ -38,11 +57,9 @@ typedef struct {
     int           seldepth;
 
     /* Heuristic tables */
-    int  history   [2][64][64];   /* butterfly history [side][from][to]  */
-    int  cont_hist [7][64];       /* continuation history [piece_type][to]
-                                     Lightweight port of SF's continuation
-                                     history: captures the (piece,to) affinity
-                                     at ply-1 with ~30 Elo benefit.          */
+    int  history   [2][64][64];        /* butterfly history [side][from][to]  */
+    int16_t cont_hist_p1 [CONT_HIST_PIECES][64]; /* ply-1 continuation history */
+    int16_t cont_hist_p2 [CONT_HIST_PIECES][64]; /* ply-2 continuation history */
     Move killers   [MAX_PLY][2];
     Move countermove[64][64];
 

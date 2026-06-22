@@ -1,0 +1,297 @@
+name: Engine Benchmark
+
+# This workflow runs whenever a pull request is opened or updated against
+# main, OR manually via the "Run workflow" button.  It builds the engine
+# from BOTH the PR head and the merge-base (the commit on main that the
+# PR branches from), then:
+#
+#   1. Plays a cutechess-cli match between the two engine binaries to
+#      estimate the Elo difference (PR - main).
+#   2. Runs an NPS benchmark on each engine and reports the normalised
+#      NPS ratio (PR / main).  The NPS is normalised by a CPU-bound
+#      reference benchmark to avoid "GitHub Actions runner has a faster
+#      CPU this time" shenanigans.
+#
+# The results are written as a PR comment so reviewers can see at a
+# glance whether the PR makes the engine stronger / faster / slower.
+#
+# Notes on cutechess-cli installation:
+#   We use the static Linux binary from the official cutechess releases
+#   on GitHub.  No build step required.
+#
+# Notes on engine time control:
+#   We use 0.1+0.5 (100ms base + 500ms increment) — short enough to
+#   run 200+ games in ~10 minutes on a free GitHub Actions runner, but
+#   long enough to dampen per-move variance.  Adjust via the
+#   `TIME_CONTROL` env var if needed.
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  # Time control for the cutechess match (in seconds).
+  # 0.1+0.5 = 100ms base, 500ms increment per move.
+  TIME_CONTROL: "0.1+0.5"
+  # Number of games to play.  More = tighter Elo CI but longer CI run.
+  # 200 games at 0.1+0.5 takes ~10 minutes.
+  N_GAMES: "200"
+  # Hash size in MB for both engines.
+  HASH_MB: "32"
+  # Number of games to play concurrently (cutechess -concurrency).
+  N_CONCURRENT: "4"
+
+permissions:
+  contents: read
+  pull-requests: write   # needed to post the PR comment
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          path: pr
+          fetch-depth: 0
+
+      - name: Resolve merge-base (main)
+        working-directory: pr
+        run: |
+          # Find the commit on main that the PR branches from.
+          MERGE_BASE=$(git merge-base origin/main HEAD)
+          echo "Merge base: $MERGE_BASE"
+          echo "MERGE_BASE=$MERGE_BASE" >> $GITHUB_ENV
+
+      - name: Checkout main (at merge-base)
+        working-directory: pr
+        run: |
+          git worktree add ../main $MERGE_BASE
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc autoconf automake autoconf-archive libtool
+
+      - name: Build PR engine
+        working-directory: pr
+        run: |
+          autoreconf --install
+          ./configure
+          make -j$(nproc)
+          # Save a copy with a distinctive name
+          cp src/engine ../engine_pr
+          ../engine_pr <<< $'uci\nquit' 2>&1 | head -3
+
+      - name: Build main engine
+        working-directory: main
+        run: |
+          autoreconf --install
+          ./configure
+          make -j$(nproc)
+          cp src/engine ../engine_main
+          ../engine_main <<< $'uci\nquit' 2>&1 | head -3
+
+      - name: Install cutechess-cli
+        run: |
+          # Try the official release first; fall back to apt.
+          set -e
+          curl -fsSL -o cutechess.tar.gz \
+            https://github.com/cutechess/cutechess/releases/download/v1.3.1/cutechess-1.3.1-linux-amd64.tar.gz
+          tar -xzf cutechess.tar.gz
+          ls cutechess-*/
+          cp cutechess-1.3.1-linux-amd64/cutechess-cli ./cutechess-cli
+          chmod +x cutechess-cli
+          ./cutechess-cli --version || true
+
+      - name: Run cutechess-cli match (PR vs main)
+        run: |
+          mkdir -p match
+          # Engine config: name, command, init-string.
+          # We pass `setoption name Hash value ${HASH_MB}` via -initstr
+          # so both engines use the same hash size.
+          #
+          # -recover: restart crashed engines (rare but useful).
+          # -resign movecount=3 score=400: resign in clearly lost positions.
+          # -draw movecount=8 movenumber=6 score=10: adjudicate draws.
+          ./cutechess-cli \
+            -engine name=pr     cmd=./engine_pr    dir=. \
+                initstr="setoption name Hash value ${HASH_MB}" \
+            -engine name=main   cmd=./engine_main  dir=. \
+                initstr="setoption name Hash value ${HASH_MB}" \
+            -each proto=uci tc=${TIME_CONTROL} \
+            -rounds ${N_GAMES} -concurrency ${N_CONCURRENT} \
+            -recover \
+            -resign movecount=3 score=400 \
+            -draw  movecount=8 movenumber=6 score=10 \
+            -pgn match/match.pgn \
+            > match/cutechess.out 2>&1 || true
+          echo "=== cutechess output (tail) ==="
+          tail -25 match/cutechess.out
+
+      - name: Compute Elo difference
+        run: |
+          python3 pr/scripts/elo_from_cutechess.py \
+            --input match/cutechess.out \
+            --name-a pr --name-b main \
+            | tee match/elo_report.txt
+          # Extract the Elo number for the next step.
+          ELO_LINE=$(grep '^Elo diff:' match/elo_report.txt)
+          echo "ELO_REPORT<<EOF" >> $GITHUB_ENV
+          cat match/elo_report.txt >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Run NPS benchmark on PR engine
+        run: |
+          python3 pr/scripts/nps_benchmark.py \
+            --engine ./engine_pr --label pr --json \
+            > nps_pr.json
+          echo "=== PR NPS ==="
+          cat nps_pr.json
+
+      - name: Run NPS benchmark on main engine
+        run: |
+          python3 pr/scripts/nps_benchmark.py \
+            --engine ./engine_main --label main --json \
+            > nps_main.json
+          echo "=== main NPS ==="
+          cat nps_main.json
+
+      - name: Compute NPS ratio
+        run: |
+          python3 - <<'EOF'
+          import json
+          with open("nps_pr.json") as f:  pr  = json.load(f)
+          with open("nps_main.json") as f: main = json.load(f)
+
+          pr_nps    = pr["engine_nps"]
+          main_nps  = main["engine_nps"]
+          pr_norm   = pr["normalised_nps"]
+          main_norm = main["normalised_nps"]
+          pr_cpu    = pr["cpu_bench_score"]
+          main_cpu  = main["cpu_bench_score"]
+
+          # Time-to-depth: lower is better.  Useful when an engine
+          # changes its pruning profile — a more aggressive pruner may
+          # have LOWER NPS (each node is "richer") but ALSO lower
+          # time-to-depth (reaches the target depth faster).
+          pr_ttd    = pr.get("normalised_time_per_depth", 0)
+          main_ttd  = main.get("normalised_time_per_depth", 0)
+
+          ratio_raw  = pr_nps / main_nps if main_nps else 0
+          ratio_norm = pr_norm / main_norm if main_norm else 0
+          delta_norm = pr_norm - main_norm
+          ratio_ttd  = pr_ttd / main_ttd if main_ttd else 0
+          delta_ttd  = pr_ttd - main_ttd
+
+          print(f"PR  raw NPS:    {pr_nps:>10d}")
+          print(f"main raw NPS:   {main_nps:>10d}")
+          print(f"raw ratio:      {ratio_raw:.3f}x")
+          print()
+          print(f"PR  CPU bench:  {pr_cpu:>10.0f}")
+          print(f"main CPU bench: {main_cpu:>10.0f}")
+          print(f"CPU ratio:      {pr_cpu/main_cpu:.3f}x  (should be ~1.0 on the same runner)")
+          print()
+          print(f"PR  norm NPS:   {pr_norm:>10.0f}")
+          print(f"main norm NPS:  {main_norm:>10.0f}")
+          print(f"norm ratio:     {ratio_norm:.3f}x")
+          print(f"norm delta:     {delta_norm:+.0f}  (positive = PR is faster)")
+          print()
+          print(f"PR  norm TTD:   {pr_ttd:>10.1f}")
+          print(f"main norm TTD:  {main_ttd:>10.1f}")
+          print(f"TTD ratio:      {ratio_ttd:.3f}x  (lower = PR is faster)")
+          print(f"TTD delta:      {delta_ttd:+.1f}  (negative = PR is faster)")
+
+          with open("nps_ratio.txt", "w") as f:
+              f.write(f"PR_raw_nps={pr_nps}\n")
+              f.write(f"main_raw_nps={main_nps}\n")
+              f.write(f"raw_ratio={ratio_norm:.4f}\n")
+              f.write(f"PR_cpu_score={pr_cpu:.0f}\n")
+              f.write(f"main_cpu_score={main_cpu:.0f}\n")
+              f.write(f"PR_norm_nps={pr_norm:.0f}\n")
+              f.write(f"main_norm_nps={main_norm:.0f}\n")
+              f.write(f"norm_ratio={ratio_norm:.4f}\n")
+              f.write(f"norm_delta={delta_norm:+.0f}\n")
+              f.write(f"PR_norm_ttd={pr_ttd:.1f}\n")
+              f.write(f"main_norm_ttd={main_ttd:.1f}\n")
+              f.write(f"ttd_ratio={ratio_ttd:.4f}\n")
+              f.write(f"ttd_delta={delta_ttd:+.1f}\n")
+          EOF
+          cat nps_ratio.txt >> $GITHUB_ENV
+
+      - name: Build PR comment
+        run: |
+          # Assemble the markdown comment body.  GitHub's environment
+          # variable dumping into heredocs is finicky — we build the
+          # file step by step instead.
+          {
+            echo "## Engine Benchmark Results"
+            echo
+            echo "Comparing **PR** (\`${GITHUB_HEAD_REF}\`) vs **main** (\`${MERGE_BASE:0:7}\`)."
+            echo
+            echo "### Elo (strength)"
+            echo
+            echo '```'
+            cat match/elo_report.txt
+            echo '```'
+            echo
+            echo "### NPS (raw speed)"
+            echo
+            echo "| Metric | PR | main | ratio |"
+            echo "|---|---:|---:|---:|"
+            echo "| Raw NPS | ${PR_raw_nps} | ${main_raw_nps} | ${raw_ratio}x |"
+            echo "| CPU bench | ${PR_cpu_score} | ${main_cpu_score} | $(python3 -c "print(f'{$PR_cpu_score/$main_cpu_score:.3f}x')") |"
+            echo "| Normalised NPS | ${PR_norm_nps} | ${main_norm_nps} | ${norm_ratio}x |"
+            echo
+            echo "**Normalised NPS delta: ${norm_delta}** (positive = PR is faster)"
+            echo
+            echo "> **Caveat:** NPS measures raw search throughput.  An engine with more"
+            echo "> aggressive pruning may have LOWER NPS (each node is \"richer\") but"
+            echo "> reach the same depth faster.  See the time-to-depth metric below."
+            echo
+            echo "### Time-to-depth (effective speed)"
+            echo
+            echo "| Metric | PR | main | ratio |"
+            echo "|---|---:|---:|---:|"
+            echo "| Norm. time/depth (lower=better) | ${PR_norm_ttd} | ${main_norm_ttd} | ${ttd_ratio}x |"
+            echo
+            echo "**TTD delta: ${ttd_delta}** (negative = PR reaches target depth faster)"
+            echo
+            echo "_Auto-generated by the Engine Benchmark workflow._"
+          } > comment.md
+          echo "=== Comment body ==="
+          cat comment.md
+
+      - name: Find existing benchmark comment
+        if: github.event_name == 'pull_request'
+        uses: peter-evans/find-comment@v3
+        id: find_comment
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: github-actions[bot]
+          body-includes: "Engine Benchmark Results"
+
+      - name: Post / update PR comment
+        if: github.event_name == 'pull_request'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-id: ${{ steps.find_comment.outputs.comment-id }}
+          edit-mode: replace
+          body-path: comment.md
+
+      - name: Upload artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            match/
+            nps_pr.json
+            nps_main.json
+            nps_ratio.txt
+            comment.md

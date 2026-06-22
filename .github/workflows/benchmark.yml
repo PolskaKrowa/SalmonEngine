@@ -48,7 +48,11 @@ permissions:
 
 jobs:
   benchmark:
-    runs-on: ubuntu-22.04
+    # ubuntu-24.04 (noble) is required because we need Qt6 to build
+    # cutechess-cli from source.  Qt6 isn't available on ubuntu-22.04
+    # (jammy), which only ships Qt5; the upstream cutechess project
+    # switched to Qt6 in 2024.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
@@ -98,19 +102,60 @@ jobs:
 
       - name: Install cutechess-cli
         run: |
-          # Try the official release first; fall back to apt.
+          # Install cutechess-cli by building it from source.
+          #
+          # Why not apt?  The `cutechess-cli` binary package is NOT in
+          # the Ubuntu 22.04 / 24.04 main or universe repos — the
+          # `cutechess` source package in Ubuntu was last updated in
+          # yakkety (16.10) and only built a GUI metapackage, not the
+          # CLI tool.  No PPA provides it either.
+          #
+          # Why not the GitHub release binary?  The cutechess GitHub
+          # releases only ship Windows binaries since v1.4.0
+          # (v1.3.1 had a Linux build but it's linked against ICU 66,
+          # which is from Ubuntu 20.04 and isn't available on newer
+          # runners).  So downloading a pre-built binary is a dead end.
+          #
+          # Building from source takes ~3 minutes on a GitHub Actions
+          # runner but produces a binary linked against the runner's
+          # own Qt6 libraries, which always works.
+          #
+          # The cutechess project uses CMake + Qt6 (as of 2024).
+          # The CMakeLists unconditionally requires all Qt6 components
+          # (Core, Gui, Widgets, Concurrent, Svg, PrintSupport,
+          # Core5Compat) even though the CLI binary itself only links
+          # against Qt6::Core and Qt6::Core5Compat.  We install the
+          # full Qt6 dev package to satisfy the find_package call.
           set -e
-          curl -fsSL -o cutechess.tar.gz \
-            https://github.com/cutechess/cutechess/releases/download/v1.3.1/cutechess-1.3.1-linux-amd64.tar.gz
-          tar -xzf cutechess.tar.gz
-          ls cutechess-*/
-          cp cutechess-1.3.1-linux-amd64/cutechess-cli ./cutechess-cli
-          chmod +x cutechess-cli
-          ./cutechess-cli --version || true
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ git ca-certificates \
+            qt6-base-dev qt6-base-dev-tools libqt6core5compat6-dev \
+            libgl1-mesa-dev
+
+          git clone --depth 1 https://github.com/cutechess/cutechess.git /tmp/cc-src
+          cd /tmp/cc-src
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DWITH_TESTS=OFF ..
+          # Build just the `cli` target (skips the GUI binary, saving time).
+          make -j$(nproc) cli
+          # Sanity-check the binary landed where we expect.
+          ls -la cutechess-cli
+          sudo cp cutechess-cli /usr/local/bin/cutechess-cli
+          sudo chmod +x /usr/local/bin/cutechess-cli
+          cd -
+
+          echo "=== cutechess-cli version ==="
+          cutechess-cli --version
 
       - name: Run cutechess-cli match (PR vs main)
         run: |
           mkdir -p match
+          # cutechess-cli is on PATH (installed via apt in the previous step).
+          CUTECHESS=$(which cutechess-cli)
+          echo "Using cutechess-cli at: $CUTECHESS"
+          #
           # Engine config: name, command, init-string.
           # We pass `setoption name Hash value ${HASH_MB}` via -initstr
           # so both engines use the same hash size.
@@ -118,7 +163,7 @@ jobs:
           # -recover: restart crashed engines (rare but useful).
           # -resign movecount=3 score=400: resign in clearly lost positions.
           # -draw movecount=8 movenumber=6 score=10: adjudicate draws.
-          ./cutechess-cli \
+          "$CUTECHESS" \
             -engine name=pr     cmd=./engine_pr    dir=. \
                 initstr="setoption name Hash value ${HASH_MB}" \
             -engine name=main   cmd=./engine_main  dir=. \

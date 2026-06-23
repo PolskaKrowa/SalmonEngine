@@ -299,7 +299,14 @@ void unmake_move(Board *b) {
     b->ep_sq     = u->ep_sq;
     b->castle    = u->castle;
     b->halfmove  = u->halfmove;
-    b->hash      = u->hash;
+    /* NOTE: Do NOT restore b->hash here yet.  The put_piece / move_piece /
+     * remove_piece calls below each XOR the hash incrementally, which
+     * would corrupt a restored hash.  Instead, we let those calls
+     * re-derive the hash delta (they undo the make_move's hash delta),
+     * and then we restore the saved hash at the very end.  Failing to
+     * do this was the root cause of the "illegal position" / "two
+     * kings" bug: the hash drifted from the actual board state,
+     * causing TT entries from unrelated positions to be applied. */
     b->ply--;
     if (us == BLACK) b->fullmove--;
 
@@ -334,6 +341,9 @@ void unmake_move(Board *b) {
         Square rt = (us == WHITE) ? A1 : A8;
         move_piece(b, us, ROOK, rf, rt);
     }
+
+    /* Now restore the saved hash — after all piece ops are done. */
+    b->hash = u->hash;
 }
 
 /* ──────────────────────────────────────────────

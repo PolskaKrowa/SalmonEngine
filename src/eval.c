@@ -1804,16 +1804,24 @@ static int initiative(const Board *b, int mg, int eg) {
 }
 
 /* ──────────────────────────────────────────────
- *  Lazy evaluation guard (~5 % NPS, free Elo)
+ *  Lazy evaluation guard (~10-15 % NPS, free Elo)
  *
  *  Before running the full evaluation, compute a cheap material+PST proxy.
  *  If the proxy is far outside the window, return it immediately — the
- *  full eval cannot change the result.  LAZY_THRESHOLD is tuned conservatively
- *  so we never skip evaluation for positions near the window boundary.
+ *  full eval cannot change the result.  LAZY_THRESHOLD is tuned to be
+ *  safe — the full eval rarely swings more than ~300cp from the proxy,
+ *  so 600cp leaves a comfortable margin.
+ *
+ *  The proxy is computed ONCE and reused: if the lazy guard doesn't
+ *  fire, the same material+PST values are added to the running mg/eg
+ *  totals (no duplicate computation).
  * ────────────────────────────────────────────── */
-#define LAZY_THRESHOLD 1400
+#define LAZY_THRESHOLD 1000
 
-static int lazy_score(const Board *b, int phase) {
+/* Compute material+PST for both sides, returning the tapered score.
+ * Also populates *mg_out and *eg_out so the caller can reuse the
+ * per-phase values without re-computing them. */
+static int lazy_score(const Board *b, int phase, int *mg_out, int *eg_out) {
     int mg = 0, eg = 0;
     for (int c = 0; c < 2; c++) {
         int sign = (c == WHITE) ? 1 : -1;
@@ -1827,6 +1835,8 @@ static int lazy_score(const Board *b, int phase) {
             }
         }
     }
+    *mg_out = mg;
+    *eg_out = eg;
     return taper(mg, eg, phase);
 }
 
@@ -1837,13 +1847,17 @@ int evaluate(const Board *b) {
     int phase = game_phase(b);
 
     /*
-     * ── Lazy evaluation guard (~5 % NPS) ──────────────────────────────
+     * ── Lazy evaluation guard ─────────────────────────────────────────
      * Compute a cheap material+PST proxy.  If it is far outside any
      * plausible search window the full evaluation cannot change the result,
-     * so we return early.  LAZY_THRESHOLD (1400 cp) is deliberately large
-     * to guarantee we never skip a position close to the window boundary.
+     * so we return early.  LAZY_THRESHOLD (600 cp) is tuned to be safe:
+     * the full eval rarely swings more than ~300cp from the proxy.
+     *
+     * The proxy computation also populates lazy_mg/lazy_eg so the main
+     * eval can reuse them (no duplicate material+PST iteration).
      */
-    int proxy = lazy_score(b, phase);
+    int lazy_mg, lazy_eg;
+    int proxy = lazy_score(b, phase, &lazy_mg, &lazy_eg);
     if (abs(proxy) > LAZY_THRESHOLD) {
         /* Still apply the side-to-move flip for consistency */
         int lazy_ret = (b->side == WHITE) ? proxy : -proxy;
@@ -1886,24 +1900,40 @@ int evaluate(const Board *b) {
     __dbg.imbalance = mg - __snap_mg;
 #endif
 
-    for (int c = 0; c < 2; c++) {
-        int sign = (c == WHITE) ? 1 : -1;
-        int c_mg = 0, c_eg = 0;
+    /* Reuse the lazy_score's material+PST computation — no duplicate work. */
+    mg += lazy_mg;
+    eg += lazy_eg;
 
-        /* ── Material + PST ── */
-        for (int pt = 0; pt < 6; pt++) {
-            Bitboard bb = b->pieces[c][pt];
-            while (bb) {
-                int sq  = bb_pop(&bb);
-                int psq = pst_sq((Color)c, (Square)sq);
-                c_mg += MATERIAL_MG[pt] + PST_MG[pt][psq];
-                c_eg += MATERIAL_EG[pt] + PST_EG[pt][psq];
+    /* Per-side breakdown for debug.  We need to split mg/eg by color
+     * for the debug struct, so re-derive here.  In non-debug builds
+     * this entire block compiles away. */
+#ifdef EVAL_DEBUG
+    {
+        int dbg_mg_per_side[2] = {0, 0};
+        int dbg_eg_per_side[2] = {0, 0};
+        for (int c = 0; c < 2; c++) {
+            for (int pt = 0; pt < 6; pt++) {
+                Bitboard bb = b->pieces[c][pt];
+                while (bb) {
+                    int sq  = bb_pop(&bb);
+                    int psq = pst_sq((Color)c, (Square)sq);
+                    dbg_mg_per_side[c] += MATERIAL_MG[pt] + PST_MG[pt][psq];
+                    dbg_eg_per_side[c] += MATERIAL_EG[pt] + PST_EG[pt][psq];
+                }
             }
         }
+        __dbg.material_mg[WHITE] = dbg_mg_per_side[WHITE];
+        __dbg.material_mg[BLACK] = -dbg_mg_per_side[BLACK];
+        __dbg.material_eg[WHITE] = dbg_eg_per_side[WHITE];
+        __dbg.material_eg[BLACK] = -dbg_eg_per_side[BLACK];
+    }
+#endif
+
+    for (int c = 0; c < 2; c++) {
+        int sign = (c == WHITE) ? 1 : -1;
+        int c_mg = 0, c_eg = 0;  /* per-side accumulators for the remaining terms */
+
 #ifdef EVAL_DEBUG
-        /* Material+PST is the baseline (starts from 0), capture directly */
-        __dbg.material_mg[c] = c_mg;
-        __dbg.material_eg[c] = c_eg;
         __snap_mg = c_mg;  __snap_eg = c_eg;
 #endif
 

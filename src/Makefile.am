@@ -19,7 +19,7 @@ if ENABLE_EVAL_DEBUG
 engine_SOURCES += eval_debug.c
 endif
 
-engine_LDADD = -lm 
+engine_LDADD = -lm
 
 # ── Tuner binary (only built when --enable-tuner is passed) ───
 if ENABLE_TUNER

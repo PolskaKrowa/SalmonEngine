@@ -33,8 +33,6 @@
  *  • Time management: check every 2048 nodes; stop when budget exceeded
  */
 
-#define _POSIX_C_SOURCE 199309L
-
 #include "search.h"
 #include "movegen.h"
 #include "eval.h"
@@ -44,7 +42,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <limits.h>
-#include <time.h>
+#include <time.h>      /* clock_gettime, CLOCK_MONOTONIC */
 
 #ifdef EVAL_DEBUG
 #  include "eval_debug.h"
@@ -396,6 +394,9 @@ static long now_ms(void) {
 }
 
 bool time_up(SearchInfo *si) {
+    /* Pondering: search indefinitely until `stop` is set (by `ponderhit`
+     * with time conversion, or by a new `position`/`go`/`stop` command). */
+    if (si->limits->ponder) return si->limits->stop;
     if (si->limits->infinite) return si->limits->stop;
     if (si->limits->stop)     return true;
     if (si->max_time_ms <= 0) return false;
@@ -430,6 +431,17 @@ int quiesce(Board *b, int alpha, int beta, int ply, SearchInfo *si) {
     else
         gen_captures(b, &ml);
 
+    /* Quiescence move scoring.
+     *
+     * We use the full score_move() for consistency with the main search's
+     * move ordering.  Although quiescence is capture-dominated (and a
+     * lighter MVV-LVA-only scorer would be faster per-move), the full
+     * scorer's SEE-based capture classification (winning/even/losing)
+     * produces better move ordering, which reduces the number of nodes
+     * searched — a net win in NPS despite the higher per-move cost.
+     *
+     * The history/killer/countermove tables are passed for the in-check
+     * case (where quiet moves are generated and need ordering). */
     int scores[MAX_MOVES];
     const Move *killers_ply = si->killers[ply < MAX_PLY ? ply : MAX_PLY - 1];
     int (*hist_side)[64]    = si->history[b->side];
@@ -438,8 +450,6 @@ int quiesce(Board *b, int alpha, int beta, int ply, SearchInfo *si) {
                                [MOVE_TO  (si->move_stack[ply - 1])]
               : NULL_MOVE;
 
-    /* Quiescence only uses ply-1 continuation history (the search depth
-     * here is so shallow that ply-2 adds noise without signal). */
     Move prev_moves[1];
     int  n_prev = 0;
     if (ply > 0 && si->move_stack[ply - 1] != NULL_MOVE) {
@@ -496,7 +506,8 @@ int quiesce(Board *b, int alpha, int beta, int ply, SearchInfo *si) {
  * ────────────────────────────────────────────── */
 /* mark negamax as hot */
 __attribute__((hot))
-int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
+int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si,
+            Move excluded) {
     /* power-of-2 modulo → bitwise AND.
      * GCC already performs this transform at -O3, but the explicit form
      * documents intent and removes any ambiguity for readers and tools. */
@@ -530,9 +541,17 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
         }
     }
 
-    /* ── TT probe ── */
+    /* ── TT probe ──
+     *
+     * When `excluded` is set (we are inside a singular-extension
+     * verification search), the TT entry was computed WITH the
+     * excluded move available, so its bound does not apply to the
+     * excluded sub-search.  Disable TT cutoffs and TT move hint in
+     * that case (we still probe so we can read the move for ordering
+     * of the non-excluded moves, but we don't trust the score).
+     */
     TTEntry tte;
-    bool    tt_hit  = tt_probe(b->hash, &tte);
+    bool    tt_hit  = excluded ? false : tt_probe(b->hash, &tte);
     Move    tt_move = tt_hit ? tte.move : NULL_MOVE;
 
     if (tt_hit && !pv && tte.depth >= depth) {
@@ -669,7 +688,7 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
 
         make_null_move(b);
         si->move_stack[ply] = NULL_MOVE;
-        int null_score = -negamax(b, depth - R, -beta, -beta + 1, ply + 1, si);
+        int null_score = -negamax(b, depth - R, -beta, -beta + 1, ply + 1, si, NULL_MOVE);
         unmake_null_move(b);
 
         if (null_score >= beta) {
@@ -677,7 +696,7 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
 
             /* Verification at deep nodes: prevents zugzwang false-positives. */
             if (depth - R >= 6) {
-                int verify = negamax(b, depth - R, beta - 1, beta, ply, si);
+                int verify = negamax(b, depth - R, beta - 1, beta, ply, si, NULL_MOVE);
                 if (verify < beta) goto after_nmp;
             }
             return null_score;
@@ -714,7 +733,7 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
 
             if (pc_val >= raised_beta)
                 pc_val = -negamax(b, depth - 4, -(raised_beta), -(raised_beta) + 1,
-                                  ply + 1, si);
+                                  ply + 1, si, NULL_MOVE);
 
             unmake_move(b);
 
@@ -784,6 +803,10 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
 
     for (int i = 0; i < ml.count; i++) {
         Move m = pick_move(ml.moves, scores, ml.count, i);
+
+        /* Skip the excluded move (singular extension verification). */
+        if (m == excluded) continue;
+
         if (!is_legal(b, m)) continue;
 
         bool is_cap   = MOVE_IS_CAP(m) || MOVE_TYPE(m) == MT_EP;
@@ -893,34 +916,48 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
             && scores[i] < -20 * depth * depth)
             continue;
 
-        /* ── Singular Extension ── */
+        /* ── Singular Extension ──
+         *
+         * A move is "singular" if it is clearly better than all other
+         * moves at this node.  We test this by running a reduced-depth
+         * search with the TT move EXCLUDED — if that search fails low
+         * (no other move can reach sing_beta = tt_score - 2*depth),
+         * the TT move is singular and deserves an extension.
+         *
+         * The `excluded` parameter is threaded through negamax so the
+         * recursive call skips the excluded move in its move loop and
+         * disables TT cutoffs (which would be wrong since the TT value
+         * was computed with the excluded move available).
+         *
+         * Multi-cut: if the excluded search FAILS HIGH over sing_beta
+         * AND sing_beta >= beta, multiple moves are good enough — we
+         * can prune the entire node.  This folds the classic
+         * Björnsson-Marsland MC-pruning into the singular verification.
+         */
         int extension = 0;
         if (depth >= 6
             && m == tt_move
             && !root
             && tt_move != NULL_MOVE
+            && excluded == NULL_MOVE
             && tte.move != NULL_MOVE
             && abs(tte.score) < MATE_SCORE - MAX_PLY
             && (tte.flag & TT_LOWER)
             && tte.depth >= depth - 3)
         {
-            int sing_beta  = tte.score - 2 * depth;
+            int sing_beta  = value_from_tt(tte.score, ply) - 2 * depth;
             int half_depth = depth / 2;
 
-            Move saved_tt = tt_move;
-            tt_move = NULL_MOVE;
-
             int sing_val = negamax(b, half_depth, sing_beta - 1, sing_beta,
-                                   ply, si);
-
-            tt_move = saved_tt;
+                                   ply, si, m);
 
             if (__builtin_expect(si->limits->stop, 0)) return 0;
 
             if (sing_val < sing_beta) {
                 extension = 1;
-            } else if (sing_beta >= beta) {
-                return sing_beta;
+            } else if (sing_val >= beta) {
+                /* Multi-cut: several moves are good enough, prune. */
+                return sing_val;
             }
         }
 
@@ -1005,15 +1042,20 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
             if (reduction > new_depth)  reduction = new_depth;
         }
 
-        /* ── PVS / LMR search ── */
+        /* ── PVS / LMR search ──
+         *
+         * Propagate `excluded` to children so a singular-verify search
+         * keeps the excluded move excluded throughout the sub-tree.
+         * (The verify search itself sets excluded=m for its top-level
+         * call; deeper calls inherit it.) */
         if (legal_count == 1) {
-            score = -negamax(b, new_depth, -beta, -alpha, ply + 1, si);
+            score = -negamax(b, new_depth, -beta, -alpha, ply + 1, si, excluded);
         } else {
             score = -negamax(b, new_depth - reduction,
-                             -alpha - 1, -alpha, ply + 1, si);
+                             -alpha - 1, -alpha, ply + 1, si, excluded);
 
             if (score > alpha && (reduction > 0 || pv)) {
-                score = -negamax(b, new_depth, -beta, -alpha, ply + 1, si);
+                score = -negamax(b, new_depth, -beta, -alpha, ply + 1, si, excluded);
             }
         }
 
@@ -1125,17 +1167,27 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si) {
                     }
                 }
 
-                tt_store(b->hash, value_to_tt(beta, ply), best_move, depth, TT_LOWER, ply);
+                /* Don't store to TT when searching with an excluded move —
+                 * the score is only valid for the excluded sub-position. */
+                if (excluded == NULL_MOVE)
+                    tt_store(b->hash, value_to_tt(beta, ply), best_move, depth, TT_LOWER, ply);
                 return beta;
             }
         }
     }
 
     /* ── Terminal node detection ── */
-    if (legal_count == 0)
+    if (legal_count == 0) {
+        /* When excluded is set, the "no legal moves" case is the
+         * excluded move being the only legal move — return alpha
+         * (fail-low) rather than a mate score, since the position
+         * with the excluded move added is not mate. */
+        if (excluded != NULL_MOVE) return alpha;
         return in_chk ? (-MATE_SCORE + ply) : DRAW_SCORE;
+    }
 
-    tt_store(b->hash, value_to_tt(best_score, ply), best_move, depth, tt_flag, ply);
+    if (excluded == NULL_MOVE)
+        tt_store(b->hash, value_to_tt(best_score, ply), best_move, depth, tt_flag, ply);
     return best_score;
 }
 
@@ -1175,7 +1227,10 @@ void search(Board *b, SearchLimits *lim) {
      * capped at 50ms.  We now check depth-only BEFORE the game-clock
      * fallback.
      */
-    if (lim->infinite) {
+    if (lim->infinite || lim->ponder) {
+        /* Infinite or ponder: no time limit.  Ponder searches until
+         * `stop` is set (by `ponderhit` converting to time-limited
+         * mode, or by a new command). */
         si.allotted_ms = 0;
         si.max_time_ms = 0;
     } else if (lim->movetime > 0) {
@@ -1245,7 +1300,7 @@ void search(Board *b, SearchLimits *lim) {
             int failed_low_count = 0, failed_high_count = 0;
 
             while (true) {
-                score = negamax(b, depth, asp_alpha, asp_beta, 0, &si);
+                score = negamax(b, depth, asp_alpha, asp_beta, 0, &si, NULL_MOVE);
 
                 if (lim->stop) goto done;
 
@@ -1262,12 +1317,12 @@ void search(Board *b, SearchLimits *lim) {
                 }
 
                 if (delta > 500 || failed_low_count + failed_high_count >= 3) {
-                    score = negamax(b, depth, -INF, INF, 0, &si);
+                    score = negamax(b, depth, -INF, INF, 0, &si, NULL_MOVE);
                     break;
                 }
             }
         } else {
-            score = negamax(b, depth, -INF, INF, 0, &si);
+            score = negamax(b, depth, -INF, INF, 0, &si, NULL_MOVE);
         }
 
         if (lim->stop) break;
@@ -1326,7 +1381,16 @@ done:
     {
         char mv_str[6];
         move_to_str(best_move, mv_str);
-        printf("bestmove %s\n", mv_str);
+
+        /* Extract ponder move (predicted opponent reply) for `bestmove X ponder Y`. */
+        Move ponder_move = search_extract_ponder_move(b, best_move);
+        if (ponder_move != NULL_MOVE) {
+            char ponder_str[6];
+            move_to_str(ponder_move, ponder_str);
+            printf("bestmove %s ponder %s\n", mv_str, ponder_str);
+        } else {
+            printf("bestmove %s\n", mv_str);
+        }
         fflush(stdout);
     }
 
@@ -1339,4 +1403,50 @@ void search_init(void) {
     init_mvv_lva();
     init_reductions();
     book_init();
+}
+
+/* ──────────────────────────────────────────────
+ *  Ponder move extraction
+ *
+ *  After a search completes, we predict the opponent's reply by
+ *  probing the TT for the position AFTER our best move.  The TT
+ *  entry's stored move (the opponent's best move from their
+ *  perspective) is our ponder move.
+ *
+ *  This is the standard Stockfish-style approach: the PV is implicit
+ *  in the TT, so we don't need to track it explicitly during search.
+ * ────────────────────────────────────────────── */
+Move search_extract_ponder_move(Board *b, Move best_move) {
+    if (best_move == NULL_MOVE) return NULL_MOVE;
+
+    /* Make our move, probe the TT, unmake. */
+    make_move(b, best_move);
+    TTEntry tte;
+    bool hit = tt_probe(b->hash, &tte);
+    Move ponder = hit ? tte.move : NULL_MOVE;
+
+    /* Verify the ponder move is legal in the position after our move.
+     * The TT might contain a stale or corrupted move (e.g., from a
+     * collision or a position that was never fully searched), so we
+     * must validate before returning it.  An illegal ponder move
+     * would cause the GUI to reject our `bestmove X ponder Y` line. */
+    if (ponder != NULL_MOVE) {
+        /* Generate legal moves and check if ponder is among them.
+         * We use is_legal() which does make/unmake internally. */
+        MoveList ml;
+        gen_moves(b, &ml);
+        bool found_legal = false;
+        for (int i = 0; i < ml.count; i++) {
+            if (ml.moves[i] == ponder) {
+                if (is_legal(b, ponder)) {
+                    found_legal = true;
+                    break;
+                }
+            }
+        }
+        if (!found_legal) ponder = NULL_MOVE;
+    }
+
+    unmake_move(b);
+    return ponder;
 }

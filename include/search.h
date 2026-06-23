@@ -25,6 +25,7 @@ typedef struct {
     int  movetime;
     int  depth;
     bool infinite;
+    bool ponder;     /* true if we're pondering (search opponent's predicted move) */
     bool stop;
 } SearchLimits;
 
@@ -101,6 +102,19 @@ void search      (Board *b, SearchLimits *lim);
 bool time_up     (SearchInfo *si);
 int  see         (const Board *b, Move m);
 int  negamax     (Board *b, int depth, int alpha, int beta,
-                  int ply, SearchInfo *si);
+                  int ply, SearchInfo *si, Move excluded);
 int  quiesce     (Board *b, int alpha, int beta,
                   int ply, SearchInfo *si);
+
+/* ── Pondering support ──
+ *
+ * After a `go ponder` search completes, the engine outputs
+ * `bestmove X ponder Y` where Y is the predicted opponent reply.
+ * The GUI then sends `ponderhit` (if the opponent played Y) or a
+ * new `position`/`go` (if they didn't).
+ *
+ * `search_extract_ponder_move` returns the predicted opponent reply
+ * by probing the TT for the position after `best_move` was played.
+ * Returns NULL_MOVE if no ponder move is available.
+ */
+Move search_extract_ponder_move(Board *b, Move best_move);

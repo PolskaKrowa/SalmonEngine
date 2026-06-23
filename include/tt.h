@@ -41,9 +41,12 @@ typedef struct {
     uint8_t  _pad;       /* explicit pad to reach 16 bytes             */
 } TTEntry;               /* sizeof = 16 bytes                          */
 
-/* Number of entries per bucket.  2 is a good default — more entries
- * per bucket improves hit rate but increases probe cost. */
-#define TT_BUCKET_SLOTS 2
+/* Number of entries per bucket.  3 matches Stockfish/Ethereal — more
+ * entries per bucket improves hit rate without measurably increasing
+ * probe cost (3×16-byte entries = 48 bytes, fits in a cache line).
+ * Must be paired with the SF-style depth - 8*age priority function
+ * in tt.c for proper replacement. */
+#define TT_BUCKET_SLOTS 3
 
 /* ──────────────────────────────────────────────
  *  API

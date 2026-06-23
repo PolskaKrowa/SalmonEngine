@@ -78,10 +78,10 @@ void tt_clear(void) {
 }
 
 void tt_new_search(void) {
-    /* Wrap around at 250 to leave headroom in the uint8_t — the priority
-     * arithmetic uses generation delta, which stays small as long as we
-     * wrap cleanly.  250 is well below 256 so arithmetic never overflows. */
-    TT_GENERATION = (uint8_t)((TT_GENERATION + 1) % 250);
+    /* Bump generation.  We use uint8_t arithmetic with wrap at 256;
+     * the priority function handles wrap-around via the `if (age > 125)`
+     * guard below. */
+    TT_GENERATION = (uint8_t)(TT_GENERATION + 1);
 }
 
 /* ──────────────────────────────────────────────
@@ -110,21 +110,26 @@ void tt_prefetch(uint64_t key) {
 }
 
 /*
- * priority(entry) — higher = "more valuable to keep".
+ * priority(entry) — HIGHER = "more valuable to keep".
  *
- *   depth           (0..127)
- *   + 4 if entry is from the current generation
- *   - 1 if entry is empty (TT_NONE) — easy to replace
+ * SF-style formula:
+ *   priority = depth - 8 * relative_age
  *
- * The +4 generation bonus is roughly equivalent to 4 extra plies of
- * depth, ensuring current-search entries survive at the expense of
- * stale entries from previous searches.
+ * where relative_age is how many generations old the entry is.
+ * One generation of age costs 8 ply of depth, so a fresh shallow
+ * entry beats an old deep one (recent searches are likely to probe
+ * similar positions).  Empty entries get the lowest priority for
+ * easy eviction.
+ *
+ * We pick the entry with the LOWEST priority to replace.
  */
 static inline int tt_priority(const TTEntry *e) {
-    if (e->flag == TT_NONE) return -1;
-    int p = (int)e->depth;
-    if (e->generation == TT_GENERATION) p += 4;
-    return p;
+    if (e->flag == TT_NONE) return -256;  /* very low — easy to evict */
+    int age = (int)((uint8_t)(TT_GENERATION - e->generation));
+    /* Generation wraps at 256; if the delta is large the entry is
+     * from a previous wrapped epoch, so cap its effective age. */
+    if (age > 125) age = 256 - age;
+    return (int)e->depth - 8 * age;
 }
 
 /* ──────────────────────────────────────────────
@@ -147,6 +152,7 @@ bool tt_probe(uint64_t key, TTEntry *out) {
  *  Store
  * ────────────────────────────────────────────── */
 void tt_store(uint64_t key, int score, Move move, int depth, int flag, int ply) {
+    (void)ply;  /* score is already TT-adjusted by the caller via value_to_tt */
     if (!TT) return;
     TTEntry *bucket = tt_bucket(key);
 
@@ -160,8 +166,12 @@ void tt_store(uint64_t key, int score, Move move, int depth, int flag, int ply) 
             if (move) e->move = move;
             /* Always overwrite score/depth/flag — the new search is
              * at least as deep as the old one (in normal iterative
-             * deepening) and may have a more accurate score. */
-            e->score = (int16_t)score_to_tt(score, ply);
+             * deepening) and may have a more accurate score.
+             *
+             * NOTE: `score` is already TT-adjusted (caller passed
+             * value_to_tt(score, ply)).  We do NOT call score_to_tt
+             * here — that would double-adjust mate scores. */
+            e->score = (int16_t)score;
             e->depth = (uint8_t)depth;
             e->flag  = (uint8_t)flag;
             e->generation = TT_GENERATION;
@@ -182,7 +192,7 @@ void tt_store(uint64_t key, int score, Move move, int depth, int flag, int ply) 
 
     TTEntry *e = &bucket[replace_idx];
     e->key   = key;
-    e->score = (int16_t)score_to_tt(score, ply);
+    e->score = (int16_t)score;  /* caller already TT-adjusted */
     e->move  = move;
     e->depth = (uint8_t)depth;
     e->flag  = (uint8_t)flag;

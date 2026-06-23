@@ -128,6 +128,13 @@ jobs:
       #    Note: the apt "cutechess-cli" package is not used here because
       #    it lags far behind the upstream release; we build from source
       #    in the next step to get a current, reproducible binary.
+      #
+      #    Qt6 module -> Ubuntu package mapping:
+      #      QtWidgets, QtConcurrent, QtPrintSupport, QtTest -> qt6-base-dev
+      #      QtSvg                                           -> libqt6svg6-dev
+      #      Qt5Compat (QTextStream, QRegExp, etc.)         -> libqt6core5compat6-dev
+      #    QtTest / qt-testlib is optional (unit tests only) and is included
+      #    in qt6-base-dev, so no extra package is required for it.
       - name: Install system dependencies
         if: steps.changes.outputs.skip != 'true'
         run: |
@@ -135,7 +142,9 @@ jobs:
           sudo apt-get install -y \
             autoconf automake autoconf-archive gcc make \
             cmake g++ git \
-            qt6-base-dev
+            qt6-base-dev \
+            libqt6svg6-dev \
+            libqt6core5compat6-dev
 
       # ── 3b. Build cutechess-cli from source ──
       #    Clones the latest upstream tag at shallow depth, configures a

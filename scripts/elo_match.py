@@ -82,8 +82,8 @@ def run_cutechess(engine_a: str, engine_b: str,
         "-rounds",      str(rounds),
         "-games",       "2",                 # each opening, both colours
         "-variant",     "standard",
-        "-engine",      f"name={name_a}", f"cmd={engine_a}",
-        "-engine",      f"name={name_b}", f"cmd={engine_b}",
+        "-engine",      f"name={name_a}", f"cmd={engine_a}", "depth=15",
+        "-engine",      f"name={name_b}", f"cmd={engine_b}", "depth=15",
         "-each",        "proto=uci", f"tc={time_control}",
     ]
     if openings:

@@ -221,7 +221,7 @@ jobs:
             --engine-b /tmp/engine-main \
             --name-a   "branch" \
             --name-b   "main" \
-            --time-control "10+0.1" \
+            --time-control "inf" \
             --rounds   200 \
             --history  "elo_history/${{ github.ref_name }}.jsonl" \
             --branch   "${{ github.ref_name }}" \

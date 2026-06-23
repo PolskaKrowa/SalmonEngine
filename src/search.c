@@ -33,6 +33,8 @@
  *  • Time management: check every 2048 nodes; stop when budget exceeded
  */
 
+#define _POSIX_C_SOURCE 199309L
+
 #include "search.h"
 #include "movegen.h"
 #include "eval.h"

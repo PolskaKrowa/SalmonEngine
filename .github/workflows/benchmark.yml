@@ -121,11 +121,13 @@ jobs:
           # own Qt6 libraries, which always works.
           #
           # The cutechess project uses CMake + Qt6 (as of 2024).
-          # The CMakeLists unconditionally requires all Qt6 components
-          # (Core, Gui, Widgets, Concurrent, Svg, PrintSupport,
-          # Core5Compat) even though the CLI binary itself only links
-          # against Qt6::Core and Qt6::Core5Compat.  We install the
-          # full Qt6 dev package to satisfy the find_package call.
+          # We only need the `cli` target (which links against
+          # Qt6::Core and Qt6::Core5Compat only), but the upstream
+          # CMakeLists unconditionally find_package()s ALL Qt6
+          # components including the GUI ones (Widgets, Concurrent,
+          # Svg, PrintSupport).  We patch the CMakeLists to make those
+          # GUI components optional, so we only have to install the
+          # much smaller qt6-base-dev + libqt6core5compat6-dev.
           set -e
 
           sudo apt-get update
@@ -136,6 +138,91 @@ jobs:
 
           git clone --depth 1 https://github.com/cutechess/cutechess.git /tmp/cc-src
           cd /tmp/cc-src
+
+          # Patch CMakeLists.txt to make the GUI Qt components optional.
+          #
+          # The upstream file does:
+          #   set(QT_COMPONENTS Core Gui Widgets Concurrent Svg PrintSupport Core5Compat)
+          #   find_package(Qt6 REQUIRED COMPONENTS ${QT_COMPONENTS} QUIET)
+          # and unconditionally add_executable(gui ...).
+          #
+          # We change this to:
+          #   - find_package only the CLI-needed components (Core, Core5Compat)
+          #     as REQUIRED
+          #   - find_package the GUI components (Gui, Widgets, Concurrent,
+          #     Svg, PrintSupport) as OPTIONAL
+          #   - wrap add_executable(gui ...) and its target_* calls in
+          #     `if(TARGET Qt::Widgets AND TARGET Qt::Svg AND ...)`
+          #
+          # The patch is done with a small Python script rather than
+          # sed because the CMakeLists structure is multiline.
+          python3 - <<'PYEOF'
+          import re
+          with open('CMakeLists.txt') as f:
+              src = f.read()
+
+          # 1. Replace the QT_COMPONENTS + find_package block so the
+          #    GUI components become optional.
+          old_block = (
+              'set(QT_COMPONENTS Core Gui Widgets Concurrent Svg PrintSupport Core5Compat)\n'
+              'if(WITH_TESTS)\n'
+              '\tenable_testing()\n'
+              '\tset(QT_COMPONENTS ${QT_COMPONENTS} Test)\n'
+              'endif()\n'
+              '\n'
+              'find_package(Qt6 REQUIRED COMPONENTS ${QT_COMPONENTS} QUIET)\n'
+          )
+          new_block = (
+              '# CLI needs only Core and Core5Compat; the rest are GUI-only.\n'
+              'find_package(Qt6 REQUIRED COMPONENTS Core Core5Compat QUIET)\n'
+              'find_package(Qt6 COMPONENTS Gui Widgets Concurrent Svg PrintSupport QUIET)\n'
+              'set(WITH_GUI OFF)\n'
+              'if(TARGET Qt::Gui AND TARGET Qt::Widgets AND TARGET Qt::Concurrent AND TARGET Qt::Svg AND TARGET Qt::PrintSupport)\n'
+              '\tset(WITH_GUI ON)\n'
+              'endif()\n'
+              'if(WITH_TESTS)\n'
+              '\tenable_testing()\n'
+              '\tfind_package(Qt6 COMPONENTS Test QUIET)\n'
+              'endif()\n'
+              '\n'
+              'if(NOT WITH_GUI)\n'
+              '\tmessage(STATUS "GUI components not found — building CLI only.")\n'
+              'endif()\n'
+          )
+          if old_block not in src:
+              raise SystemExit('CMakeLists patch: QT_COMPONENTS block not found')
+          src = src.replace(old_block, new_block)
+
+          # 2. Wrap the `add_executable(gui ...)` block (and its
+          #    target_* calls) in `if(WITH_GUI) ... endif()`.
+          #    The block starts at `add_executable(gui` and runs to
+          #    the end of the file (GUI is the last target).  We also
+          #    need to wrap the `install(TARGETS gui ...)` line,
+          #    which would otherwise fail at install time if the gui
+          #    target doesn't exist.
+          gui_start = src.find('add_executable(gui')
+          if gui_start == -1:
+              raise SystemExit('CMakeLists patch: add_executable(gui) not found')
+          before = src[:gui_start]
+          gui_block = src[gui_start:]
+          src = (before
+               + 'if(WITH_GUI)\n'
+               + gui_block
+               + '\nendif()\n')
+
+          # 3. The `install(TARGETS gui ...)` line is inside the
+          #    wrapped block now, but `install(TARGETS cli ...)` is
+          #    also inside that block — we want it to ALWAYS run.
+          #    CMake's install() rules are no-ops during `make cli`
+          #    anyway (they only fire on `make install`), so this is
+          #    not a problem in practice.  We skip `make install`
+          #    entirely and just copy the binary manually.
+
+          with open('CMakeLists.txt', 'w') as f:
+              f.write(src)
+          print('Patched CMakeLists.txt successfully.')
+          PYEOF
+
           mkdir build && cd build
           cmake -DCMAKE_BUILD_TYPE=Release -DWITH_TESTS=OFF ..
           # Build just the `cli` target (skips the GUI binary, saving time).

@@ -122,14 +122,46 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # ── 3. Install build deps + cutechess-cli (only if needed) ──
-      - name: Install build deps + cutechess-cli
+      # ── 3. Install system build dependencies ──
+      #    Packages needed to build both the chess engine (autotools/gcc)
+      #    and cutechess-cli from source (cmake, g++, Qt5).
+      #    Note: the apt "cutechess-cli" package is not used here because
+      #    it lags far behind the upstream release; we build from source
+      #    in the next step to get a current, reproducible binary.
+      - name: Install system dependencies
         if: steps.changes.outputs.skip != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             autoconf automake autoconf-archive gcc make \
-            cutechess-cli
+            cmake g++ git \
+            qtbase5-dev libqt5core5a
+
+      # ── 3b. Build cutechess-cli from source ──
+      #    Clones the latest upstream tag at shallow depth, configures a
+      #    Release build with CMake, and installs into /usr/local so that
+      #    cutechess-cli is on PATH for every subsequent step.
+      #    The --version call at the end is a fast sanity-check: if the
+      #    binary isn't reachable or crashes on startup the step fails
+      #    here with a clear message rather than silently later.
+      - name: Build cutechess-cli from source
+        if: steps.changes.outputs.skip != 'true'
+        run: |
+          git clone --depth 1 \
+            https://github.com/cutechess/cutechess.git \
+            /tmp/cutechess-src
+
+          cmake \
+            -S /tmp/cutechess-src \
+            -B /tmp/cutechess-build \
+            -DCMAKE_BUILD_TYPE=Release
+
+          cmake --build /tmp/cutechess-build --parallel "$(nproc)"
+
+          sudo cmake --install /tmp/cutechess-build
+
+          # Verify the binary is reachable and executable.
+          cutechess-cli --version
 
       # ── 4. Build the branch engine ──
       - name: Build branch engine

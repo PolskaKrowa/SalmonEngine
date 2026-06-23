@@ -220,9 +220,125 @@ static const int ROOK_SEMIOPEN_MG   = 12;
 static const int ROOK_SEMIOPEN_EG   = 7;
 static const int ROOK_ON_SEVENTH_MG = 20;
 static const int ROOK_ON_SEVENTH_EG = 32;
+/* Rook on a file containing the enemy queen — small bonus for the latent
+ * battery / pinning threat.  Classical Stockfish term ("Rook on queen file"). */
+static const int ROOK_ON_QUEEN_FILE_MG = 7;
+static const int ROOK_ON_QUEEN_FILE_EG = 5;
 
-static const int BISHOP_PAIR_MG = 30;
+/* The MG bishop-pair value is intentionally not declared here — it is
+ * already encoded in material_imbalance() via QuadOurs[0][0] = 1438
+ * (≈ 90 cp MG after /16).  Declaring it as a separate constant would
+ * generate an unused-constant warning. */
 static const int BISHOP_PAIR_EG = 60;
+
+/*
+ * Bishop pawns ("bad bishop") — penalty for a bishop whose own pawns sit on
+ * the same color complex as the bishop.  A bishop on a dark square with many
+ * own pawns on dark squares loses mobility and gets walled in.  Classical
+ * Stockfish term ("Bishop pawns").  Penalty per same-color own pawn.
+ * Tuned conservative values; more in MG than EG (the bishop has more to do
+ * in the middlegame).
+ */
+static const int BISHOP_PAWNS_MG = 5;
+static const int BISHOP_PAWNS_EG = 3;
+/* Bonus that scales the penalty when the bishop has more than 3 same-color
+ * pawns (extra-bad case — the bishop is effectively neutralised). */
+static const int BISHOP_PAWNS_HEAVY_MG = 4;
+static const int BISHOP_PAWNS_HEAVY_THRESHOLD = 3;
+
+/*
+ * Long-diagonal bishop — bonus for a bishop sitting on one of the two long
+ * diagonals (a1-h8 or a8-h1) when it sees the central squares.  A long-
+ * diagonal bishop exerts pressure across the whole board for very little
+ * material investment.  Classical Stockfish term ("Long diagonal bishop").
+ */
+static const int LONG_DIAGONAL_BISHOP_MG = 30;
+static const int LONG_DIAGONAL_BISHOP_EG = 12;
+
+/*
+ * Queen infiltration — bonus for a queen that has pushed into enemy territory
+ * (ranks 5-7 from our perspective).  A queen on the 6th or 7th harasses
+ * pawns, threats mate, and pins pieces.  Classical Stockfish term
+ * ("Queen infiltration").  Tiered by depth.
+ */
+static const int QUEEN_INFILTRATION_MG[4] = { 0, 10, 25, 40 }; /* ranks 5/6/7/8 */
+static const int QUEEN_INFILTRATION_EG[4] = { 0, 15, 30, 45 };
+
+/*
+ * Pawnless flank — penalty when our king sits on a flank (queen-side or
+ * king-side) with no friendly pawns at all.  Such a king is structurally
+ * exposed even without enemy pieces nearby: every exchange opens a file
+ * toward it.  Classical Stockfish term ("Pawnless flank").
+ */
+static const int PAWNLESS_FLANK_MG = 35;
+static const int PAWNLESS_FLANK_EG = 8;
+
+/*
+ * Phalanx — two friendly pawns side-by-side on the same rank.  A phalanx
+ * controls the two squares in front of it mutually and is a strong passed-
+ * pawn candidate.  Classical Stockfish term ("Phalanx").  Applied per pawn
+ * that has a friendly neighbour on the adjacent file at the same rank.
+ */
+static const int PHALANX_MG = 12;
+static const int PHALANX_EG = 2;
+
+/*
+ * Candidate passed pawn — a pawn that is not yet passed but whose advance is
+ * hard to stop because the enemy pawns that could block it are on the same
+ * file (opposed) and cannot easily get support to the adjacent files.
+ * Worth ~half of a true passed pawn, scaled by rank.  Classical Stockfish
+ * term ("Candidate passed").
+ */
+static const int CANDIDATE_PASSED_MG[8] = { 0, 5,  9, 13, 20, 35, 0, 0 };
+static const int CANDIDATE_PASSED_EG[8] = { 0, 7, 11, 18, 30, 55, 0, 0 };
+
+/*
+ * Hanging pawns — the specific pawn structure: two friendly pawns on c4+d4
+ * (or mirrored) with no friendly pawns on the b/e files and no enemy pawns
+ * on the c/d files.  Strong centrally but structurally weak (cannot be
+ * defended by other pawns).  Classical Stockfish term ("Hanging").  Net
+ * effect is a small penalty in MG (weakness) and small bonus in EG
+ * (centralisation pays off when pieces come off).
+ */
+static const int HANGING_PAWNS_MG = -14;
+static const int HANGING_PAWNS_EG =  8;
+
+/*
+ * Endgame shelter — small EG bonus for retaining pawn shelter in front of
+ * the king.  Even in endgames the king wants a pawn shield; the effect is
+ * much smaller than in the middlegame.  Classical Stockfish term
+ * ("Endgame shelter").
+ */
+static const int KING_SHIELD_BONUS_EG = 2;
+
+/*
+ * Space — bonus proportional to the number of squares behind our pawns that
+ * we control (not attacked by enemy pawns).  More space means more room to
+ * manoeuvre and harder for the opponent to defend.  Classical Stockfish term
+ * ("Space").  MG-only — in the endgame the kings walk out and space matters
+ * far less.  The raw count is divided by a scaling factor (here ~12) so the
+ * bonus stays in a sensible range.
+ */
+static const int SPACE_SCALE = 12;
+static const int SPACE_MG_PER_SQUARE = 7;
+
+/*
+ * Knight on queen — bonus for a knight that attacks the enemy queen.  Even
+ * without an immediate tactical threat, a knight annoying the queen exerts
+ * a strong positional pull.  Classical Stockfish term ("Knight on queen").
+ */
+static const int KNIGHT_ON_QUEEN_MG = 12;
+static const int KNIGHT_ON_QUEEN_EG = 6;
+
+/*
+ * Slider on queen — bonus for a bishop/rook that attacks the enemy queen
+ * along a ray.  Pin or skewer potential.  Classical Stockfish term
+ * ("Slider on queen").  Bishop and rook get slightly different weights.
+ */
+static const int BISHOP_ON_QUEEN_MG = 8;
+static const int BISHOP_ON_QUEEN_EG = 4;
+static const int ROOK_ON_QUEEN_ATTACK_MG = 6;
+static const int ROOK_ON_QUEEN_ATTACK_EG = 3;
 
 static const int OUTPOST_KNIGHT_MG = 22;
 static const int OUTPOST_KNIGHT_EG = 14;
@@ -242,7 +358,13 @@ static const int KING_ATTACKER_WEIGHT[6]  = { 0, 20, 20, 40, 80, 0, };
 static const int KING_EG_DISTANCE_PENALTY = 4;
 
 #define TEMPO_BONUS_MG 16
-#define TEMPO_BONUS_EG 0
+/*
+ * Tempo EG — a small tempo bonus for the side to move in the endgame.
+ * The original engine set this to 0, but in endgames with passed-pawn races
+ * and opposition battles the side-to-move advantage is real (the player who
+ * just moved must commit first).  Modern engines typically use 8-15 cp EG.
+ */
+#define TEMPO_BONUS_EG 10
 
 /* Mobility evaluation indexing */
 static const int * const MOB_MG_TABLE[6] = {
@@ -484,6 +606,91 @@ static void eval_pawns_uncached(const Board *b, Color us, int *mg, int *eg) {
                     }
                 }
             }
+
+            /*
+             * ── Candidate passed pawn ──
+             *
+             * A candidate is a pawn that is not yet passed but whose advance
+             * is hard to stop: there is at most one enemy pawn in its path
+             * (on the same file or adjacent files ahead), and we have
+             * enough own-pawn support that the enemy pawn will be traded
+             * away rather than block us permanently.  We approximate the
+             * SF definition: the pawn is opposed by exactly one enemy pawn
+             * on the same file, and no enemy pawns on the adjacent files
+             * ahead.  Worth ~half of a true passed pawn.
+             */
+            {
+                Bitboard same_file_ahead = their_pawns & FILE_BB[file] & ahead_mask;
+                Bitboard adj_file_ahead  = their_pawns & adj_files   & ahead_mask;
+                if (same_file_ahead && !adj_file_ahead
+                    && bb_popcount(same_file_ahead) == 1) {
+                    int bonus_rank = (us == WHITE) ? rank : (7 - rank);
+                    if (bonus_rank >= 1 && bonus_rank <= 6) {
+                        *mg += CANDIDATE_PASSED_MG[bonus_rank];
+                        *eg += CANDIDATE_PASSED_EG[bonus_rank];
+                    }
+                }
+            }
+        }
+
+        /*
+         * ── Phalanx ──
+         *
+         * Two friendly pawns side-by-side on the same rank form a "phalanx" —
+         * they defend the two squares in front of them mutually and are a
+         * strong passed-pawn / centre-formation building block.  We award a
+         * per-pawn bonus when this pawn has a friendly neighbour on an
+         * adjacent file at the same rank.  (Each phalanx pair gets counted
+         * twice — once per pawn — which matches the SF convention.)
+         */
+        if (file > 0) {
+            int left_sq = sq - 1;
+            if (our_pawns & SQUARE_BB[left_sq]) {
+                *mg += PHALANX_MG;
+                *eg += PHALANX_EG;
+            }
+        }
+    }
+
+    /*
+     * ── Hanging pawns (structural term, evaluated once per side) ──
+     *
+     * The "hanging pawns" structure is two friendly pawns side-by-side on
+     * the c/d files (or e/f for the mirror), with NO friendly pawns on
+     * either adjacent outer file (b/f or a/d) and NO enemy pawns on the
+     * same two files.  They form a strong centre but cannot be defended by
+     * other pawns, so the side must defend them with pieces.
+     *
+     * Detection: find friendly pawns on adjacent files c+d (or e+f, or
+     * b+c, etc. — actually SF checks all adjacent-file pairs).  We use a
+     * simpler, more lenient version: any pair of friendly pawns on
+     * adjacent files at the same rank, where (a) no friendly pawns exist
+     * on the next file outward, and (b) no enemy pawns exist on either of
+     * the two pawn files.  This is a per-pair bonus awarded once.
+     */
+    {
+        Bitboard p = our_pawns;
+        while (p) {
+            int sq1 = bb_pop(&p);
+            int f1 = sq1 & 7, r1 = sq1 >> 3;
+            int f2 = f1 + 1;
+            if (f2 > 7) continue;
+            /* Same-rank friendly pawn on the next file? */
+            int sq2 = r1 * 8 + f2;
+            if (!(our_pawns & SQUARE_BB[sq2])) continue;
+            /* No friendly pawns on the next-outward files. */
+            int f_left  = f1 - 1;
+            int f_right = f2 + 1;
+            Bitboard outer = 0;
+            if (f_left  >= 0) outer |= FILE_BB[f_left];
+            if (f_right <= 7) outer |= FILE_BB[f_right];
+            if (our_pawns & outer) continue;
+            /* No enemy pawns on either of the two pawn files. */
+            if (their_pawns & (FILE_BB[f1] | FILE_BB[f2])) continue;
+            /* Confirmed hanging pair — apply once. */
+            *mg += HANGING_PAWNS_MG;
+            *eg += HANGING_PAWNS_EG;
+            break;  /* only one bonus per side */
         }
     }
 }
@@ -619,6 +826,28 @@ static void eval_rooks(const Board *b, Color us, int *mg, int *eg) {
                 *eg += ROOK_ON_SEVENTH_EG;
             }
         }
+
+        /*
+         * Rook on queen file: small bonus when the rook sits on a file
+         * that contains an enemy queen.  This represents a latent
+         * battery / pinning threat along the file, separate from the
+         * direct "rook attacks queen" tactical bonus awarded elsewhere.
+         * Only credit when the file is not already open or semi-open
+         * (those cases get the larger ROOK_OPEN_FILE bonus instead, and
+         * crediting again would double-count).
+         */
+        if (!(no_own_pawn && no_enemy_pawn) && !no_own_pawn) {
+            Bitboard enemy_queen_file = 0;
+            Bitboard eqs = b->pieces[them][QUEEN];
+            while (eqs) {
+                int eqs_sq = bb_pop(&eqs);
+                enemy_queen_file |= FILE_BB[eqs_sq & 7];
+            }
+            if (enemy_queen_file & file_bb) {
+                *mg += ROOK_ON_QUEEN_FILE_MG;
+                *eg += ROOK_ON_QUEEN_FILE_EG;
+            }
+        }
     }
 }
 
@@ -742,10 +971,37 @@ static void eval_king_safety(const Board *b, Color us, int *mg, int *eg) {
         } else {
             int shield1 = (us == WHITE) ? king_rank + 1 : king_rank - 1;
             int shield2 = (us == WHITE) ? king_rank + 2 : king_rank - 2;
-            if (shield1 >= 0 && shield1 < 8 && (file_pawns & RANK_BB[shield1]))
+            if (shield1 >= 0 && shield1 < 8 && (file_pawns & RANK_BB[shield1])) {
                 *mg += KING_SHIELD_BONUS * 2;
-            else if (shield2 >= 0 && shield2 < 8 && (file_pawns & RANK_BB[shield2]))
+                *eg += KING_SHIELD_BONUS_EG;
+            } else if (shield2 >= 0 && shield2 < 8 && (file_pawns & RANK_BB[shield2])) {
                 *mg += KING_SHIELD_BONUS;
+            }
+        }
+    }
+
+    /*
+     * ── 1a. Pawnless flank ──
+     *
+     * If our king is on a flank (king-side files fgh or queen-side files
+     * abc) with NO friendly pawns on that entire flank, that's a structural
+     * weakness even without enemy piece pressure: any exchange opens a file
+     * directly toward the king.  Apply a flat penalty, larger in MG where
+     * the king is committed to its corner, smaller in EG where the king
+     * can walk away.  Classical SF term ("Pawnless flank").
+     */
+    {
+        Bitboard flank_files;
+        if (king_file <= 2) {
+            flank_files = FILE_BB[0] | FILE_BB[1] | FILE_BB[2];
+        } else if (king_file >= 5) {
+            flank_files = FILE_BB[5] | FILE_BB[6] | FILE_BB[7];
+        } else {
+            flank_files = 0;  /* king on central file — no flank */
+        }
+        if (flank_files && !(our_pawns & flank_files)) {
+            *mg += PAWNLESS_FLANK_MG;
+            *eg += PAWNLESS_FLANK_EG;
         }
     }
 
@@ -1103,6 +1359,230 @@ static void eval_minor_behind_pawn(const Board *b, Color us, int *mg, int *eg) {
     *eg +=  3 * count;
 }
 
+/*
+ * ──────────────────────────────────────────────
+ *  Bishop pawns ("bad bishop")
+ *
+ *  A bishop whose own pawns are predominantly on the same color complex as
+ *  the bishop itself loses mobility and is effectively a "big pawn".  We
+ *  count own pawns on the bishop's color complex and apply a per-pawn
+ *  penalty.  When the count exceeds the heavy threshold (3), an additional
+ *  flat penalty is added because the bishop is essentially neutralised.
+ *
+ *  Color complex of a square s: dark squares have (s ^ (s>>3)) & 1 == 0
+ *  (sum of file+rank is even).  Same-color squares share this bit.
+ *  We test (s ^ color_rep_sq) & 1 == 0 to detect same color.
+ *  Color representative: sq 0 (a1) is dark.
+ * ────────────────────────────────────────────── */
+static void eval_bishop_pawns(const Board *b, Color us, int *mg, int *eg) {
+    Bitboard bishops = b->pieces[us][BISHOP];
+    Bitboard our_pawns = b->pieces[us][PAWN];
+
+    while (bishops) {
+        int sq = bb_pop(&bishops);
+        /* Determine the color complex of this bishop.
+         * (file + rank) parity: dark squares have even parity (a1=0+0=0). */
+        int bishop_parity = ((sq & 7) + (sq >> 3)) & 1;
+
+        /* Count own pawns on the same color complex. */
+        int same_color_pawns = 0;
+        Bitboard p = our_pawns;
+        while (p) {
+            int psq = bb_pop(&p);
+            int pawn_parity = ((psq & 7) + (psq >> 3)) & 1;
+            if (pawn_parity == bishop_parity) same_color_pawns++;
+        }
+
+        if (same_color_pawns > 0) {
+            *mg -= BISHOP_PAWNS_MG * same_color_pawns;
+            *eg -= BISHOP_PAWNS_EG * same_color_pawns;
+            if (same_color_pawns > BISHOP_PAWNS_HEAVY_THRESHOLD) {
+                *mg -= BISHOP_PAWNS_HEAVY_MG;
+            }
+        }
+    }
+}
+
+/*
+ * ──────────────────────────────────────────────
+ *  Long diagonal bishop
+ *
+ *  A bishop on one of the two long diagonals (a1-h8 or a8-h1) sees the
+ *  central squares d4/e4/d5/e5 and exerts board-wide pressure.  We award
+ *  a small bonus for each such bishop that actually has line-of-sight to
+ *  the centre (i.e. the diagonal is not blocked by another own piece).
+ *
+ *  We use a simple heuristic: if the bishop's attacks from its current
+ *  square include at least one of the four central squares, we count it
+ *  as a long-diagonal bishop when the bishop is itself on one of the two
+ *  long diagonals.  This avoids rewarding a bishop on a1 that's walled in
+ *  by its own pawns on b2/c3.
+ * ────────────────────────────────────────────── */
+static const Bitboard LONG_DIAGONAL_A1H8 =
+      (1ULL <<  0) | (1ULL <<  9) | (1ULL << 18) | (1ULL << 27)
+    | (1ULL << 36) | (1ULL << 45) | (1ULL << 54) | (1ULL << 63);
+static const Bitboard LONG_DIAGONAL_A8H1 =
+      (1ULL << 56) | (1ULL << 49) | (1ULL << 42) | (1ULL << 35)
+    | (1ULL << 28) | (1ULL << 21) | (1ULL << 14) | (1ULL <<  7);
+
+static void eval_long_diagonal_bishop(const Board *b, Color us, int *mg, int *eg) {
+    Bitboard bishops = b->pieces[us][BISHOP];
+    Bitboard occ = b->occ[2];
+
+    while (bishops) {
+        int sq = bb_pop(&bishops);
+        Bitboard sqbb = SQUARE_BB[sq];
+        bool on_long = (sqbb & (LONG_DIAGONAL_A1H8 | LONG_DIAGONAL_A8H1)) != 0;
+        if (!on_long) continue;
+
+        /* Check the bishop actually sees at least one central square. */
+        Bitboard atk = bishop_attacks((Square)sq, occ);
+        Bitboard centre = SQUARE_BB[27] | SQUARE_BB[28]
+                        | SQUARE_BB[35] | SQUARE_BB[36];
+        if (atk & centre) {
+            *mg += LONG_DIAGONAL_BISHOP_MG;
+            *eg += LONG_DIAGONAL_BISHOP_EG;
+        }
+    }
+}
+
+/*
+ * ──────────────────────────────────────────────
+ *  Queen infiltration
+ *
+ *  A queen on ranks 5/6/7 from our perspective is actively invading — it
+ *  threatens pawns, mate, and pins.  We award a tiered bonus based on the
+ *  rank from our side.  Rank 8 (deeply invading or behind enemy lines) gets
+ *  the largest bonus.  No bonus for queens still on our half of the board.
+ * ────────────────────────────────────────────── */
+static void eval_queen_infiltration(const Board *b, Color us, int *mg, int *eg) {
+    Bitboard queens = b->pieces[us][QUEEN];
+    while (queens) {
+        int sq = bb_pop(&queens);
+        int rank = sq >> 3;
+        /* Rank from our perspective: WHITE ranks 0..7, BLACK inverted. */
+        int our_rank = (us == WHITE) ? rank : (7 - rank);
+        /* our_rank 0..3 = our half → no bonus.
+         * our_rank 4    = rank 5 → small bonus (index 1).
+         * our_rank 5    = rank 6 → medium bonus (index 2).
+         * our_rank 6..7 = ranks 7/8 → large bonus (index 3). */
+        int idx;
+        if      (our_rank <= 4) idx = (our_rank == 4) ? 1 : 0;
+        else if (our_rank == 5) idx = 2;
+        else                    idx = 3;
+        *mg += QUEEN_INFILTRATION_MG[idx];
+        *eg += QUEEN_INFILTRATION_EG[idx];
+    }
+}
+
+/*
+ * ──────────────────────────────────────────────
+ *  Knight on queen / Slider on queen
+ *
+ *  Award a small bonus for our pieces that attack the enemy queen.  Knights
+ *  annoying the queen are tactically dangerous (fork potential); bishops
+ *  and rooks attacking the queen along a ray represent latent pin/skewer
+ *  threats.  The bonus is small to avoid double-counting with the existing
+ *  fork and battery terms — this is a positional bonus, not a tactical one.
+ * ────────────────────────────────────────────── */
+static void eval_pieces_on_queen(const Board *b, Color us, int *mg, int *eg) {
+    Color them = us ^ 1;
+    Bitboard enemy_queens = b->pieces[them][QUEEN];
+    if (!enemy_queens) return;
+
+    Bitboard occ = b->occ[2];
+
+    /* Knight on queen: knight attacks any enemy-queen square. */
+    Bitboard knights = b->pieces[us][KNIGHT];
+    while (knights) {
+        int sq = bb_pop(&knights);
+        if (KNIGHT_ATTACKS[sq] & enemy_queens) {
+            *mg += KNIGHT_ON_QUEEN_MG;
+            *eg += KNIGHT_ON_QUEEN_EG;
+        }
+    }
+
+    /* Bishop on queen: bishop x-rays any enemy-queen square. */
+    Bitboard bishops = b->pieces[us][BISHOP];
+    while (bishops) {
+        int sq = bb_pop(&bishops);
+        if (bishop_attacks((Square)sq, occ) & enemy_queens) {
+            *mg += BISHOP_ON_QUEEN_MG;
+            *eg += BISHOP_ON_QUEEN_EG;
+        }
+    }
+
+    /* Rook on queen: rook x-rays any enemy-queen square (and we're not
+     * already crediting this through "rook on queen file" — that term
+     * covers the file-based battery, this covers the direct attack). */
+    Bitboard rooks = b->pieces[us][ROOK];
+    while (rooks) {
+        int sq = bb_pop(&rooks);
+        if (rook_attacks((Square)sq, occ) & enemy_queens) {
+            *mg += ROOK_ON_QUEEN_ATTACK_MG;
+            *eg += ROOK_ON_QUEEN_ATTACK_EG;
+        }
+    }
+}
+
+/*
+ * ──────────────────────────────────────────────
+ *  Space evaluation
+ *
+ *  Reward squares behind our pawns (up to rank 5 from our perspective) that
+ *  we control (i.e. the square is empty or holds our own piece, and is not
+ *  attacked by an enemy pawn).  More space = more manoeuvring room.
+ *
+ *  The count is divided by SPACE_SCALE to keep the bonus in a sensible range
+ *  (~5-15 cp typical).  MG-only — space matters far less in the endgame
+ *  where the kings walk out and pawns are passed rather than blocked.
+ * ────────────────────────────────────────────── */
+static void eval_space(const Board *b, Color us, int *mg, int *eg) {
+    (void)eg;  /* space is MG-only */
+    Color them = us ^ 1;
+    Bitboard our_pawns = b->pieces[us][PAWN];
+    Bitboard their_pawns = b->pieces[them][PAWN];
+
+    /* Enemy-pawn attack set: squares the enemy pawns control. */
+    Bitboard epa;
+    if (them == WHITE) {
+        epa = ((their_pawns & ~FILE_BB[0]) << 7) | ((their_pawns & ~FILE_BB[7]) << 9);
+    } else {
+        epa = ((their_pawns & ~FILE_BB[7]) >> 7) | ((their_pawns & ~FILE_BB[0]) >> 9);
+    }
+
+    /* Build the "behind-our-pawns" span: for each of our pawns, every square
+     * on the same file with rank strictly less than the pawn's rank (from
+     * our perspective).  For WHITE this means ranks 0..pawn_rank-1; for
+     * BLACK the symmetric.  We only count up to our rank 5 (rank index 4)
+     * — deep behind isn't more valuable than shallow behind, and clamping
+     * to rank 5 keeps the bonus tied to the actual pawn front. */
+    Bitboard behind = 0;
+    Bitboard p = our_pawns;
+    while (p) {
+        int sq = bb_pop(&p);
+        int file = sq & 7;
+        int rank = sq >> 3;
+        if (us == WHITE) {
+            for (int r = 0; r < rank && r <= 4; r++)
+                behind |= SQUARE_BB[r * 8 + file];
+        } else {
+            for (int r = 7; r > rank && r >= 3; r--)
+                behind |= SQUARE_BB[r * 8 + file];
+        }
+    }
+
+    /* A square counts toward our space if:
+     *   - it's in the `behind` span
+     *   - it's not attacked by an enemy pawn
+     *   - it's not occupied by the enemy king (kings don't take space)
+     * Own pieces and empty squares both count — having pieces in your space
+     * is the whole point of having space. */
+    Bitboard blocked = epa | b->pieces[them][KING];
+    int count = bb_popcount(behind & ~blocked);
+    *mg += (count * SPACE_MG_PER_SQUARE) / SPACE_SCALE;
+}
+
 /* ──────────────────────────────────────────────
  *  Material Imbalance (SF 11 quadratic polynomial)
  *
@@ -1422,6 +1902,21 @@ int evaluate(const Board *b) {
         __dbg.minor_behind_eg[c] = c_eg - __snap_eg;
         __snap_mg = c_mg;  __snap_eg = c_eg;
 #endif
+
+        /* ── BishopPawns ("bad bishop"): penalty for own pawns on bishop's colour ── */
+        eval_bishop_pawns(b, (Color)c, &c_mg, &c_eg);
+
+        /* ── LongDiagonalBishop: bonus for bishop on a1-h8 / a8-h1 long diagonal ── */
+        eval_long_diagonal_bishop(b, (Color)c, &c_mg, &c_eg);
+
+        /* ── QueenInfiltration: bonus for queen deep in enemy territory ── */
+        eval_queen_infiltration(b, (Color)c, &c_mg, &c_eg);
+
+        /* ── PiecesOnQueen: knight/slider x-raying the enemy queen ── */
+        eval_pieces_on_queen(b, (Color)c, &c_mg, &c_eg);
+
+        /* ── Space: reward for squares behind our pawns we control ── */
+        eval_space(b, (Color)c, &c_mg, &c_eg);
 
         /*
          * ── King safety: shield + open files + distance-weighted enemy

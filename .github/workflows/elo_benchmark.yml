@@ -1,0 +1,228 @@
+# ──────────────────────────────────────────────────────────────────────
+#  Elo Benchmark — branch vs default-branch, per push
+# ──────────────────────────────────────────────────────────────────────
+#
+#  WHAT THIS DOES
+#    On every push to a feature branch, builds the branch HEAD and the
+#    default-branch (main) HEAD, runs a cutechess-cli match between
+#    them, and appends the Elo result to elo_history/<branch>.jsonl.
+#    The history file is committed back to the branch so you get a
+#    persistent, per-branch timeline of Elo-over-commits.
+#
+#  WHEN IT RUNS
+#    • On push to ANY branch EXCEPT the repo's default branch
+#      (typically "main" — detected dynamically so it works regardless
+#      of what the default is called).
+#    • Only if at least one PERFORMANCE-AFFECTING file changed in the
+#      most recent commit.  See PERF_AFFECTING_REGEX below.  Pushes
+#      that only touch README, docs, CI files, or scripts are skipped
+#      automatically — both at the trigger level (paths-ignore) and
+#      again inside the job (git diff check) for safety.
+#
+#  WHAT IT PRODUCES
+#    elo_history/<branch-name>.jsonl  —  one JSON record per push,
+#    appended.  Schema documented in scripts/elo_match.py.
+#
+#  HOW TO READ THE HISTORY
+#    jq -s 'sort_by(.timestamp)' elo_history/my-branch.jsonl \
+#    | jq '.[] | {sha: .commit_sha[0:8], elo: .elo_diff,
+#                 ci: [.elo_ci_lo, .elo_ci_hi], los: .los,
+#                 msg: .commit_message_first_line}'
+#
+#  TUNABLE KNOBS
+#    • PERF_AFFECTING_REGEX  — what counts as "performance-affecting"
+#    • --time-control        — cutechess tc (default 10+0.1)
+#    • --rounds              — games / 2 (default 200 → 400 games)
+#    Edit the relevant lines below.  Defaults give ~±15 Elo CI at
+#    200 rounds; bump to 500+ for ~±10 Elo.
+#
+#  LIMITATIONS
+#    • One entry per PUSH, not per commit.  If you push 5 commits at
+#      once you get one entry for the HEAD commit.  Push one commit
+#      at a time if you need per-commit granularity.
+#    • The baseline is always the LATEST default branch, not the
+#      merge-base.  This is intentional — you want to know "is my
+#      branch better than main RIGHT NOW".
+#    • 200 rounds at 10+0.1 takes ~40-60 min on a 2-core runner.
+#      Adjust if you need faster feedback or tighter CI.
+# ──────────────────────────────────────────────────────────────────────
+
+name: Elo Benchmark
+
+on:
+  push:
+    # Trigger-level pre-filter: don't even start the workflow if the
+    # push ONLY touched files in this list.  Saves CI minutes.  The
+    # finer per-commit check still runs inside the job as a second
+    # line of defence.
+    paths-ignore:
+      - 'README.md'
+      - 'LICENSE.md'
+      - 'CONTRIBUTING.md'
+      - '.gitignore'
+      - 'docs/**'
+      - '.github/**'
+      - 'tests/**'
+      - 'autom4te.cache/**'
+
+permissions:
+  # Needed to push the elo_history/<branch>.jsonl commit back to the branch.
+  contents: write
+
+# ── What counts as "performance-affecting"? ──────────────────────────
+# Edit this regex (grep -E syntax) to add or remove paths.  Default:
+# any source file under src/ or include/, plus the top-level build
+# files.  Changes to README, docs, CI, scripts, or tests do NOT
+# trigger the benchmark.
+env:
+  PERF_AFFECTING_REGEX: '^(src/|include/|Makefile\.am$|configure\.ac$)'
+
+jobs:
+  elo:
+    # Skip on the default branch — we only benchmark feature branches.
+    # Uses github.event.repository.default_branch so it works whether
+    # the repo calls it "main", "master", or anything else.
+    if: github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      # ── 1. Checkout the branch (with parent commit for diffing) ──
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # HEAD + HEAD^, enough for the per-commit diff
+
+      # ── 2. Decide whether this push actually needs benchmarking ──
+      - name: Detect performance-affecting changes
+        id: changes
+        run: |
+          set -e
+          # Diff the most recent commit against its parent.
+          # If this is the initial commit (no parent), diff against the
+          # empty tree so every file counts as "added".
+          if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            BASE=HEAD^
+          else
+            BASE=$(git hash-object -t tree /dev/null)
+          fi
+          CHANGED=$(git diff --name-only "$BASE" HEAD)
+          echo "Files changed in this commit:"
+          echo "$CHANGED"
+          echo ""
+          # Filter to performance-affecting paths only.
+          PERF_AFFECTING=$(echo "$CHANGED" \
+            | grep -E "$PERF_AFFECTING_REGEX" || true)
+          if [ -z "$PERF_AFFECTING" ]; then
+            echo "No performance-affecting files changed — skipping benchmark."
+            echo "skip=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "Performance-affecting files changed:"
+            echo "$PERF_AFFECTING"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 3. Install build deps + cutechess-cli (only if needed) ──
+      - name: Install build deps + cutechess-cli
+        if: steps.changes.outputs.skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf automake autoconf-archive gcc make \
+            cutechess-cli
+
+      # ── 4. Build the branch engine ──
+      - name: Build branch engine
+        if: steps.changes.outputs.skip != 'true'
+        run: |
+          autoreconf --install
+          ./configure
+          make -j$(nproc)
+          cp src/engine /tmp/engine-branch
+
+      # ── 5. Checkout & build the default-branch baseline ──
+      - name: Checkout default branch for baseline
+        if: steps.changes.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: main-checkout
+          fetch-depth: 1
+
+      - name: Build baseline engine
+        if: steps.changes.outputs.skip != 'true'
+        run: |
+          cd main-checkout
+          autoreconf --install
+          ./configure
+          make -j$(nproc)
+          cp src/engine /tmp/engine-main
+
+      # ── 6. Grab the commit subject for the history record ──
+      - name: Get commit subject
+        if: steps.changes.outputs.skip != 'true'
+        id: msg
+        run: |
+          SUBJECT=$(git log -1 --pretty=%s ${{ github.sha }})
+          {
+            echo "subject<<EOF"
+            echo "$SUBJECT"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # ── 7. Run the match ──
+      #    Edit --rounds and --time-control here to tune cost vs CI.
+      - name: Run Elo match
+        if: steps.changes.outputs.skip != 'true'
+        run: |
+          python3 scripts/elo_match.py \
+            --engine-a /tmp/engine-branch \
+            --engine-b /tmp/engine-main \
+            --name-a   "branch" \
+            --name-b   "main" \
+            --time-control "10+0.1" \
+            --rounds   200 \
+            --history  "elo_history/${{ github.ref_name }}.jsonl" \
+            --branch   "${{ github.ref_name }}" \
+            --commit-sha    "${{ github.sha }}" \
+            --commit-message "${{ steps.msg.outputs.subject }}"
+
+      # ── 8. Commit the updated history back to the branch ──
+      #    [skip ci] prevents the bot's commit from re-triggering this
+      #    workflow.  (The path filter would skip it anyway, but this
+      #    is a belt-and-braces safeguard.)
+      - name: Commit history back to branch
+        if: steps.changes.outputs.skip != 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "elo_history/${{ github.ref_name }}.jsonl"
+          git commit -m "chore(bench): update Elo history for ${{ github.sha }} [skip ci]" \
+            || echo "Nothing to commit"
+          git push
+
+      # ── 9. Render a summary in the Actions UI ──
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Elo Benchmark"
+            echo ""
+            if [ "${{ steps.changes.outputs.skip }}" = "true" ]; then
+              echo "**Skipped** — no performance-affecting files changed in this commit."
+            else
+              echo "**Branch:** \`${{ github.ref_name }}\`"
+              echo "**Commit:** \`${{ github.sha }}\`"
+              echo ""
+              echo "Results appended to \`elo_history/${{ github.ref_name }}.jsonl\`."
+              echo ""
+              echo "### View the timeline"
+              echo '```bash'
+              echo "jq -s 'sort_by(.timestamp)' \\"
+              echo "  elo_history/${{ github.ref_name }}.jsonl \\"
+              echo "  | jq '.[] | {sha: .commit_sha[0:8], elo: .elo_diff,"
+              echo "              ci: [.elo_ci_lo, .elo_ci_hi], los: .los,"
+              echo "              msg: .commit_message_first_line}'"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

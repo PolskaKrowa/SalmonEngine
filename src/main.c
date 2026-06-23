@@ -11,6 +11,7 @@
 
 #include "bitboard.h"
 #include "board.h"
+#include "eval.h"
 #include "search.h"
 #include "uci.h"
 #include <stdio.h>
@@ -23,6 +24,7 @@ int main(void) {
     /* One-time initialisation */
     bitboard_init();
     board_init();
+    eval_weights_init();  /* load compiled-default eval weights into EW */
     search_init();
 
     /* Enter UCI command loop */

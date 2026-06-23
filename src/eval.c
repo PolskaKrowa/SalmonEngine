@@ -49,8 +49,63 @@
 #  include "eval_debug.h"
 #endif
 
-static const int MATERIAL_MG[6] = { 82, 344, 358, 480, 1022, 0 };
-static const int MATERIAL_EG[6] = { 94, 338, 329, 546, 924, 0 };
+/* ──────────────────────────────────────────────
+ *  Runtime-tunable eval weights (EvalWeights struct).
+ *
+ *  The compiled defaults below are loaded into the global `EW` struct
+ *  by eval_weights_init().  The tuner can modify EW at runtime to
+ *  test different values without recompilation.
+ * ────────────────────────────────────────────── */
+EvalWeights EW;
+
+void eval_weights_init(void) {
+    /* Material */
+    EW.material_mg[PAWN]   = 82;   EW.material_eg[PAWN]   = 94;
+    EW.material_mg[KNIGHT] = 344;  EW.material_eg[KNIGHT] = 338;
+    EW.material_mg[BISHOP] = 358;  EW.material_eg[BISHOP] = 329;
+    EW.material_mg[ROOK]   = 480;  EW.material_eg[ROOK]   = 546;
+    EW.material_mg[QUEEN]  = 1022; EW.material_eg[QUEEN]  = 924;
+    EW.material_mg[KING]   = 0;    EW.material_eg[KING]   = 0;
+
+    /* Pawn structure */
+    EW.doubled_pawn_mg  = -11;  EW.doubled_pawn_eg  = -56;
+    EW.isolated_pawn_mg = -15;  EW.isolated_pawn_eg = -15;
+    EW.backward_pawn_mg = -9;   EW.backward_pawn_eg = -22;
+    EW.passed_pawn_mg[0] = 0;  EW.passed_pawn_eg[0] = 0;
+    EW.passed_pawn_mg[1] = 5;  EW.passed_pawn_eg[1] = 10;
+    EW.passed_pawn_mg[2] = 10; EW.passed_pawn_eg[2] = 20;
+    EW.passed_pawn_mg[3] = 20; EW.passed_pawn_eg[3] = 40;
+    EW.passed_pawn_mg[4] = 35; EW.passed_pawn_eg[4] = 65;
+    EW.passed_pawn_mg[5] = 60; EW.passed_pawn_eg[5] = 95;
+    EW.passed_pawn_mg[6] = 90; EW.passed_pawn_eg[6] = 140;
+    EW.passed_pawn_mg[7] = 0;  EW.passed_pawn_eg[7] = 0;
+    EW.pawn_chain_mg  = 11;   EW.pawn_chain_eg  = 4;
+    EW.pawn_island_mg = -3;   EW.pawn_island_eg = -8;
+
+    /* King safety */
+    EW.king_attacker_weight[PAWN]   = 0;
+    EW.king_attacker_weight[KNIGHT] = 20;
+    EW.king_attacker_weight[BISHOP] = 20;
+    EW.king_attacker_weight[ROOK]   = 40;
+    EW.king_attacker_weight[QUEEN]  = 80;
+    EW.king_attacker_weight[KING]   = 0;
+    EW.king_open_file_penalty  = -25;
+    EW.king_shield_bonus       = 7;
+    EW.king_shield_bonus_eg    = 2;
+
+    /* Tempo */
+    EW.tempo_mg = 16;
+    EW.tempo_eg = 10;
+
+    /* Lazy eval */
+    EW.lazy_threshold = 1000;
+}
+
+EvalWeights *eval_weights_get(void) { return &EW; }
+
+/* Keep the static const arrays for PST tables (too large for the struct
+ * and rarely tuned).  Material values are duplicated in EW for the
+ * tuner, but the eval code reads from EW for consistency. */
 
 static const int PST_PAWN_MG[64] = {
         0,     0,     0,     0,     0,     0,     0,     0,
@@ -493,6 +548,7 @@ static void eval_pawns_uncached(const Board *b, Color us, int *mg, int *eg) {
     Bitboard our_pawns   = b->pieces[us][PAWN];
     Bitboard their_pawns = b->pieces[them][PAWN];
     Bitboard pawns_copy  = our_pawns;
+    Bitboard passed_bb   = 0;  /* track passed pawns for connected-passer bonus */
 
     while (pawns_copy) {
         int sq   = bb_pop(&pawns_copy);
@@ -532,6 +588,7 @@ static void eval_pawns_uncached(const Board *b, Color us, int *mg, int *eg) {
             int bonus_rank = (us == WHITE) ? rank : (7 - rank);
             *mg += PASSED_PAWN_BONUS_MG[bonus_rank];
             *eg += PASSED_PAWN_BONUS_EG[bonus_rank];
+            passed_bb |= SQUARE_BB[sq];  /* track for connected-passer check */
 
             /*
              * ── King-distance term (EG only — MG tactics handled by search) ──
@@ -769,6 +826,51 @@ static void eval_pawns_uncached(const Board *b, Color us, int *mg, int *eg) {
             int extra = islands - 1;
             *mg += PAWN_ISLAND_PENALTY_MG * extra;
             *eg += PAWN_ISLAND_PENALTY_EG * extra;
+        }
+    }
+
+    /*
+     * NEW: ── Connected passed pawns ──
+     *
+     * Two passed pawns on adjacent files, especially on the same or
+     * nearby ranks, are far more dangerous than the sum of their
+     * individual values.  They defend each other's advance and create
+     * an unstoppable "phalanx" that the opponent cannot blockade with
+     * a single piece.  We award a bonus per connected pair (counted
+     * once per pawn, matching the phalanx convention).
+     *
+     * Values scale with rank — connected passers on the 6th/7th rank
+     * are nearly always winning.
+     */
+    if (passed_bb) {
+        Bitboard pp = passed_bb;
+        while (pp) {
+            int sq = bb_pop(&pp);
+            int file = sq & 7;
+            int rank = sq >> 3;
+            int bonus_rank = (us == WHITE) ? rank : (7 - rank);
+
+            /* Check adjacent files for another passed pawn */
+            Bitboard adj_files_bb = 0;
+            if (file > 0) adj_files_bb |= FILE_BB[file - 1];
+            if (file < 7) adj_files_bb |= FILE_BB[file + 1];
+
+            /* Same rank or one rank apart (mutual support range) */
+            Bitboard support_zone = adj_files_bb
+                                  & (RANK_BB[rank]
+                                     | (rank > 0 ? RANK_BB[rank - 1] : 0)
+                                     | (rank < 7 ? RANK_BB[rank + 1] : 0));
+
+            if (passed_bb & support_zone) {
+                /* Bonus scales with rank: +10 MG / +20 EG at rank 2,
+                 * up to +30 MG / +60 EG at rank 6. */
+                int conn_mg = 5 + 5 * bonus_rank;
+                int conn_eg = 10 + 10 * bonus_rank;
+                if (conn_mg > 30) conn_mg = 30;
+                if (conn_eg > 60) conn_eg = 60;
+                *mg += conn_mg;
+                *eg += conn_eg;
+            }
         }
     }
 }
@@ -1158,6 +1260,17 @@ static void eval_king_safety(const Board *b, Color us, int *mg, int *eg) {
                 int scale = (dist <= 1) ? 4 : (dist <= 3) ? 2 : 1;
                 attack_count++;
                 attack_weight += KING_ATTACKER_WEIGHT[pt] * scale;
+
+                /* NEW: Per-square attack table — count how many king-zone
+                 * squares this piece attacks.  More zone coverage = more
+                 * dangerous (the king has fewer escape squares).  This is
+                 * the SF-style "kingAttacksCount" approach. */
+                int zone_squares = bb_popcount(atk & king_zone);
+                /* Each zone square attacked adds a small bonus, scaled
+                 * by piece type (queen touching 5 zone squares is far
+                 * worse than a knight touching 2). */
+                int zone_bonus = zone_squares * KING_ATTACKER_WEIGHT[pt] / 20;
+                attack_weight += zone_bonus;
             }
         }
     }
@@ -1190,6 +1303,64 @@ static void eval_king_safety(const Board *b, Color us, int *mg, int *eg) {
     if (attack_count >= 2) {
         int danger = attack_weight * attack_weight / 200;
         *mg -= danger;
+    }
+
+    /*
+     * NEW: ── Safe check bonus ──
+     *
+     * A "safe check" is a check from a square where the checking piece
+     * is NOT attacked by any enemy pawn (and ideally not by a cheaper
+     * enemy piece either).  Safe checks are powerful because they force
+     * the king to move or block, creating tempo for the attacker to
+     * build a mating net.
+     *
+     * We detect safe checks by finding squares from which our pieces
+     * attack the enemy king, and checking whether those squares are
+     * defended (by us) or at least not attacked by enemy pawns/pieces.
+     *
+     * Bonus per safe check: knight +20, bishop +20, rook +40, queen +20.
+     * (Rook checks on open files near the king are especially strong.)
+     */
+    {
+        Bitboard occ_local = b->occ[2];
+        Bitboard enemy_king_bb = b->pieces[them][KING];
+        int ek_sq = bb_lsb(enemy_king_bb);
+
+        /* For each piece type, find checking squares and test safety.
+         * A check square is "safe" if no enemy pawn attacks it AND
+         * (it's defended by a friendly piece OR no enemy piece attacks
+         * it with a cheaper piece).  We use a simplified version: safe
+         * if not attacked by enemy pawns. */
+
+        /* Knight checks: squares a knight can reach the king from */
+        Bitboard n_checks = KNIGHT_ATTACKS[ek_sq] & b->pieces[us][KNIGHT];
+        /* Bishop checks: our bishops that x-ray the king diagonally */
+        Bitboard b_checks = bishop_attacks((Square)ek_sq, occ_local) & b->pieces[us][BISHOP];
+        /* Rook checks: our rooks that x-ray the king on rank/file */
+        Bitboard r_checks = rook_attacks((Square)ek_sq, occ_local) & b->pieces[us][ROOK];
+        /* Queen checks: our queens that x-ray the king */
+        Bitboard q_checks = (bishop_attacks((Square)ek_sq, occ_local)
+                            | rook_attacks((Square)ek_sq, occ_local))
+                           & b->pieces[us][QUEEN];
+
+        /* Enemy pawn attacks */
+        Bitboard enemy_pawn_attacks = 0;
+        Bitboard ep = b->pieces[them][PAWN];
+        while (ep) {
+            int s = bb_pop(&ep);
+            enemy_pawn_attacks |= PAWN_ATTACKS[them][s];
+        }
+
+        /* Count safe checks (piece not attacked by enemy pawn) */
+        int safe_checks = 0;
+        if (n_checks & ~enemy_pawn_attacks) { *mg += 20; safe_checks++; }
+        if (b_checks & ~enemy_pawn_attacks) { *mg += 20; safe_checks++; }
+        if (r_checks & ~enemy_pawn_attacks) { *mg += 40; safe_checks++; }
+        if (q_checks & ~enemy_pawn_attacks) { *mg += 20; safe_checks++; }
+
+        /* Multiple safe checks are exponentially dangerous */
+        if (safe_checks >= 2) *mg += 30;
+        if (safe_checks >= 3) *mg += 30;
     }
 
     /*
@@ -1301,13 +1472,13 @@ static void eval_threats(const Board *b, Color us, int *mg, int *eg) {
                 int min_atk_mg = 30000, min_atk_eg = 30000;
                 for (int apt = PAWN; apt <= QUEEN; apt++) {
                     if (b->pieces[them][apt] & enemy_atk) {
-                        min_atk_mg = MATERIAL_MG[apt];
-                        min_atk_eg = MATERIAL_EG[apt];
+                        min_atk_mg = EW.material_mg[apt];
+                        min_atk_eg = EW.material_eg[apt];
                         break;
                     }
                 }
-                int piece_mg = MATERIAL_MG[pt];
-                int piece_eg = MATERIAL_EG[pt];
+                int piece_mg = EW.material_mg[pt];
+                int piece_eg = EW.material_eg[pt];
                 if (min_atk_mg < piece_mg) {
                     /* Partial penalty: proportional to value difference. */
                     *mg -= (piece_mg - min_atk_mg) / 6;
@@ -1830,8 +2001,8 @@ static int lazy_score(const Board *b, int phase, int *mg_out, int *eg_out) {
             while (bb) {
                 int sq  = bb_pop(&bb);
                 int psq = pst_sq((Color)c, (Square)sq);
-                mg += sign * (MATERIAL_MG[pt] + PST_MG[pt][psq]);
-                eg += sign * (MATERIAL_EG[pt] + PST_EG[pt][psq]);
+                mg += sign * (EW.material_mg[pt] + PST_MG[pt][psq]);
+                eg += sign * (EW.material_eg[pt] + PST_EG[pt][psq]);
             }
         }
     }
@@ -1858,7 +2029,7 @@ int evaluate(const Board *b) {
      */
     int lazy_mg, lazy_eg;
     int proxy = lazy_score(b, phase, &lazy_mg, &lazy_eg);
-    if (abs(proxy) > LAZY_THRESHOLD) {
+    if (abs(proxy) > EW.lazy_threshold) {
         /* Still apply the side-to-move flip for consistency */
         int lazy_ret = (b->side == WHITE) ? proxy : -proxy;
 
@@ -1917,8 +2088,8 @@ int evaluate(const Board *b) {
                 while (bb) {
                     int sq  = bb_pop(&bb);
                     int psq = pst_sq((Color)c, (Square)sq);
-                    dbg_mg_per_side[c] += MATERIAL_MG[pt] + PST_MG[pt][psq];
-                    dbg_eg_per_side[c] += MATERIAL_EG[pt] + PST_EG[pt][psq];
+                    dbg_mg_per_side[c] += EW.material_mg[pt] + PST_MG[pt][psq];
+                    dbg_eg_per_side[c] += EW.material_eg[pt] + PST_EG[pt][psq];
                 }
             }
         }
@@ -2037,8 +2208,17 @@ int evaluate(const Board *b) {
         __snap_mg = c_mg;  __snap_eg = c_eg;
 #endif
 
-        /* ── Tactical threats: hanging pieces, fork potential, skewers ── */
-        eval_threats(b, (Color)c, &c_mg, &c_eg);
+        /* ── Tactical threats: hanging pieces, fork potential, skewers ──
+         *
+         * Gate: skip eval_threats when there are no minor/major pieces
+         * on the board (pawn-only endgames have no "hanging pieces" in
+         * the traditional sense — pawn captures are handled by the
+         * search).  This saves the expensive sq_attackers() calls in
+         * KP endgames where the function would return 0 anyway. */
+        if (b->occ[2] & ~(b->pieces[WHITE][PAWN] | b->pieces[BLACK][PAWN]
+                         | b->pieces[WHITE][KING] | b->pieces[BLACK][KING])) {
+            eval_threats(b, (Color)c, &c_mg, &c_eg);
+        }
 #ifdef EVAL_DEBUG
         __dbg.threats_mg[c] = c_mg - __snap_mg;
         __dbg.threats_eg[c] = c_eg - __snap_eg;
@@ -2052,7 +2232,7 @@ int evaluate(const Board *b) {
     int score = taper(mg, eg, phase);
 
     /* Tempo bonus */
-    score += taper(TEMPO_BONUS_MG, TEMPO_BONUS_EG, phase);
+    score += taper(EW.tempo_mg, EW.tempo_eg, phase);
 
     /*
      * ── Opposite-colored-bishops drawishness ──────────────────────
@@ -2105,6 +2285,82 @@ int evaluate(const Board *b) {
     }
 
     /*
+     * NEW: ── Wrong rook pawn + wrong-color bishop drawishness ─────────
+     *
+     * KRP vs KB is a classic draw when:
+     *   - The defender has only a bishop (no pawns, no other pieces)
+     *   - The attacker's only pawn is a rook pawn (a- or h-file)
+     *   - The defender's bishop is on the "wrong" color complex (i.e.,
+     *     NOT the color of the promotion square)
+     *   - The defender's king can reach the corner (the promotion
+     *     square's color complex is the bishop's, so the king can
+     *     blockade on the bishop's color and never be driven away)
+     *
+     * The promotion square of a rook pawn is always the same color
+     * as the pawn's starting square's corner: a8 (sq 56) is light,
+     * h8 (sq 63) is dark.  If the defender's bishop is on the opposite
+     * color from the promotion square, the pawn cannot be supported
+     * by the bishop to promote, and the king can always blockade.
+     *
+     * We detect this and reduce the winning side's score by 75%.
+     */
+    {
+        /* Only applies when each side has exactly one bishop and the
+         * only other pieces are kings and pawns. */
+        int wb = bb_popcount(b->pieces[WHITE][BISHOP]);
+        int bb_n = bb_popcount(b->pieces[BLACK][BISHOP]);
+
+        /* Check both directions: White attacking with rook pawn + bishop,
+         * Black defending with bishop; and vice versa. */
+        for (int attacker = WHITE; attacker <= BLACK; attacker++) {
+            int defender = attacker ^ 1;
+            int atk_bishops = (attacker == WHITE) ? wb : bb_n;
+            int def_bishops = (defender == WHITE) ? wb : bb_n;
+
+            if (atk_bishops != 1 || def_bishops != 1) continue;
+
+            /* No non-pawn non-king non-bishop pieces allowed */
+            Bitboard other_pieces = b->occ[2]
+                & ~b->pieces[WHITE][PAWN]   & ~b->pieces[BLACK][PAWN]
+                & ~b->pieces[WHITE][KING]   & ~b->pieces[BLACK][KING]
+                & ~b->pieces[WHITE][BISHOP] & ~b->pieces[BLACK][BISHOP];
+            if (other_pieces != 0) continue;
+
+            /* Attacker must have exactly one pawn, and it must be a
+             * rook pawn (a- or h-file). */
+            Bitboard atk_pawns = b->pieces[attacker][PAWN];
+            if (bb_popcount(atk_pawns) != 1) continue;
+            int pawn_sq = bb_lsb(atk_pawns);
+            int pawn_file = pawn_sq & 7;
+            if (pawn_file != 0 && pawn_file != 7) continue;
+
+            /* Promotion square color: a8 (sq 56) is light (sq & 1 == 0),
+             * h8 (sq 63) is dark (sq & 1 == 1).
+             * For white attacker: promo = a8 or h8.
+             * For black attacker: promo = a1 or h1. */
+            int promo_sq = (attacker == WHITE)
+                         ? (pawn_file == 0 ? 56 : 63)   /* a8 or h8 */
+                         : (pawn_file == 0 ? 0  : 7);    /* a1 or h1 */
+            int promo_color = promo_sq & 1;  /* 0 = light, 1 = dark */
+
+            /* Defender's bishop color */
+            int def_bishop_sq = bb_lsb(b->pieces[defender][BISHOP]);
+            int def_bishop_color = def_bishop_sq & 1;
+
+            /* "Wrong color" = bishop is on opposite color from promo sq */
+            if (def_bishop_color != promo_color) {
+                /* This is the drawish case — reduce the attacker's
+                 * advantage by 75%.  Only apply if the attacker is
+                 * winning (score > 0 for white attacker, < 0 for black). */
+                int sgn = (attacker == WHITE) ? 1 : -1;
+                if (sgn * score > 0) {
+                    score -= sgn * (abs(score) * 3 / 4);
+                }
+            }
+        }
+    }
+
+    /*
      * ── Initiative / complexity correction (SF 11) ────────────────────
      * Reduces a winning advantage when the winning side cannot realistically
      * convert it: no passed pawns, no outflanking, pawns on only one flank.
@@ -2124,7 +2380,7 @@ int evaluate(const Board *b) {
      * taper() and initiative() are pure functions — calling them again
      * for debug capture is safe and identical to the calls above.
      */
-    __dbg.tempo       = taper(TEMPO_BONUS_MG, TEMPO_BONUS_EG, phase);
+    __dbg.tempo       = taper(EW.tempo_mg, EW.tempo_eg, phase);
     __dbg.initiative  = initiative(b, mg, eg);
     __dbg.final_score = final_score;
     eval_debug_record(b, &__dbg);

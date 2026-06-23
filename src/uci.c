@@ -91,6 +91,7 @@ static void handle_uci(void) {
            DEFAULT_HASH_MB);
     printf("option name OwnBook type check default true\n");
     printf("option name Ponder type check default false\n");
+    printf("option name Threads type spin default 1 min 1 max 64\n");
     printf("uciok\n");
     fflush(stdout);
 }
@@ -220,7 +221,7 @@ static void handle_go(Board *b, const char *line) {
 }
 
 static void handle_setoption(const char *line) {
-    /* Supported: "Hash" (spin) and "OwnBook" (check) */
+    /* Supported: "Hash" (spin), "OwnBook" (check), "Threads" (spin) */
     const char *name = strstr(line, "name");
     const char *val  = strstr(line, "value");
     if (!name || !val) return;
@@ -233,10 +234,14 @@ static void handle_setoption(const char *line) {
         tt_init((size_t)mb);
     } else if (strncasecmp(name, "ownbook", 7) == 0
             || strncasecmp(name, "book", 4) == 0) {
-        /* Accept "true"/"false" or "1"/"0". */
         bool enabled = (strncasecmp(val, "true", 4) == 0
                      || strncasecmp(val, "1",    1) == 0);
         book_set_enabled(enabled);
+    } else if (strncasecmp(name, "threads", 7) == 0) {
+        int n = atoi(val);
+        if (n < 1) n = 1;
+        if (n > 64) n = 64;
+        g_num_threads = n;
     }
 }
 

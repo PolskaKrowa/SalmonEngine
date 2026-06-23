@@ -29,6 +29,12 @@ typedef struct {
     bool stop;
 } SearchLimits;
 
+/* ── Lazy SMP thread count ──
+ *
+ * Number of search threads.  Set via the UCI "Threads" option.
+ * Default is 1 (single-threaded, backward-compatible). */
+extern int g_num_threads;
+
 /*
  * Continuation-history tables.
  *
@@ -94,6 +100,7 @@ typedef struct {
     /* Per-ply stacks */
     int  eval_stack[MAX_PLY];
     Move move_stack[MAX_PLY];
+    int  piece_stack[MAX_PLY];  /* piece type of the mover at each ply */
 } SearchInfo;
 
 /* ── Public API ── */

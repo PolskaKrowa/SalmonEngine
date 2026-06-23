@@ -33,6 +33,8 @@
  *  • Time management: check every 2048 nodes; stop when budget exceeded
  */
 
+#define _POSIX_C_SOURCE 199309L
+
 #include "search.h"
 #include "movegen.h"
 #include "eval.h"
@@ -42,6 +44,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <limits.h>
+#include <time.h>
 
 #ifdef EVAL_DEBUG
 #  include "eval_debug.h"
@@ -84,7 +87,10 @@ static inline int lmr_reduction(bool improving, int depth, int move_count) {
 static inline int stat_bonus(int depth)
     __attribute__((const));
 static inline int stat_bonus(int depth) {
-    return depth > 15 ? -8 : 19 * depth * depth + 155 * depth - 132;
+    /* Was: depth > 15 ? -8 : ...  (NEGATIVE bonus for deep cutoffs — wrong sign!)
+     * SF 15+: small POSITIVE cap for deep cutoffs. Deep cutoffs are noisier
+     * but still worth rewarding.  1594 matches SF 15's stat_bonus cap. */
+    return depth > 13 ? 1594 : 19 * depth * depth + 155 * depth - 132;
 }
 
 /*
@@ -200,10 +206,6 @@ int see(const Board *b, Move m) {
         d++;
         gain[d] = SEE_VAL[attacker_type] - gain[d - 1];
 
-        /* removed dead stub `if (…) {};` that was here.
-         * The backward pass below already implements the correct
-         * "don't recapture if it loses material" logic. */
-
         Bitboard atk = attacks_to_sq(b, to, occ) & occ & b->occ[side];
         if (!atk) break;
 
@@ -214,6 +216,27 @@ int see(const Board *b, Move m) {
             if (piece_bb) break;
         }
         if (pt > KING) break;
+
+        /* King-safety check (SF see_ge pattern):
+         *
+         * If the king is the next recapturer AND the opponent still has
+         * an attacker on the target square after the king "captures",
+         * the king's recapture is illegal (the king would be moving
+         * into check, typically because an enemy slider was revealed
+         * by the previous capture's x-ray).  In that case we stop the
+         * swap loop — the king cannot actually recapture, so the
+         * previous capture stands. */
+        if (pt == KING) {
+            Bitboard occ_after_king = occ ^ (piece_bb & -piece_bb);
+            Bitboard remaining = attacks_to_sq(b, to, occ_after_king)
+                                 & occ_after_king & b->occ[side ^ 1];
+            if (remaining) {
+                /* King can't recapture safely — current side keeps
+                 * the gain from the previous capture.  Don't commit
+                 * the king's recapture (don't update occ/attacker). */
+                break;
+            }
+        }
 
         occ ^= (piece_bb & -piece_bb);
         attacker_type = pt;
@@ -359,12 +382,25 @@ static void decay_history(SearchInfo *si) {
 
 /* ──────────────────────────────────────────────
  *  Time management
+ *
+ *  Wall-clock time via CLOCK_MONOTONIC (not clock() which is CPU time).
+ *  Two thresholds:
+ *    • allotted_ms (soft): when we'd LIKE to stop.  Used between iterations.
+ *    • max_time_ms (hard): when we MUST stop.  Used inside negamax.
+ *  When only `depth` is requested, both are 0 → search runs to depth.
  * ────────────────────────────────────────────── */
+static long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 bool time_up(SearchInfo *si) {
-    if (si->limits->infinite || si->limits->stop) return si->limits->stop;
-    if (si->allotted_ms <= 0) return false;
-    clock_t elapsed = (clock() - si->start_time) * 1000 / CLOCKS_PER_SEC;
-    return (int)elapsed >= si->allotted_ms;
+    if (si->limits->infinite) return si->limits->stop;
+    if (si->limits->stop)     return true;
+    if (si->max_time_ms <= 0) return false;
+    long elapsed = now_ms() - si->start_time_ms;
+    return elapsed >= si->max_time_ms;
 }
 
 /* ──────────────────────────────────────────────
@@ -1111,8 +1147,10 @@ extern void move_to_str(Move m, char *out);
 void search(Board *b, SearchLimits *lim) {
     SearchInfo si;
     memset(&si, 0, sizeof(si));
-    si.limits     = lim;
-    si.start_time = clock();
+    si.limits        = lim;
+    si.start_time_ms = now_ms();
+    si.allotted_ms   = 0;
+    si.max_time_ms   = 0;
 
     /* Bump TT generation so this search's entries outcompete stale
      * entries from previous searches during replacement. */
@@ -1123,13 +1161,50 @@ void search(Board *b, SearchLimits *lim) {
     eval_debug_init();
 #endif
 
-    if (!lim->infinite && lim->movetime == 0) {
+    /* ── Time budget ──
+     *
+     * Three modes:
+     *   (1) movetime > 0   — explicit per-move budget.
+     *   (2) wtime/btime > 0 — game clock.
+     *   (3) depth > 0 OR infinite — no time limit (search runs to depth).
+     *
+     * The original code had a bug where mode (3) was unreachable: when
+     * only `depth` was set (wtime=0, movetime=0), the condition
+     * `!infinite && movetime == 0` was TRUE, so allotted_ms was set
+     * to max(0+0, 50) = 50ms — depth-only searches were silently
+     * capped at 50ms.  We now check depth-only BEFORE the game-clock
+     * fallback.
+     */
+    if (lim->infinite) {
+        si.allotted_ms = 0;
+        si.max_time_ms = 0;
+    } else if (lim->movetime > 0) {
+        si.allotted_ms = lim->movetime * 95 / 100;
+        si.max_time_ms = lim->movetime;
+        if (si.allotted_ms < 1) si.allotted_ms = 1;
+    } else if (lim->depth > 0) {
+        /* depth-only: no time limit. */
+        si.allotted_ms = 0;
+        si.max_time_ms = 0;
+    } else {
         int time_left = (b->side == WHITE) ? lim->wtime : lim->btime;
         int inc       = (b->side == WHITE) ? lim->winc  : lim->binc;
-        si.allotted_ms = (time_left / 20) + (inc / 2);
-        if (si.allotted_ms < 50) si.allotted_ms = 50;
-    } else if (lim->movetime > 0) {
-        si.allotted_ms = lim->movetime - 50;
+        if (time_left <= 0 && inc <= 0) {
+            /* No usable time control — fall back to a small default. */
+            si.allotted_ms = 1000;
+            si.max_time_ms = 2000;
+        } else {
+            /* opt: assume ~30 moves left; budget = time_left/30 + inc/2.
+             * max: protect against clock blow-out — never exceed time_left*0.8. */
+            int opt = time_left / 30 + inc / 2;
+            int max = time_left / 4 + inc;
+            if (max > time_left * 8 / 10) max = time_left * 8 / 10;
+            if (max < opt) max = opt;
+            if (opt < 10)  opt = 10;
+            if (max < 20)  max = 20;
+            si.allotted_ms = opt;
+            si.max_time_ms = max;
+        }
     }
 
     int  max_depth = (lim->depth > 0) ? lim->depth : 100;
@@ -1160,32 +1235,9 @@ void search(Board *b, SearchLimits *lim) {
 
         /*
          * Aspiration windows (SF 14+ tuning).
-         *
-         * Start with a small window around prev_score.  When the
-         * search fails low (score <= asp_alpha) we widen DOWNWARD;
-         * when it fails high (score >= asp_beta) we widen UPWARD.
-         * Each re-search uses a window that's been grown by `delta`,
-         * which itself grows exponentially so we never do more than
-         * ~3-4 re-searches before falling back to [-INF, INF].
-         *
-         * Changes from the original:
-         *   • Initial window is depth-dependent: wider at deeper
-         *     plies (where scores swing more) to reduce re-searches.
-         *   • Failed-low re-search keeps the UPPER bound at +delta
-         *     (don't widen upward when we already know the score is
-         *     low — that just gives the search more room to fail high
-         *     on a spurious tactical line).
-         *   • Failed-high re-search keeps the LOWER bound at -delta
-         *     symmetrically.
-         *   • When the score drops by more than ~50 cp relative to
-         *     the previous iteration, fall back to a full window
-         *     immediately — the position has changed materially and
-         *     the aspiration window is misleading.
+         * Starts at depth 4 (matches original engine behavior).
          */
         if (depth >= 4) {
-            /* Initial delta grows with depth: 18 at d=4, 25 at d=8,
-             * 35 at d=14, capping at 50.  Deeper searches have more
-             * score variance, so a wider window avoids re-searches. */
             int delta = 18 + depth;
             if (delta > 50) delta = 50;
             int asp_alpha = prev_score - delta;
@@ -1198,15 +1250,10 @@ void search(Board *b, SearchLimits *lim) {
                 if (lim->stop) goto done;
 
                 if (score <= asp_alpha) {
-                    /* Failed low.  Widen downward. */
                     failed_low_count++;
                     asp_alpha = (asp_alpha - delta < -INF) ? -INF : asp_alpha - delta;
-                    /* Grow delta, but more slowly after the first
-                     * failure (the second failure is rarer and a
-                     * smaller step avoids wasting time). */
                     delta = failed_low_count == 1 ? delta * 2 : delta * 3 / 2;
                 } else if (score >= asp_beta) {
-                    /* Failed high.  Widen upward. */
                     failed_high_count++;
                     asp_beta  = (asp_beta + delta >  INF) ?  INF : asp_beta + delta;
                     delta = failed_high_count == 1 ? delta * 2 : delta * 3 / 2;
@@ -1214,8 +1261,6 @@ void search(Board *b, SearchLimits *lim) {
                     break;
                 }
 
-                /* Fall back to full window if we've already failed twice
-                 * OR if delta has grown past the safety threshold. */
                 if (delta > 500 || failed_low_count + failed_high_count >= 3) {
                     score = negamax(b, depth, -INF, INF, 0, &si);
                     break;
@@ -1235,7 +1280,7 @@ void search(Board *b, SearchLimits *lim) {
 
         char mv_str[6];
         move_to_str(best_move, mv_str);
-        int elapsed_ms = (int)((clock() - si.start_time) * 1000 / CLOCKS_PER_SEC);
+        int elapsed_ms = (int)(now_ms() - si.start_time_ms);
         long long nps  = elapsed_ms > 0
                          ? (long long)(si.nodes * 1000ULL / (unsigned)elapsed_ms)
                          : 0;
@@ -1256,7 +1301,25 @@ void search(Board *b, SearchLimits *lim) {
         }
         fflush(stdout);
 
+        /* Stop conditions:
+         *   - Hard time limit reached.
+         *   - Soft time limit: if we're over the optimum budget, don't
+         *     start the next (deeper) iteration.
+         *
+         * NOTE: We deliberately do NOT break on finding a mate.  The
+         * baseline engine continues searching after finding a mate,
+         * which lets it discover SHORTER mates (e.g., mate-in-1 vs
+         * mate-in-3) at deeper iterations.  Breaking early would
+         * cause the engine to return a longer mate when a shorter
+         * one exists. */
         if (time_up(&si)) break;
+
+        /* Soft time limit: if we're over the optimum budget, don't
+         * start the next (deeper) iteration. */
+        if (si.allotted_ms > 0) {
+            long elapsed = now_ms() - si.start_time_ms;
+            if (elapsed >= si.allotted_ms) break;
+        }
     }
 
 done:

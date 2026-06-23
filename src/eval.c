@@ -175,7 +175,7 @@ static const int PST_KING_EG[64] = {
       -18,    -4,    21,    24,    27,    23,     9,   -11,
       -19,    -3,    11,    21,    23,    16,     7,    -9,
       -27,   -11,     4,    13,    14,     4,    -5,   -17,
-      120,   -34,   -21,   -11,   -28,   -14,   -24,   -43,
+      -53,   -34,   -21,   -11,   -28,   -14,   -24,   -43,
 };
 
 static const int DOUBLED_PAWN_PENALTY_MG  = -11;
@@ -186,6 +186,19 @@ static const int BACKWARD_PAWN_PENALTY_MG = -9;
 static const int BACKWARD_PAWN_PENALTY_EG = -22;
 static const int PASSED_PAWN_BONUS_MG[8]  = { 0, 5, 10, 20, 35, 60, 90, 0, };
 static const int PASSED_PAWN_BONUS_EG[8]  = { 0, 10, 20, 40, 65, 95, 140, 0, };
+
+/* NEW: Pawn chain — bonus for a pawn that is defended by another friendly
+ * pawn (i.e., a friendly pawn sits on one of the two squares diagonally
+ * behind it).  Pawn chains are harder to break and provide solid structure.
+ * Values from SF 11's connected-pawn table (approximate). */
+static const int PAWN_CHAIN_BONUS_MG = 11;
+static const int PAWN_CHAIN_BONUS_EG = 4;
+
+/* NEW: Pawn islands — penalty for each additional group of contiguous
+ * pawns files (an "island").  More islands = harder to defend, weaker
+ * structure.  Penalty per island AFTER the first. */
+static const int PAWN_ISLAND_PENALTY_MG = -3;
+static const int PAWN_ISLAND_PENALTY_EG = -8;
 
 /*
  * Non-linear MobilityBonus tables (SF 11 values).
@@ -650,6 +663,39 @@ static void eval_pawns_uncached(const Board *b, Color us, int *mg, int *eg) {
                 *eg += PHALANX_EG;
             }
         }
+
+        /*
+         * NEW: ── Pawn chain (defended pawn bonus) ──
+         *
+         * A pawn is "in a chain" if a friendly pawn defends it — i.e.,
+         * a friendly pawn sits on one of the two squares diagonally
+         * behind it (from our perspective).  Such pawns are harder to
+         * attack and form a solid structure.  SF 11 gives a small
+         * per-defender bonus; we use a flat bonus per defended pawn
+         * (capped at +1 even if both defenders exist, since double-
+         * defense isn't much better than single).
+         */
+        {
+            int behind1, behind2;
+            if (us == WHITE) {
+                behind1 = sq - 9;  /* down-left */
+                behind2 = sq - 7;  /* down-right */
+            } else {
+                behind1 = sq + 7;  /* up-left */
+                behind2 = sq + 9;  /* up-right */
+            }
+            bool defended = false;
+            if (behind1 >= 0 && behind1 < 64 && file > 0
+                && (our_pawns & SQUARE_BB[behind1]))
+                defended = true;
+            if (!defended && behind2 >= 0 && behind2 < 64 && file < 7
+                && (our_pawns & SQUARE_BB[behind2]))
+                defended = true;
+            if (defended) {
+                *mg += PAWN_CHAIN_BONUS_MG;
+                *eg += PAWN_CHAIN_BONUS_EG;
+            }
+        }
     }
 
     /*
@@ -691,6 +737,38 @@ static void eval_pawns_uncached(const Board *b, Color us, int *mg, int *eg) {
             *mg += HANGING_PAWNS_MG;
             *eg += HANGING_PAWNS_EG;
             break;  /* only one bonus per side */
+        }
+    }
+
+    /*
+     * NEW: ── Pawn islands ──
+     *
+     * An "island" is a maximal run of contiguous files that contain at
+     * least one friendly pawn.  E.g. pawns on a, b, d, g, h → 3 islands
+     * ({a,b}, {d}, {g,h}).  More islands = weaker structure (each island
+     * must be defended separately; no mutual support across gaps).
+     *
+     * We apply a small per-island penalty AFTER the first island — i.e.,
+     * 0 islands = 0 penalty, 1 island = 0 penalty, 2 islands = 1×penalty,
+     * 3 islands = 2×penalty, etc.  This avoids penalising a single
+     * connected pawn group and focuses on the fragmentation itself.
+     */
+    {
+        int islands = 0;
+        bool in_island = false;
+        for (int f = 0; f < 8; f++) {
+            bool has_pawn = (our_pawns & FILE_BB[f]) != 0;
+            if (has_pawn && !in_island) {
+                islands++;
+                in_island = true;
+            } else if (!has_pawn) {
+                in_island = false;
+            }
+        }
+        if (islands > 1) {
+            int extra = islands - 1;
+            *mg += PAWN_ISLAND_PENALTY_MG * extra;
+            *eg += PAWN_ISLAND_PENALTY_EG * extra;
         }
     }
 }

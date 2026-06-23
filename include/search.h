@@ -68,8 +68,9 @@ static const int COUNTER_HIST_MAX = 16384;  /* |score| clamp before store */
 /* ── Per-search state ── */
 typedef struct {
     SearchLimits *limits;
-    clock_t       start_time;
-    int           allotted_ms;
+    long          start_time_ms;   /* wall-clock start, milliseconds */
+    int           allotted_ms;     /* optimum time — soft limit */
+    int           max_time_ms;     /* hard limit (>= allotted_ms) */
 
     uint64_t      nodes;
     int           seldepth;

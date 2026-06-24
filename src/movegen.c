@@ -213,3 +213,154 @@ bool is_legal(Board *b, Move m) {
     unmake_move(b);
     return legal;
 }
+
+/* ──────────────────────────────────────────────
+ *  move_gives_check  (OPT-F)
+ *
+ *  Determine whether playing `m` puts the side-to-move's opponent in
+ *  check, WITHOUT calling make_move / in_check.  Computing this from
+ *  the pre-move board state is much cheaper than the post-make
+ *  in_check() call (which re-derives the king square and runs 5+
+ *  slider attack lookups), and we already know the from/to/piece
+ *  from the move encoding.
+ *
+ *  Three sources of check:
+ *    1. Direct check   — the moving piece, from its destination, attacks
+ *       the enemy king.  (For promotions, use the promoted piece type.)
+ *       (For castling, the rook gives the check, not the king.)
+ *    2. Discovered check — a slider behind the mover (on a line through
+ *       `from` and the enemy king) now sees the king after `from` is
+ *       vacated.  We test this by computing slider attacks from `from`
+ *       with `from` itself removed from occupancy, intersected with
+ *       our sliders (rook/queen on lines, bishop/queen on diagonals).
+ *    3. En-passant discovered check — when an EP capture removes a
+ *       pawn, that pawn might have been blocking a slider.  Test by
+ *       also XOR-ing out the captured pawn's square before computing
+ *       discovered attacks.
+ *
+ *  The discovered-check test uses occupancy with `from` removed; for
+ *  EP we also remove the captured pawn square.  This is the standard
+ *  Stockfish approach.
+ * ────────────────────────────────────────────── */
+bool move_gives_check(const Board *b, Move m) {
+    Color  us   = b->side;
+    Color  them = us ^ 1;
+    Square from = MOVE_FROM(m);
+    Square to   = MOVE_TO(m);
+    MoveType mt = MOVE_TYPE(m);
+
+    int king_sq = bb_lsb(b->pieces[them][KING]);
+
+    /* Occupancy after the move: piece removed from `from`, placed at `to`.
+     * For captures the captured piece is also removed, but for discovered-
+     * check purposes that doesn't matter (the captured piece was on `to`,
+     * not behind the mover).  For EP we need to also remove the captured
+     * pawn (handled below). */
+    Bitboard occ = b->occ[2];
+    occ ^= SQUARE_BB[from];
+    occ |= SQUARE_BB[to];
+
+    /* ── Direct check ── */
+    switch (mt) {
+        case MT_N_PROMO:
+        case MT_N_PROMO_CAP:
+            if (KNIGHT_ATTACKS[to] & SQUARE_BB[king_sq]) return true;
+            break;
+        case MT_B_PROMO:
+        case MT_B_PROMO_CAP:
+            if (bishop_attacks((Square)to, occ) & SQUARE_BB[king_sq]) return true;
+            break;
+        case MT_R_PROMO:
+        case MT_R_PROMO_CAP:
+            if (rook_attacks((Square)to, occ) & SQUARE_BB[king_sq]) return true;
+            break;
+        case MT_Q_PROMO:
+        case MT_Q_PROMO_CAP:
+            if ( (bishop_attacks((Square)to, occ) | rook_attacks((Square)to, occ))
+                 & SQUARE_BB[king_sq]) return true;
+            break;
+        case MT_KCASTLE:
+        case MT_QCASTLE: {
+            /* The rook is the piece that can give check after castling. */
+            Square rook_to = (mt == MT_KCASTLE)
+                ? (us == WHITE ? F1 : F8)
+                : (us == WHITE ? D1 : D8);
+            if (rook_attacks(rook_to, occ) & SQUARE_BB[king_sq]) return true;
+            /* King itself cannot give check from its castled square
+             * (opponent's king is never adjacent in a legal position
+             * before the castle).  Skip direct king check. */
+            break;
+        }
+        default: {
+            /* Normal move: use the moving piece's type. */
+            PieceType pt = piece_type(b->mailbox[from]);
+            Bitboard atk = 0;
+            switch (pt) {
+                case PAWN:
+                    atk = PAWN_ATTACKS[us][to];
+                    break;
+                case KNIGHT:
+                    atk = KNIGHT_ATTACKS[to];
+                    break;
+                case BISHOP:
+                    atk = bishop_attacks((Square)to, occ);
+                    break;
+                case ROOK:
+                    atk = rook_attacks((Square)to, occ);
+                    break;
+                case QUEEN:
+                    atk = bishop_attacks((Square)to, occ)
+                        | rook_attacks((Square)to, occ);
+                    break;
+                case KING:
+                    /* A king move can only give check if it's a discovered
+                     * check — kings don't deliver direct check. */
+                    break;
+                default: break;
+            }
+            if (atk & SQUARE_BB[king_sq]) return true;
+            break;
+        }
+    }
+
+    /* ── Discovered check ──
+     *
+     * A slider of ours that was behind `from` (on a line through the
+     * enemy king) now sees the king.  The correct test is:
+     *   rook_attacks(king_sq, occ_with_from_removed) & our_rooks
+     * which asks "with `from` vacated, which of our rooks attack the
+     * king?"  Symmetry of rook attacks on a line means this is the
+     * same as asking which of our rooks the king would attack.
+     *
+     * IMPORTANT: the moving piece is still recorded at `from` in
+     * b->pieces[us][...] (we have NOT called make_move yet).  When
+     * the mover is itself a rook/bishop/queen, it would create a
+     * false positive on the discovered-check test (the slider at
+     * `from` "sees" the king through the now-empty `from` square,
+     * but the slider has actually moved to `to`).  Mask `from` out
+     * of the candidate slider sets to avoid this.
+     *
+     * For EP, we must also XOR out the captured pawn square (it was a
+     * blocker that the EP capture removes). */
+    if (mt == MT_EP) {
+        Square cap_sq = (us == WHITE) ? (Square)(to - 8) : (Square)(to + 8);
+        occ ^= SQUARE_BB[cap_sq];
+    }
+
+    Bitboard from_bb = SQUARE_BB[from];
+    Bitboard our_rooks   = b->pieces[us][ROOK]   & ~from_bb;
+    Bitboard our_bishops = b->pieces[us][BISHOP] & ~from_bb;
+    Bitboard our_queens  = b->pieces[us][QUEEN]  & ~from_bb;
+
+    /* Rook/queen discovered check. */
+    Bitboard rook_dc = rook_attacks((Square)king_sq, occ)
+                     & (our_rooks | our_queens);
+    if (rook_dc) return true;
+
+    /* Bishop/queen discovered check. */
+    Bitboard bishop_dc = bishop_attacks((Square)king_sq, occ)
+                       & (our_bishops | our_queens);
+    if (bishop_dc) return true;
+
+    return false;
+}

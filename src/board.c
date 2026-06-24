@@ -266,17 +266,31 @@ void make_move(Board *b, Move m) {
         b->hash ^= ZKEYS.ep[b->ep_sq & 7];
     }
 
-    /* Update castling rights */
+    /* Update castling rights.
+     * OPT-I: fully-initialized 64-entry table where every non-castling-
+     * relevant square has mask ~0 (no rights removed), so we can index
+     * without a fallback branch.  The previous code relied on C's
+     * default-zero initialization for unlisted indices and then branched
+     * to convert 0 → ~0; this version is branchless.
+     *
+     * Square indices: A1=0, E1=4, H1=7, A8=56, E8=60, H8=63.
+     * Mask values: ~CR_WQ = ~2 = 0xFFFFFFFD, ~(CR_WK|CR_WQ) = ~3 = 0xFFFFFFFC,
+     *              ~CR_WK = ~1 = 0xFFFFFFFE, similarly for black. */
     static const int castle_mask[64] = {
-        [A1]=~CR_WQ, [E1]=~(CR_WK|CR_WQ), [H1]=~CR_WK,
-        [A8]=~CR_BQ, [E8]=~(CR_BK|CR_BQ), [H8]=~CR_BK,
+        /* a1 */ ~CR_WQ,             /* b1 */ ~0, ~0, ~0,
+        /* e1 */ ~(CR_WK|CR_WQ),     /* f1 */ ~0, ~0,
+        /* h1 */ ~CR_WK,
+        /* a2..h2 */ ~0, ~0, ~0, ~0, ~0, ~0, ~0, ~0,
+        /* a3..h3 */ ~0, ~0, ~0, ~0, ~0, ~0, ~0, ~0,
+        /* a4..h4 */ ~0, ~0, ~0, ~0, ~0, ~0, ~0, ~0,
+        /* a5..h5 */ ~0, ~0, ~0, ~0, ~0, ~0, ~0, ~0,
+        /* a6..h6 */ ~0, ~0, ~0, ~0, ~0, ~0, ~0, ~0,
+        /* a7..h7 */ ~0, ~0, ~0, ~0, ~0, ~0, ~0, ~0,
+        /* a8 */ ~CR_BQ,             /* b8 */ ~0, ~0, ~0,
+        /* e8 */ ~(CR_BK|CR_BQ),     /* f8 */ ~0, ~0,
+        /* h8 */ ~CR_BK
     };
-    /* For all other squares the mask is -1 (0xFF...FF) */
-    int cm_from = (from < 64) ? castle_mask[from] : ~0;
-    int cm_to   = (to   < 64) ? castle_mask[to]   : ~0;
-    if (cm_from == 0) cm_from = ~0; /* not a castling-relevant square */
-    if (cm_to   == 0) cm_to   = ~0;
-    b->castle &= cm_from & cm_to;
+    b->castle &= castle_mask[from] & castle_mask[to];
 
     /* Finalise hash */
     b->hash ^= ZKEYS.castle[b->castle];

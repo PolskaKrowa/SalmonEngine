@@ -18,3 +18,10 @@ void gen_captures(const Board *b, MoveList *ml);
  * Validate legality: returns true if the move leaves the king safe.
  */
 bool is_legal(Board *b, Move m);
+
+/*
+ * move_gives_check — does playing `m` put the opponent in check?
+ * Computed from the pre-move board state (no make/unmake needed).
+ * Used by the search to avoid the post-make in_check() call.
+ */
+bool move_gives_check(const Board *b, Move m);

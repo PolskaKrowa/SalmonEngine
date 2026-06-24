@@ -5,6 +5,9 @@
 #  Then: ./configure [--prefix=/usr/local] [--enable-debug]
 #                    [--enable-sanitize] [--enable-tuner]
 #                    [--enable-eval-debug]
+#                    [--enable-superopt]
+#                    [--with-souper=PATH] [--with-minotaur=PATH]
+#                    [--with-clang=PATH] [--with-llc=PATH]
 # -------------------------------------------------------------
 
 AC_INIT([salmon], [2.0], [], [salmon-engine])
@@ -62,6 +65,93 @@ AC_ARG_ENABLE([eval-debug],
     [AS_HELP_STRING([--enable-eval-debug], [build with evaluation debugging])],
     [enable_eval_debug=$enableval], [enable_eval_debug=no])
 
+# ── Superoptimisation: Souper + Minotaur ─────────────────────────
+#
+# When --enable-superopt is given, each .c file is compiled to LLVM
+# bitcode with clang, then run through Souper (optimistic substitution
+# with SMT solving) and Minotaur (a custom LLVM opt pass pipeline).
+# Both stages have per-stage fallbacks: if either tool fails on a
+# particular file, that file is still built using the previous stage's
+# bitcode.  See build-aux/superopt-stage.sh for the wrapper.
+#
+# Requires: clang (for bitcode emission + final codegen), llc (for
+# codegen if clang is not used for that step), souper, minotaur.
+AC_ARG_ENABLE([superopt],
+    [AS_HELP_STRING([--enable-superopt],
+        [enable Souper + Minotaur superoptimisation passes (requires clang, llc, souper, minotaur)])],
+    [enable_superopt=$enableval], [enable_superopt=no])
+
+AC_ARG_WITH([souper],
+    [AS_HELP_STRING([--with-souper=PATH], [path to souper binary])],
+    [SOUPER_BIN=$withval], [SOUPER_BIN=])
+AC_ARG_WITH([minotaur],
+    [AS_HELP_STRING([--with-minotaur=PATH], [path to minotaur binary])],
+    [MINOTAUR_BIN=$withval], [MINOTAUR_BIN=])
+AC_ARG_WITH([clang],
+    [AS_HELP_STRING([--with-clang=PATH], [path to clang binary (for bitcode emission)])],
+    [CLANG_BIN=$withval], [CLANG_BIN=])
+AC_ARG_WITH([llc],
+    [AS_HELP_STRING([--with-llc=PATH], [path to llc binary])],
+    [LLC_BIN=$withval], [LLC_BIN=])
+
+if test "x$enable_superopt" = "xyes"; then
+    AC_MSG_NOTICE([Superoptimisation enabled — checking for required tools])
+
+    # clang — required for emitting LLVM bitcode from C source.
+    if test -z "$CLANG_BIN"; then
+        AC_PATH_PROG([CLANG_BIN_AUTO], [clang], [no])
+        CLANG_BIN=$CLANG_BIN_AUTO
+    fi
+    if test "x$CLANG_BIN" = "xno" -o -z "$CLANG_BIN"; then
+        AC_MSG_ERROR([--enable-superopt requires clang (use --with-clang=PATH to specify)])
+    fi
+    AC_MSG_NOTICE([  clang:    $CLANG_BIN])
+
+    # llc — required for codegen from optimised bitcode to assembly.
+    if test -z "$LLC_BIN"; then
+        AC_PATH_PROG([LLC_BIN_AUTO], [llc], [no])
+        LLC_BIN=$LLC_BIN_AUTO
+    fi
+    if test "x$LLC_BIN" = "xno" -o -z "$LLC_BIN"; then
+        AC_MSG_ERROR([--enable-superopt requires llc (use --with-llc=PATH to specify)])
+    fi
+    AC_MSG_NOTICE([  llc:      $LLC_BIN])
+
+    # souper — required (no fallback at the build-system level; per-file
+    # fallback is handled by superopt-stage.sh).
+    if test -z "$SOUPER_BIN"; then
+        AC_PATH_PROG([SOUPER_BIN_AUTO], [souper], [no])
+        SOUPER_BIN=$SOUPER_BIN_AUTO
+    fi
+    if test "x$SOUPER_BIN" = "xno" -o -z "$SOUPER_BIN"; then
+        AC_MSG_ERROR([--enable-superopt requires souper (use --with-souper=PATH to specify)])
+    fi
+    AC_MSG_NOTICE([  souper:   $SOUPER_BIN])
+
+    # minotaur — same as souper.
+    if test -z "$MINOTAUR_BIN"; then
+        AC_PATH_PROG([MINOTAUR_BIN_AUTO], [minotaur], [no])
+        MINOTAUR_BIN=$MINOTAUR_BIN_AUTO
+    fi
+    if test "x$MINOTAUR_BIN" = "xno" -o -z "$MINOTAUR_BIN"; then
+        AC_MSG_ERROR([--enable-superopt requires minotaur (use --with-minotaur=PATH to specify)])
+    fi
+    AC_MSG_NOTICE([  minotaur: $MINOTAUR_BIN])
+
+    AC_SUBST([CLANG_BIN])
+    AC_SUBST([LLC_BIN])
+    AC_SUBST([SOUPER_BIN])
+    AC_SUBST([MINOTAUR_BIN])
+
+    # Override CC/CFLAGS so the automake-generated .c.o rule (which
+    # would use gcc) is replaced by our custom superopt rule below.
+    # We still keep CC=gcc for the final link step (handled by the
+    # automake linker rule, which uses CCLD).
+    SUPEROPT_CFLAGS_BASE="$CFLAGS"
+    AC_SUBST([SUPEROPT_CFLAGS_BASE])
+fi
+AM_CONDITIONAL([ENABLE_SUPEROPT], [test "x$enable_superopt" = "xyes"])
+
 AM_CONDITIONAL([ENABLE_TUNER], [test "x$enable_tuner" = "xyes"])
 
 # Set CFLAGS / LDFLAGS based on selected mode
@@ -96,4 +186,12 @@ AC_MSG_NOTICE([
   Now run:  make
             make tuner   (if --enable-tuner)
             make perft   (smoke test)
-])
+
+  Superoptimisation: $enable_superopt])
+
+if test "x$enable_superopt" = "xyes"; then
+    AC_MSG_NOTICE([    clang=$CLANG_BIN
+    llc=$LLC_BIN
+    souper=$SOUPER_BIN
+    minotaur=$MINOTAUR_BIN])
+fi

@@ -23,4 +23,3 @@ config.log
 config.status
 engine
 tuna
-build-aux/

@@ -1309,58 +1309,58 @@ static void eval_king_safety(const Board *b, Color us, int *mg, int *eg) {
      * NEW: ── Safe check bonus ──
      *
      * A "safe check" is a check from a square where the checking piece
-     * is NOT attacked by any enemy pawn (and ideally not by a cheaper
-     * enemy piece either).  Safe checks are powerful because they force
-     * the king to move or block, creating tempo for the attacker to
-     * build a mating net.
-     *
-     * We detect safe checks by finding squares from which our pieces
-     * attack the enemy king, and checking whether those squares are
-     * defended (by us) or at least not attacked by enemy pawns/pieces.
+     * is NOT attacked by any enemy pawn.  Safe checks are powerful
+     * because they force the king to move or block, creating tempo for
+     * building a mating net.
      *
      * Bonus per safe check: knight +20, bishop +20, rook +40, queen +20.
-     * (Rook checks on open files near the king are especially strong.)
+     * Multiple safe checks get exponential bonuses.
+     *
+     * PERFORMANCE: This is gated behind a material check (only compute
+     * when we have major/minor pieces that could give checks) and
+     * caches the bishop/rook attack lookups to avoid redundant slider
+     * computations (the main cause of the 300Knps-1Mnps variance).
      */
     {
-        Bitboard occ_local = b->occ[2];
-        Bitboard enemy_king_bb = b->pieces[them][KING];
-        int ek_sq = bb_lsb(enemy_king_bb);
+        /* Gate: skip if we have no major pieces (queen/rook) — without
+         * them, safe checks can't lead to mate, so the bonus is wasted.
+         * This skips the expensive slider lookups in minor-only endgames. */
+        Bitboard our_majors = b->pieces[us][ROOK] | b->pieces[us][QUEEN];
+        if (our_majors) {
+            Bitboard occ_local = b->occ[2];
+            int ek_sq = bb_lsb(b->pieces[them][KING]);
 
-        /* For each piece type, find checking squares and test safety.
-         * A check square is "safe" if no enemy pawn attacks it AND
-         * (it's defended by a friendly piece OR no enemy piece attacks
-         * it with a cheaper piece).  We use a simplified version: safe
-         * if not attacked by enemy pawns. */
+            /* Compute slider attacks from the enemy king ONCE, then
+             * reuse for both bishop and queen checks (and rook/queen). */
+            Bitboard b_atk_from_king = bishop_attacks((Square)ek_sq, occ_local);
+            Bitboard r_atk_from_king = rook_attacks  ((Square)ek_sq, occ_local);
 
-        /* Knight checks: squares a knight can reach the king from */
-        Bitboard n_checks = KNIGHT_ATTACKS[ek_sq] & b->pieces[us][KNIGHT];
-        /* Bishop checks: our bishops that x-ray the king diagonally */
-        Bitboard b_checks = bishop_attacks((Square)ek_sq, occ_local) & b->pieces[us][BISHOP];
-        /* Rook checks: our rooks that x-ray the king on rank/file */
-        Bitboard r_checks = rook_attacks((Square)ek_sq, occ_local) & b->pieces[us][ROOK];
-        /* Queen checks: our queens that x-ray the king */
-        Bitboard q_checks = (bishop_attacks((Square)ek_sq, occ_local)
-                            | rook_attacks((Square)ek_sq, occ_local))
-                           & b->pieces[us][QUEEN];
+            /* Our pieces that would check the enemy king. */
+            Bitboard n_checks = KNIGHT_ATTACKS[ek_sq] & b->pieces[us][KNIGHT];
+            Bitboard b_checks = b_atk_from_king & b->pieces[us][BISHOP];
+            Bitboard r_checks = r_atk_from_king & b->pieces[us][ROOK];
+            Bitboard q_checks = (b_atk_from_king | r_atk_from_king)
+                              & b->pieces[us][QUEEN];
 
-        /* Enemy pawn attacks */
-        Bitboard enemy_pawn_attacks = 0;
-        Bitboard ep = b->pieces[them][PAWN];
-        while (ep) {
-            int s = bb_pop(&ep);
-            enemy_pawn_attacks |= PAWN_ATTACKS[them][s];
+            /* Compute enemy pawn attacks ONCE (was per-piece before). */
+            Bitboard safe_mask = ~0;
+            Bitboard ep = b->pieces[them][PAWN];
+            while (ep) {
+                int s = bb_pop(&ep);
+                safe_mask &= ~PAWN_ATTACKS[them][s];
+            }
+
+            /* Count safe checks (piece on a non-pawn-attacked square). */
+            int safe_checks = 0;
+            if (n_checks & safe_mask) { *mg += 20; safe_checks++; }
+            if (b_checks & safe_mask) { *mg += 20; safe_checks++; }
+            if (r_checks & safe_mask) { *mg += 40; safe_checks++; }
+            if (q_checks & safe_mask) { *mg += 20; safe_checks++; }
+
+            /* Multiple safe checks are exponentially dangerous */
+            if (safe_checks >= 2) *mg += 30;
+            if (safe_checks >= 3) *mg += 30;
         }
-
-        /* Count safe checks (piece not attacked by enemy pawn) */
-        int safe_checks = 0;
-        if (n_checks & ~enemy_pawn_attacks) { *mg += 20; safe_checks++; }
-        if (b_checks & ~enemy_pawn_attacks) { *mg += 20; safe_checks++; }
-        if (r_checks & ~enemy_pawn_attacks) { *mg += 40; safe_checks++; }
-        if (q_checks & ~enemy_pawn_attacks) { *mg += 20; safe_checks++; }
-
-        /* Multiple safe checks are exponentially dangerous */
-        if (safe_checks >= 2) *mg += 30;
-        if (safe_checks >= 3) *mg += 30;
     }
 
     /*

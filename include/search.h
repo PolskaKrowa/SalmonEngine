@@ -81,6 +81,7 @@ typedef struct {
 
     uint64_t      nodes;
     int           seldepth;
+    int           thread_id;       /* 0 for main thread; >0 for SMP helpers */
 
     /* Heuristic tables */
     int  history   [2][64][64];        /* butterfly history [side][from][to]  */

@@ -33,6 +33,8 @@
  *  • Time management: check every 2048 nodes; stop when budget exceeded
  */
 
+#define _POSIX_C_SOURCE 199309L
+
 #include "search.h"
 #include "movegen.h"
 #include "eval.h"
@@ -59,6 +61,14 @@
 #define EVAL_NONE (INT_MIN / 2)
 
 static Move s_root_best_move = NULL_MOVE;
+
+/* Shared node counter for SMP NPS reporting.  Each thread writes its
+ * current node count here every 2048 nodes; thread 0 sums all entries
+ * for accurate total-NPS display.  See search_thread() for details. */
+static volatile uint64_t g_thread_nodes[64];
+
+/* Global thread count (set via UCI "Threads" option, default 1). */
+int g_num_threads = 1;
 
 /* ──────────────────────────────────────────────
  *  LMR reduction table — product-of-logs (SF 11 style)
@@ -502,9 +512,14 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si,
     /* power-of-2 modulo → bitwise AND.
      * GCC already performs this transform at -O3, but the explicit form
      * documents intent and removes any ambiguity for readers and tools. */
-    if ((si->nodes & 2047) == 0 && time_up(si)) {
-        si->limits->stop = true;
-        return 0;
+    /* Check time every 2048 nodes.  Also update the shared node counter
+     * for SMP NPS reporting (thread 0 sums all entries for display). */
+    if ((si->nodes & 2047) == 0) {
+        g_thread_nodes[si->thread_id] = si->nodes;
+        if (time_up(si)) {
+            si->limits->stop = true;
+            return 0;
+        }
     }
 
     si->nodes++;
@@ -1193,9 +1208,6 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si,
  * ────────────────────────────────────────────── */
 extern void move_to_str(Move m, char *out);
 
-/* Global thread count (set via UCI "Threads" option, default 1). */
-int g_num_threads = 1;
-
 /* ── Lazy SMP thread infrastructure ──
  *
  * Each thread runs the same iterative deepening search with its own
@@ -1290,14 +1302,22 @@ static void *search_thread(void *arg) {
         TTEntry tte;
         if (tt_probe(b->hash, &tte) && tte.move) best_move = tte.move;
 
-        /* Only thread 0 prints info lines. */
+        /* Only thread 0 prints info lines.  NPS is computed from the
+         * TOTAL node count across all threads (sum of g_thread_nodes),
+         * not just thread 0's nodes.  This gives accurate NPS for SMP. */
         if (sta->thread_id == 0) {
             char mv_str[6];
             move_to_str(best_move, mv_str);
             int elapsed_ms = (int)(now_ms() - si->start_time_ms);
-            long long nps  = elapsed_ms > 0
-                             ? (long long)(si->nodes * 1000ULL / (unsigned)elapsed_ms)
-                             : 0;
+
+            /* Sum nodes across all active threads for accurate NPS. */
+            uint64_t total_nodes = 0;
+            for (int t = 0; t < g_num_threads; t++)
+                total_nodes += g_thread_nodes[t];
+
+            long long nps = elapsed_ms > 0
+                            ? (long long)(total_nodes * 1000ULL / (unsigned)elapsed_ms)
+                            : 0;
 
             if (abs(score) >= MATE_SCORE - MAX_PLY) {
                 int mate_in = (score > 0)
@@ -1306,12 +1326,12 @@ static void *search_thread(void *arg) {
                 printf("info depth %d seldepth %d score mate %d nodes %llu "
                        "nps %lld time %d pv %s\n",
                        depth, si->seldepth, mate_in,
-                       (unsigned long long)si->nodes, nps, elapsed_ms, mv_str);
+                       (unsigned long long)total_nodes, nps, elapsed_ms, mv_str);
             } else {
                 printf("info depth %d seldepth %d score cp %d nodes %llu "
                        "nps %lld time %d pv %s\n",
                        depth, si->seldepth, score,
-                       (unsigned long long)si->nodes, nps, elapsed_ms, mv_str);
+                       (unsigned long long)total_nodes, nps, elapsed_ms, mv_str);
             }
             fflush(stdout);
         }
@@ -1397,6 +1417,7 @@ void search(Board *b, SearchLimits *lim) {
     /* Single-threaded path (fast path, no thread overhead). */
     if (num_threads == 1) {
         ThreadResult result = {0};
+        g_thread_nodes[0] = 0;  /* reset shared node counter */
         /* Allocate on heap — SearchInfo is ~340KB, too large for stack. */
         SearchThreadArg *arg = calloc(1, sizeof(SearchThreadArg));
         if (!arg) {
@@ -1412,6 +1433,7 @@ void search(Board *b, SearchLimits *lim) {
         arg->si.start_time_ms = start_ms;
         arg->si.allotted_ms   = allotted_ms;
         arg->si.max_time_ms   = max_time_ms;
+        arg->si.thread_id     = 0;  /* for g_thread_nodes tracking */
 
         search_thread(arg);
 
@@ -1446,6 +1468,7 @@ void search(Board *b, SearchLimits *lim) {
         args[i]->si.start_time_ms = start_ms;
         args[i]->si.allotted_ms   = allotted_ms;
         args[i]->si.max_time_ms   = max_time_ms;
+        args[i]->si.thread_id     = i;  /* for g_thread_nodes tracking */
         args[i]->limits    = lim;
         args[i]->thread_id = i;
         args[i]->result    = &results[i];
@@ -1453,6 +1476,7 @@ void search(Board *b, SearchLimits *lim) {
         results[i].score     = 0;
         results[i].depth     = 0;
         results[i].finished  = false;
+        g_thread_nodes[i]    = 0;  /* reset shared node counter */
     }
 
     /* Start all threads. */

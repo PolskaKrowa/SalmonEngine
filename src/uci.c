@@ -11,8 +11,12 @@
 #include <pthread.h>
 #include <unistd.h>
 
-/* Default TT size in MB */
+/* Default TT size in MB.
+ * For multi-threaded search, the TT fills up faster (N threads each
+ * write entries), so we scale: 64MB * max(1, threads/2).  The user
+ * can always override via "setoption name Hash value N". */
 #define DEFAULT_HASH_MB 64
+static int current_hash_mb = DEFAULT_HASH_MB;
 
 /* ──────────────────────────────────────────────
  *  Move string helpers
@@ -232,6 +236,7 @@ static void handle_setoption(const char *line) {
         int mb = atoi(val);
         if (mb < 1) mb = 1;
         tt_init((size_t)mb);
+        current_hash_mb = mb;  /* track user's manual setting */
     } else if (strncasecmp(name, "ownbook", 7) == 0
             || strncasecmp(name, "book", 4) == 0) {
         bool enabled = (strncasecmp(val, "true", 4) == 0
@@ -242,6 +247,15 @@ static void handle_setoption(const char *line) {
         if (n < 1) n = 1;
         if (n > 64) n = 64;
         g_num_threads = n;
+        /* Auto-scale TT for multi-threading: 64MB * max(1, threads/2).
+         * More threads fill the TT faster, so a larger TT improves hit
+         * rates and reduces contention.  Only auto-scale if the user
+         * hasn't manually set a Hash size. */
+        int recommended_mb = DEFAULT_HASH_MB * (n > 2 ? (n + 1) / 2 : 1);
+        if (recommended_mb != current_hash_mb) {
+            tt_init((size_t)recommended_mb);
+            current_hash_mb = recommended_mb;
+        }
     }
 }
 

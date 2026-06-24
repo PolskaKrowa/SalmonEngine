@@ -6,8 +6,9 @@
 #                    [--enable-sanitize] [--enable-tuner]
 #                    [--enable-eval-debug]
 #                    [--enable-superopt]
-#                    [--with-souper=PATH] [--with-minotaur=PATH]
-#                    [--with-clang=PATH] [--with-llc=PATH]
+#                    [--with-clang=PATH] [--with-opt=PATH] [--with-llc=PATH]
+#                    [--with-souper-pass=PATH] [--with-minotaur-pass=PATH]
+#                    [--with-souper=PATH]
 # -------------------------------------------------------------
 
 AC_INIT([salmon], [2.0], [], [salmon-engine])
@@ -68,31 +69,59 @@ AC_ARG_ENABLE([eval-debug],
 # ── Superoptimisation: Souper + Minotaur ─────────────────────────
 #
 # When --enable-superopt is given, each .c file is compiled to LLVM
-# bitcode with clang, then run through Souper (optimistic substitution
-# with SMT solving) and Minotaur (a custom LLVM opt pass pipeline).
-# Both stages have per-stage fallbacks: if either tool fails on a
-# particular file, that file is still built using the previous stage's
-# bitcode.  See build-aux/superopt-stage.sh for the wrapper.
+# bitcode with clang, then run through two LLVM opt pass plugins:
 #
-# Requires: clang (for bitcode emission + final codegen), llc (for
-# codegen if clang is not used for that step), souper, minotaur.
+#   • libSouperPass.so  — Souper's optimistic-substitution pass.
+#     The pass extracts optimisation candidates from the bitcode and
+#     asks an SMT solver (via the `souper` binary, which it shells out
+#     to at runtime) whether each candidate has a cheaper equivalent.
+#   • libMinotaurPass.so — Minotaur's pass pipeline.
+#
+# Both passes are loaded by the standard LLVM `opt` driver via
+# `-load-pass-plugin <plugin.so>`.  The `souper` binary itself is NOT
+# invoked directly by the Makefile — it is invoked by the Souper pass
+# at runtime, so we expose its path to the pass via the SOUPER_BIN
+# environment variable.
+#
+# Per-stage fallback: if either pass fails on a particular file, that
+# file is still built using the previous stage's bitcode.  See
+# build-aux/superopt-stage.sh for the wrapper.
+#
+# Required tools (all checked at configure time when --enable-superopt):
+#   • clang        — emit LLVM bitcode from C source
+#   • opt          — the LLVM optimiser driver that loads the pass plugins
+#   • llc          — codegen from optimised bitcode to assembly
+#   • libSouperPass.so   — Souper's pass plugin
+#   • libMinotaurPass.so — Minotaur's pass plugin
+#   • souper       — the Souper binary (invoked at runtime by the pass;
+#                    exposed via SOUPER_BIN env var so the pass finds it)
 AC_ARG_ENABLE([superopt],
     [AS_HELP_STRING([--enable-superopt],
-        [enable Souper + Minotaur superoptimisation passes (requires clang, llc, souper, minotaur)])],
+        [enable Souper + Minotaur superoptimisation passes (requires clang, opt, llc, libSouperPass.so, libMinotaurPass.so, souper)])],
     [enable_superopt=$enableval], [enable_superopt=no])
 
-AC_ARG_WITH([souper],
-    [AS_HELP_STRING([--with-souper=PATH], [path to souper binary])],
-    [SOUPER_BIN=$withval], [SOUPER_BIN=])
-AC_ARG_WITH([minotaur],
-    [AS_HELP_STRING([--with-minotaur=PATH], [path to minotaur binary])],
-    [MINOTAUR_BIN=$withval], [MINOTAUR_BIN=])
 AC_ARG_WITH([clang],
     [AS_HELP_STRING([--with-clang=PATH], [path to clang binary (for bitcode emission)])],
     [CLANG_BIN=$withval], [CLANG_BIN=])
+AC_ARG_WITH([opt],
+    [AS_HELP_STRING([--with-opt=PATH], [path to LLVM opt binary (the pass driver)])],
+    [OPT_BIN=$withval], [OPT_BIN=])
 AC_ARG_WITH([llc],
-    [AS_HELP_STRING([--with-llc=PATH], [path to llc binary])],
+    [AS_HELP_STRING([--with-llc=PATH], [path to llc binary (for codegen)])],
     [LLC_BIN=$withval], [LLC_BIN=])
+AC_ARG_WITH([souper-pass],
+    [AS_HELP_STRING([--with-souper-pass=PATH],
+        [path to libSouperPass.so (Souper's LLVM opt pass plugin)])],
+    [SOUPER_PASS=$withval], [SOUPER_PASS=])
+AC_ARG_WITH([minotaur-pass],
+    [AS_HELP_STRING([--with-minotaur-pass=PATH],
+        [path to libMinotaurPass.so (Minotaur's LLVM opt pass plugin)])],
+    [MINOTAUR_PASS=$withval], [MINOTAUR_PASS=])
+AC_ARG_WITH([souper],
+    [AS_HELP_STRING([--with-souper=PATH],
+        [path to the souper binary (invoked at runtime by the Souper pass;
+         if unset, the pass searches PATH)])],
+    [SOUPER_BIN=$withval], [SOUPER_BIN=])
 
 if test "x$enable_superopt" = "xyes"; then
     AC_MSG_NOTICE([Superoptimisation enabled — checking for required tools])
@@ -105,7 +134,19 @@ if test "x$enable_superopt" = "xyes"; then
     if test "x$CLANG_BIN" = "xno" -o -z "$CLANG_BIN"; then
         AC_MSG_ERROR([--enable-superopt requires clang (use --with-clang=PATH to specify)])
     fi
-    AC_MSG_NOTICE([  clang:    $CLANG_BIN])
+    AC_MSG_NOTICE([  clang:           $CLANG_BIN])
+
+    # opt — the LLVM optimiser driver.  Loads pass plugins via
+    # -load-pass-plugin.  Must be from the same LLVM release as the
+    # plugins were built against, or it will refuse to load them.
+    if test -z "$OPT_BIN"; then
+        AC_PATH_PROG([OPT_BIN_AUTO], [opt], [no])
+        OPT_BIN=$OPT_BIN_AUTO
+    fi
+    if test "x$OPT_BIN" = "xno" -o -z "$OPT_BIN"; then
+        AC_MSG_ERROR([--enable-superopt requires opt (use --with-opt=PATH to specify)])
+    fi
+    AC_MSG_NOTICE([  opt:             $OPT_BIN])
 
     # llc — required for codegen from optimised bitcode to assembly.
     if test -z "$LLC_BIN"; then
@@ -115,40 +156,70 @@ if test "x$enable_superopt" = "xyes"; then
     if test "x$LLC_BIN" = "xno" -o -z "$LLC_BIN"; then
         AC_MSG_ERROR([--enable-superopt requires llc (use --with-llc=PATH to specify)])
     fi
-    AC_MSG_NOTICE([  llc:      $LLC_BIN])
+    AC_MSG_NOTICE([  llc:             $LLC_BIN])
 
-    # souper — required (no fallback at the build-system level; per-file
-    # fallback is handled by superopt-stage.sh).
+    # libSouperPass.so — Souper's opt pass plugin.  Not a binary, so
+    # we check for file existence rather than AC_PATH_PROG.
+    if test -z "$SOUPER_PASS"; then
+        # Try a few common locations relative to the opt binary's prefix.
+        opt_prefix=`AS_DIRNAME(["$OPT_BIN"]) 2>/dev/null`
+        for candidate in \
+            "$opt_prefix/../lib/libSouperPass.so" \
+            "$opt_prefix/../lib64/libSouperPass.so" \
+            "/usr/lib/libSouperPass.so" \
+            "/usr/local/lib/libSouperPass.so"
+        do
+            if test -f "$candidate"; then
+                SOUPER_PASS="$candidate"
+                break
+            fi
+        done
+    fi
+    if test -z "$SOUPER_PASS" -o ! -f "$SOUPER_PASS"; then
+        AC_MSG_ERROR([--enable-superopt requires libSouperPass.so (use --with-souper-pass=PATH to specify)])
+    fi
+    AC_MSG_NOTICE([  souper pass:     $SOUPER_PASS])
+
+    # libMinotaurPass.so — Minotaur's opt pass plugin.  Same handling.
+    if test -z "$MINOTAUR_PASS"; then
+        opt_prefix=`AS_DIRNAME(["$OPT_BIN"]) 2>/dev/null`
+        for candidate in \
+            "$opt_prefix/../lib/libMinotaurPass.so" \
+            "$opt_prefix/../lib64/libMinotaurPass.so" \
+            "/usr/lib/libMinotaurPass.so" \
+            "/usr/local/lib/libMinotaurPass.so"
+        do
+            if test -f "$candidate"; then
+                MINOTAUR_PASS="$candidate"
+                break
+            fi
+        done
+    fi
+    if test -z "$MINOTAUR_PASS" -o ! -f "$MINOTAUR_PASS"; then
+        AC_MSG_ERROR([--enable-superopt requires libMinotaurPass.so (use --with-minotaur-pass=PATH to specify)])
+    fi
+    AC_MSG_NOTICE([  minotaur pass:   $MINOTAUR_PASS])
+
+    # souper binary — invoked at runtime by the Souper pass.  Optional:
+    # if not given, the pass searches PATH at runtime.  We still check
+    # for it at configure time so we can warn early if it's missing.
     if test -z "$SOUPER_BIN"; then
         AC_PATH_PROG([SOUPER_BIN_AUTO], [souper], [no])
         SOUPER_BIN=$SOUPER_BIN_AUTO
     fi
     if test "x$SOUPER_BIN" = "xno" -o -z "$SOUPER_BIN"; then
-        AC_MSG_ERROR([--enable-superopt requires souper (use --with-souper=PATH to specify)])
+        AC_MSG_WARN([souper binary not found on PATH — the Souper pass will need to find it at runtime via SOUPER_BIN or PATH (use --with-souper=PATH to specify at configure time)])
+        SOUPER_BIN=""
+    else
+        AC_MSG_NOTICE([  souper binary:   $SOUPER_BIN])
     fi
-    AC_MSG_NOTICE([  souper:   $SOUPER_BIN])
-
-    # minotaur — same as souper.
-    if test -z "$MINOTAUR_BIN"; then
-        AC_PATH_PROG([MINOTAUR_BIN_AUTO], [minotaur], [no])
-        MINOTAUR_BIN=$MINOTAUR_BIN_AUTO
-    fi
-    if test "x$MINOTAUR_BIN" = "xno" -o -z "$MINOTAUR_BIN"; then
-        AC_MSG_ERROR([--enable-superopt requires minotaur (use --with-minotaur=PATH to specify)])
-    fi
-    AC_MSG_NOTICE([  minotaur: $MINOTAUR_BIN])
 
     AC_SUBST([CLANG_BIN])
+    AC_SUBST([OPT_BIN])
     AC_SUBST([LLC_BIN])
+    AC_SUBST([SOUPER_PASS])
+    AC_SUBST([MINOTAUR_PASS])
     AC_SUBST([SOUPER_BIN])
-    AC_SUBST([MINOTAUR_BIN])
-
-    # Override CC/CFLAGS so the automake-generated .c.o rule (which
-    # would use gcc) is replaced by our custom superopt rule below.
-    # We still keep CC=gcc for the final link step (handled by the
-    # automake linker rule, which uses CCLD).
-    SUPEROPT_CFLAGS_BASE="$CFLAGS"
-    AC_SUBST([SUPEROPT_CFLAGS_BASE])
 fi
 AM_CONDITIONAL([ENABLE_SUPEROPT], [test "x$enable_superopt" = "xyes"])
 
@@ -191,7 +262,9 @@ AC_MSG_NOTICE([
 
 if test "x$enable_superopt" = "xyes"; then
     AC_MSG_NOTICE([    clang=$CLANG_BIN
+    opt=$OPT_BIN
     llc=$LLC_BIN
-    souper=$SOUPER_BIN
-    minotaur=$MINOTAUR_BIN])
+    souper-pass=$SOUPER_PASS
+    minotaur-pass=$MINOTAUR_PASS
+    souper=$SOUPER_BIN])
 fi

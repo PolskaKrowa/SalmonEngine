@@ -221,7 +221,7 @@ Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for build s
 - [UCI Protocol Specification](http://wbec-ridderkerk.nl/html/UCIProtocol.html)
 - [Bitboards on CPW](https://www.chessprogramming.org/Bitboards)
 - [Souper](https://github.com/google/souper)
-- [Minotaur](https://github.com/niklasso/minotaur)
+- [Minotaur](https://github.com/minotaur-toolkit/minotaur)
 
 ## License
 

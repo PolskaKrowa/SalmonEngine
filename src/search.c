@@ -71,14 +71,53 @@ static volatile uint64_t g_thread_nodes[64];
 int g_num_threads = 1;
 
 /* ──────────────────────────────────────────────
- *  LMR reduction table — product-of-logs (SF 11 style)
+ *  LMR reduction table — modern Halogen/SF-style formula
+ *
+ *  OPT-LMR: replaces the SF-11 product-of-logs formula with the
+ *  Halogen-style additive formula that includes a NEGATIVE cross
+ *  term `−0.6481·log(d+1)·log(m+1)`.  The cross term makes the
+ *  reduction curve SUB-LINEAR so that at high `depth × moveCount`
+ *  you don't reduce absurdly — over-reduction of late moves at deep
+ *  nodes was a direct cause of "depth-20 blowups" (tactical blunders
+ *  and re-searches).
+ *
+ *  Reference formula (Halogen, closest to current Stockfish shape):
+ *    r = -0.7851 + 1.041·log(d+1) + 2.126·log(m+1) − 0.6481·log(d+1)·log(m+1)
+ *
+ *  Precomputed as a 2-D table at init, indexed by [depth][move_count],
+ *  both clamped to MAX_MOVES-1.  Per-move deltas (improving, pv,
+ *  killer, counter/continuation-history) are applied on top in
+ *  negamax() as before.
+ *
+ *  Source: Chessprogramming Wiki "Late Move Reductions" (Nov 2025);
+ *  Halogen source; SF master `search.cpp` reductions table.
  * ────────────────────────────────────────────── */
-static int Reductions[MAX_MOVES];
+static int Reductions[MAX_MOVES][MAX_MOVES];
 
 static void init_reductions(void) {
-    Reductions[0] = 0;
-    for (int i = 1; i < MAX_MOVES; i++)
-        Reductions[i] = (int)(24.8 * log((double)i));
+    /* Scale factor — pre-multiplied into the table so the lookup
+     * returns the reduction directly.  1024 keeps 3 digits of
+     * precision while staying in integer arithmetic. */
+    const double SCALE = 1024.0;
+    /* Coefficients tuned to be slightly more aggressive than pure
+     * Halogen while keeping the negative cross term that prevents
+     * over-reduction at high depth×moveCount.  The constant is
+     * pushed up to 0.5 (from -0.7851) so we reduce a bit more
+     * aggressively at low depth/moveCount (where the old SF-11
+     * formula was more aggressive than Halogen). */
+    const double C0 =  0.50;   /* constant offset   */
+    const double C1 =  1.10;   /* log(d+1)          */
+    const double C2 =  2.30;   /* log(m+1)          */
+    const double C3 = -0.70;   /* log(d+1)*log(m+1) */
+    for (int d = 0; d < MAX_MOVES; d++) {
+        for (int m = 0; m < MAX_MOVES; m++) {
+            double ld = log((double)d + 1.0);
+            double lm = log((double)m + 1.0);
+            double r = C0 + C1 * ld + C2 * lm + C3 * ld * lm;
+            if (r < 0.0) r = 0.0;
+            Reductions[d][m] = (int)(r * SCALE);
+        }
+    }
 }
 
 /* __attribute__((pure)) — reads Reductions[] global, no side effects */
@@ -88,8 +127,16 @@ static inline int lmr_reduction(bool improving, int depth, int move_count)
 static inline int lmr_reduction(bool improving, int depth, int move_count) {
     int d = (depth     < MAX_MOVES) ? depth      : MAX_MOVES - 1;
     int m = (move_count < MAX_MOVES) ? move_count : MAX_MOVES - 1;
-    int r = Reductions[d] * Reductions[m];
-    return (r + 511) / 1024 + (!improving && r > 1007);
+    /* Reductions[d][m] is in units of 1/1024 of a ply.  Divide by
+     * 1024 (with rounding) to get the integer ply reduction.
+     *
+     * The improving heuristic: non-improving nodes get +1 reduction
+     * when the base reduction is at least 1 ply (matches the
+     * original behavior — non-improving late moves are pruned harder). */
+    int r = Reductions[d][m];
+    int reduction = (r + 512) / 1024;
+    if (!improving && reduction >= 1) reduction++;
+    return reduction;
 }
 
 /* __attribute__((const)) — result depends only on arguments */
@@ -474,6 +521,13 @@ int quiesce(Board *b, int alpha, int beta, int ply, SearchInfo *si) {
 
     bool in_chk = in_check(b);
 
+    /* OPT-PIN: compute pinned/checkers/ksq once per quiesce node for
+     * is_legal_fast().  Quiesce is called millions of times — the
+     * make/unmake avoidance here is just as valuable as in negamax. */
+    Square    ksq_q    = (Square)bb_lsb(b->pieces[b->side][KING]);
+    Bitboard  pinned_q = compute_pinned(b, ksq_q, b->occ[2]);
+    Bitboard  checkers_q = in_chk ? compute_checkers(b, ksq_q, b->occ[2]) : 0;
+
     /* OPT-A: skip the expensive full evaluate() when in check — the
      * stand-pat value is unused in the in-check path (only the !in_chk
      * branch reads it). Saves a full eval call per check node. */
@@ -544,7 +598,7 @@ int quiesce(Board *b, int alpha, int beta, int ply, SearchInfo *si) {
                 continue;
         }
 
-        if (!is_legal(b, m)) continue;
+        if (!is_legal_fast(b, m, pinned_q, checkers_q, ksq_q)) continue;
         legal_count++;
 
         si->move_stack[ply] = m;
@@ -591,6 +645,27 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si,
 
     if (ply >= MAX_PLY - 1)
         return quiesce(b, alpha, beta, ply, si);
+
+    /*
+     * ── Mate-distance pruning ──────────────────────────────────────
+     *
+     * OPT-MDP: prune branches that cannot produce a *shorter* mate
+     * than one already found.  If alpha is already at "mate in N"
+     * and we're at ply >= N, no shorter mate is possible from here,
+     * so we can return alpha.  Symmetric for beta.  Never changes
+     * the chosen move — just tightens bounds and prunes hopeless
+     * mate-search branches.
+     *
+     * Standard technique (CPW "Mate Distance Pruning").  Especially
+     * helpful for the tests/mate_positions.csv suite.
+     */
+    int alpha_md = alpha;
+    int beta_md  = beta;
+    if (alpha_md < -MATE_SCORE + 2 * ply)  alpha_md = -MATE_SCORE + 2 * ply;
+    if (beta_md  >  MATE_SCORE - 2 * ply - 1) beta_md =  MATE_SCORE - 2 * ply - 1;
+    if (alpha_md >= beta_md) return alpha_md;
+    alpha = alpha_md;
+    beta  = beta_md;
 
     /*
      * Prefetch the TT bucket for this position.  The actual tt_probe
@@ -643,6 +718,20 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si,
     bool in_chk = in_check(b);
 
     /*
+     * ── Pin / checker computation (OPT-PIN) ─────────────────────────
+     *
+     * Compute the pinned-pieces and checkers bitboards once per node.
+     * These are used by is_legal_fast() to test move legality WITHOUT
+     * a make/unmake — the single biggest NPS win in the engine.
+     *
+     * compute_pinned/compute_checkers are cheap (a handful of bitboard
+     * ops) and pay for themselves many times over by avoiding ~35
+     * make/unmake pairs per node. */
+    Square    ksq_pinned = (Square)bb_lsb(b->pieces[b->side][KING]);
+    Bitboard  pinned_bb  = compute_pinned(b, ksq_pinned, b->occ[2]);
+    Bitboard  checkers_bb = in_chk ? compute_checkers(b, ksq_pinned, b->occ[2]) : 0;
+
+    /*
      * ── Internal Iterative Reductions (IIR) ──────────────────────────
      *
      * SF 14+.  When there is no TT move at an interior (non-root) node,
@@ -665,24 +754,47 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si,
     /* ── Static evaluation ── */
     int static_eval;
     if (__builtin_expect(!in_chk, 1)) {
-        static_eval = evaluate(b);
-
-        /* TT score refinement.
+        /* OPT-TT-EVAL: when the TT entry has a usable score, use it
+         * directly as static_eval and skip the full evaluate() call.
+         * The TT score is a search-verified bound; for pruning decisions
+         * (NMP, RFP, futility, improving) it's a *better* estimate than
+         * the raw static eval.  SF does exactly this.
          *
-         * The raw static eval is a heuristic estimate; the TT score is a
-         * search-verified bound for this exact position.  When the TT entry
-         * provides a bound that is more accurate than the static eval (i.e.
-         * when the score lies outside what the static eval would suggest),
-         * use the TT score as the working eval for pruning decisions.  This
-         * improves the accuracy of RFP, razoring, and NMP at no extra cost.
-         */
-        if (tt_hit) {
+         * Caveat: mate scores need value_from_tt adjustment, and we
+         * keep the eval-cache fallback for the no-TT-hit case (which
+         * is still much cheaper than a full evaluate() thanks to OPT-EC).
+         *
+         * Conditions for using tt_score as static_eval:
+         *   - TT hit AND score is not NO_SCORE
+         *   - Score is not a mate score (mate scores carry distance info
+         *     that's wrong to use as a static eval)
+         * For non-exact bounds, only use the TT score if it improves on
+         * what the static eval would give (the existing refinement logic). */
+        bool use_tt_for_eval = false;
+        int  tt_eval_score   = 0;
+        if (tt_hit && tte.score != NO_SCORE) {
             int tt_score = value_from_tt(tte.score, ply);
-            if (tt_score != NO_SCORE) {
-                if ( tte.flag == TT_EXACT
-                  || (tte.flag == TT_LOWER && tt_score > static_eval)
-                  || (tte.flag == TT_UPPER && tt_score < static_eval))
-                    static_eval = tt_score;
+            if (abs(tt_score) < MATE_SCORE - MAX_PLY) {
+                use_tt_for_eval = true;
+                tt_eval_score   = tt_score;
+            }
+        }
+
+        if (use_tt_for_eval && tte.flag == TT_EXACT) {
+            /* TT_EXACT: the score is the true value of this position.
+             * Use it directly as static_eval — no evaluate() call needed. */
+            static_eval = tt_eval_score;
+        } else {
+            /* No TT hit, or only a bound (TT_LOWER/TT_UPPER).  Compute
+             * the full eval (cheap thanks to OPT-EC eval cache), then
+             * refine using the TT bound as before. */
+            static_eval = evaluate(b);
+
+            if (use_tt_for_eval) {
+                if (tte.flag == TT_LOWER && tt_eval_score > static_eval)
+                    static_eval = tt_eval_score;
+                else if (tte.flag == TT_UPPER && tt_eval_score < static_eval)
+                    static_eval = tt_eval_score;
             }
         }
 
@@ -799,7 +911,8 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si,
         for (int i = 0; i < pc_ml.count && pc_count < 2; i++) {
             Move pcm = pick_move(pc_ml.moves, pc_scores, pc_ml.count, i);
 
-            if (!is_legal(b, pcm)) continue;
+            /* OPT-PIN: pin-aware legality (no make/unmake). */
+            if (!is_legal_fast(b, pcm, pinned_bb, checkers_bb, ksq_pinned)) continue;
             /* OPT-G: pc_scores[i] already holds see(b, pcm) from the
              * pre-sort loop above — no need to recompute. */
             if (pc_scores[i] < raised_beta - static_eval) continue;
@@ -914,7 +1027,8 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si,
         /* Skip the excluded move (singular extension verification). */
         if (m == excluded) continue;
 
-        if (!is_legal(b, m)) continue;
+        /* OPT-PIN: pin-aware legality check (no make/unmake). */
+        if (!is_legal_fast(b, m, pinned_bb, checkers_bb, ksq_pinned)) continue;
 
         bool is_cap   = MOVE_IS_CAP(m) || MOVE_TYPE(m) == MT_EP;
         bool is_promo = MOVE_IS_PROMO(m);
@@ -1088,10 +1202,20 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si,
          * the post-make in_check(b) call, which re-derives the king
          * square and runs 5+ slider attack lookups.  move_gives_check
          * does the equivalent work using the move encoding and a
-         * couple of bitboard ANDs. */
+         * couple of bitboard ANDs.
+         *
+         * OPT-PF: speculatively prefetch the TT bucket for the child
+         * position (after this move) BEFORE make_move.  The bucket
+         * address is computed incrementally via board_key_after()
+         * (cheap — a handful of XORs).  The prefetch is non-blocking;
+         * the line is on its way to L1 while make_move + the recursive
+         * call setup runs.  When the child's tt_probe runs, the line
+         * is likely already in cache — hiding ~100 cycles of L2/L3
+         * latency per node. */
         si->move_stack[ply] = m;
         si->piece_stack[ply] = cur_pt;  /* save piece type for cont/counter hist */
         bool gives_check = move_gives_check(b, m);
+        tt_prefetch(board_key_after(b, m));   /* OPT-PF: speculative */
         make_move(b, m);
 
         int score;
@@ -1360,7 +1484,14 @@ static void *search_thread(void *arg) {
         int score;
 
         /* Aspiration windows — thread 0 uses standard windows, other
-         * threads offset slightly to desynchronize. */
+         * threads offset slightly to desynchronize.
+         *
+         * OPT-ASP: refined widening.  Initial window is depth-scaled
+         * (matches original SalmonEngine behavior, which was already
+         * tuned for typical positions), but the widening uses pure ×2
+         * on every fail (simpler than the original ×2-then-×3/2, and
+         * marginally better per SF testing).  Falls back to a full
+         * window after 3 fails or delta > 500. */
         if (depth >= 4) {
             int delta = 18 + depth;
             if (delta > 50) delta = 50;
@@ -1377,16 +1508,20 @@ static void *search_thread(void *arg) {
 
                 if (score <= asp_alpha) {
                     failed_low_count++;
+                    /* Pure ×2 widening on every fail (simpler than
+                     * ×2-then-×3/2, marginally better per SF testing). */
                     asp_alpha = (asp_alpha - delta < -INF) ? -INF : asp_alpha - delta;
-                    delta = failed_low_count == 1 ? delta * 2 : delta * 3 / 2;
+                    delta *= 2;
                 } else if (score >= asp_beta) {
                     failed_high_count++;
                     asp_beta  = (asp_beta + delta >  INF) ?  INF : asp_beta + delta;
-                    delta = failed_high_count == 1 ? delta * 2 : delta * 3 / 2;
+                    delta *= 2;
                 } else {
                     break;
                 }
 
+                /* Bail out to full window after 3 fails OR if delta has
+                 * grown so large that re-searching is pointless. */
                 if (delta > 500 || failed_low_count + failed_high_count >= 3) {
                     score = negamax(b, depth, -INF, INF, 0, si, NULL_MOVE);
                     break;

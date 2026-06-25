@@ -184,6 +184,19 @@ bool is_square_attacked(const Board *b, Square sq, Color attacker) {
     return false;
 }
 
+/* OPT-PIN: occupancy-parameterised version for king-move legality. */
+bool is_square_attacked_with_occ(const Board *b, Square sq, Color attacker,
+                                  Bitboard occ) {
+    if (PAWN_ATTACKS[attacker ^ 1][sq] & b->pieces[attacker][PAWN])   return true;
+    if (KNIGHT_ATTACKS[sq]             & b->pieces[attacker][KNIGHT])  return true;
+    if (KING_ATTACKS[sq]               & b->pieces[attacker][KING])    return true;
+    if (bishop_attacks(sq, occ)        & (b->pieces[attacker][BISHOP]
+                                        | b->pieces[attacker][QUEEN])) return true;
+    if (rook_attacks(sq, occ)          & (b->pieces[attacker][ROOK]
+                                        | b->pieces[attacker][QUEEN])) return true;
+    return false;
+}
+
 bool in_check(const Board *b) {
     int king_sq = bb_lsb(b->pieces[b->side][KING]);
     return is_square_attacked(b, (Square)king_sq, (Color)(b->side ^ 1));
@@ -407,4 +420,107 @@ uint64_t perft(Board *b, int depth) {
         unmake_move(b);
     }
     return nodes;
+}
+
+/* ──────────────────────────────────────────────
+ *  board_key_after — incremental Zobrist hash for the position after
+ *  playing move `m`, without calling make_move.  Used for speculative
+ *  TT prefetch (OPT-PF).
+ *
+ *  The hash delta must EXACTLY match what make_move XORs — otherwise
+ *  the speculative prefetch points at the wrong TT bucket.  We
+ *  replicate the logic of make_move's hash updates:
+ *
+ *    1. Remove old castle + EP keys (XOR off)
+ *    2. Apply castle-rights mask (from/to squares)
+ *    3. Add new castle key (XOR on)
+ *    4. Remove captured piece (if any)
+ *    5. Move piece (remove from, add to) OR handle promotion
+ *    6. Move castling rook (if castle)
+ *    7. Set new EP square (if double-push)
+ *    8. Flip side-to-move
+ *
+ *  We need the castle_mask table here too — duplicate it (small).
+ *  See make_move() for the authoritative version.
+ * ────────────────────────────────────────────── */
+static const int board_castle_mask[64] = {
+    /* a1 */ ~CR_WQ,             /* b1 */ ~0, ~0, ~0,
+    /* e1 */ ~(CR_WK|CR_WQ),     /* f1 */ ~0, ~0,
+    /* h1 */ ~CR_WK,
+    /* a2..h2 */ ~0, ~0, ~0, ~0, ~0, ~0, ~0, ~0,
+    /* a3..h3 */ ~0, ~0, ~0, ~0, ~0, ~0, ~0, ~0,
+    /* a4..h4 */ ~0, ~0, ~0, ~0, ~0, ~0, ~0, ~0,
+    /* a5..h5 */ ~0, ~0, ~0, ~0, ~0, ~0, ~0, ~0,
+    /* a6..h6 */ ~0, ~0, ~0, ~0, ~0, ~0, ~0, ~0,
+    /* a7..h7 */ ~0, ~0, ~0, ~0, ~0, ~0, ~0, ~0,
+    /* a8 */ ~CR_BQ,             /* b8 */ ~0, ~0, ~0,
+    /* e8 */ ~(CR_BK|CR_BQ),     /* f8 */ ~0, ~0,
+    /* h8 */ ~CR_BK
+};
+
+uint64_t board_key_after(const Board *b, Move m) {
+    Color  us   = b->side;
+    Color  them = us ^ 1;
+    Square from = MOVE_FROM(m);
+    Square to   = MOVE_TO(m);
+    MoveType mt = MOVE_TYPE(m);
+
+    uint64_t h = b->hash;
+
+    /* 1. Remove old castle + EP keys (XOR off, since they were XORed on) */
+    h ^= ZKEYS.castle[b->castle];
+    if (b->ep_sq != NO_SQ) h ^= ZKEYS.ep[b->ep_sq & 7];
+
+    /* 2-3. Castle rights change (apply mask).  We compute the new
+     * castle rights and XOR on the new key.  make_move does the
+     * same with `b->castle &= castle_mask[from] & castle_mask[to]`. */
+    int new_castle = b->castle & board_castle_mask[from] & board_castle_mask[to];
+    h ^= ZKEYS.castle[new_castle];
+
+    /* 4. Remove captured piece (regular capture or EP) */
+    if (mt == MT_CAPTURE || mt >= MT_N_PROMO_CAP) {
+        Piece cap = b->mailbox[to];
+        h ^= ZKEYS.piece[them][piece_type(cap)][to];
+    } else if (mt == MT_EP) {
+        Square ep_cap = (us == WHITE) ? (Square)(to - 8) : (Square)(to + 8);
+        h ^= ZKEYS.piece[them][PAWN][ep_cap];
+    }
+
+    /* 5. Move piece (or promotion) */
+    if (mt >= MT_N_PROMO) {
+        /* Promotion: remove pawn from `from`, add promoted piece at `to` */
+        h ^= ZKEYS.piece[us][PAWN][from];
+        PieceType promo = MOVE_PROMO_PT(m);
+        h ^= ZKEYS.piece[us][promo][to];
+    } else {
+        /* Normal move: remove piece from `from`, add at `to` */
+        Piece moving = b->mailbox[from];
+        PieceType pt = piece_type(moving);
+        h ^= ZKEYS.piece[us][pt][from];
+        h ^= ZKEYS.piece[us][pt][to];
+    }
+
+    /* 6. Castling rook move (king-side or queen-side) */
+    if (mt == MT_KCASTLE) {
+        Square rf = (us == WHITE) ? H1 : H8;
+        Square rt = (us == WHITE) ? F1 : F8;
+        h ^= ZKEYS.piece[us][ROOK][rf];
+        h ^= ZKEYS.piece[us][ROOK][rt];
+    } else if (mt == MT_QCASTLE) {
+        Square rf = (us == WHITE) ? A1 : A8;
+        Square rt = (us == WHITE) ? D1 : D8;
+        h ^= ZKEYS.piece[us][ROOK][rf];
+        h ^= ZKEYS.piece[us][ROOK][rt];
+    }
+
+    /* 7. New EP square (double pawn push only) */
+    if (mt == MT_DPUSH) {
+        int ep_sq = (us == WHITE) ? (int)(to - 8) : (int)(to + 8);
+        h ^= ZKEYS.ep[ep_sq & 7];
+    }
+
+    /* 8. Side to move */
+    h ^= ZKEYS.black_to_move;
+
+    return h;
 }

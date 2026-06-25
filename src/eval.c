@@ -541,6 +541,61 @@ static void pawn_cache_store(Bitboard wp, Bitboard bp, Color us, int mg, int eg)
 }
 
 /* ──────────────────────────────────────────────
+ *  Eval cache (full evaluate() result)
+ *
+ *  OPT-EC: separate from the pawn cache above.  Keyed on the full
+ *  Zobrist hash (so it accounts for all pieces, side to move, castle
+ *  rights, EP square).  Direct-mapped with EVAL_CACHE_SIZE entries
+ *  (64K × 12 bytes ≈ 768 KB — fits in L2 on modern CPUs).
+ *
+ *  At high search depth the transposition rate climbs sharply, so
+ *  caching the full evaluate() result — which is otherwise recomputed
+ *  at every node for static_eval / NMP / RFP / futility — yields a
+ *  large NPS win at depth 15+.
+ *
+ *  Validity: the cache stores the score from the side-to-move
+ *  perspective (same convention as evaluate()).  Stale entries are
+ *  safe — a key mismatch on probe just causes a re-eval.  No
+ *  invalidation is needed across moves; tt_clear() (called on
+ *  ucinewgame) wipes the cache via eval_cache_clear().
+ * ────────────────────────────────────────────── */
+typedef struct {
+    uint64_t key;
+    int16_t  score;   /* from side-to-move perspective */
+    uint8_t  valid;
+} EvalCacheEntry;
+
+static EvalCacheEntry eval_cache[EVAL_CACHE_SIZE];
+
+static inline unsigned eval_cache_idx(uint64_t key) {
+    /* Mix the high bits down into the low 16 — Zobrist keys are
+     * already well-distributed, but a final mix guards against
+     * pathological FEN families. */
+    uint64_t k = key ^ (key >> 32);
+    return (unsigned)k & (EVAL_CACHE_SIZE - 1);
+}
+
+bool eval_cache_probe(uint64_t key, int *score) {
+    EvalCacheEntry *e = &eval_cache[eval_cache_idx(key)];
+    if (e->valid && e->key == key) {
+        *score = e->score;
+        return true;
+    }
+    return false;
+}
+
+void eval_cache_store(uint64_t key, int score) {
+    EvalCacheEntry *e = &eval_cache[eval_cache_idx(key)];
+    e->key   = key;
+    e->score = (int16_t)score;
+    e->valid = 1;
+}
+
+void eval_cache_clear(void) {
+    memset(eval_cache, 0, sizeof(eval_cache));
+}
+
+/* ──────────────────────────────────────────────
  *  Pawn structure evaluation (one side)
  * ────────────────────────────────────────────── */
 static void eval_pawns_uncached(const Board *b, Color us, int *mg, int *eg) {
@@ -2015,6 +2070,14 @@ static int lazy_score(const Board *b, int phase, int *mg_out, int *eg_out) {
  *  Main evaluation
  * ────────────────────────────────────────────── */
 int evaluate(const Board *b) {
+    /* OPT-EC: probe the eval cache first.  At high search depth the
+     * same position is evaluated many times via transpositions — the
+     * cache turns a ~5μs full eval into a ~5ns cache hit. */
+    int cached_score;
+    if (eval_cache_probe(b->hash, &cached_score)) {
+        return cached_score;
+    }
+
     int phase = game_phase(b);
 
     /*
@@ -2042,6 +2105,9 @@ int evaluate(const Board *b) {
         __dbg_lazy.final_score = lazy_ret;
         eval_debug_record(b, &__dbg_lazy);
 #endif
+        /* OPT-EC: cache the lazy result too — it's still a valid eval
+         * for this position and will be the same on every re-eval. */
+        eval_cache_store(b->hash, lazy_ret);
         return lazy_ret;
     }
 
@@ -2386,5 +2452,7 @@ int evaluate(const Board *b) {
     eval_debug_record(b, &__dbg);
 #endif
 
+    /* OPT-EC: cache the full eval result. */
+    eval_cache_store(b->hash, final_score);
     return final_score;
 }

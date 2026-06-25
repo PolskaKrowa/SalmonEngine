@@ -347,10 +347,43 @@ void bitboard_init(void) {
     init_between_line();
     init_pext_tables();
 
-    /* Runtime CPU dispatch. */
+    /* Runtime CPU dispatch.
+     *
+     * OPT-PEXT: pick PEXT on Intel (fast hardware instruction), HQ on
+     * AMD Zen (PEXT is microcoded and ~3× slower than magic bitboards
+     * on Zen 1/2; Zen 3+ is better but still slower than Intel).  We
+     * detect AMD by checking the CPU vendor string.
+     *
+     * Source: TalkChess t=72538 "PEXT/PDEP are even slower than you
+     * think on Zen"; backscattering.de magics2.pdf benchmark.
+     *
+     * On non-x86 architectures, we always use HQ (PEXT is x86-only).
+     */
     bool has_bmi2 = __builtin_cpu_supports("bmi2");
-    rook_dispatch   = has_bmi2 ? rook_attacks_pext   : rook_attacks_hq;
-    bishop_dispatch = has_bmi2 ? bishop_attacks_pext : bishop_attacks_hq;
+    bool is_amd = false;
+#if defined(__x86_64__) || defined(__i386__)
+    {
+        /* CPUID vendor string check.  EAX=0 returns the 12-char vendor
+         * ID in EBX:EDX:ECX.  AMD = "AuthenticAMD". */
+        unsigned int eax, ebx, ecx, edx;
+        __asm__ __volatile__(
+            "cpuid"
+            : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+            : "a"(0)
+        );
+        char vendor[13];
+        *(unsigned int*)(vendor + 0) = ebx;
+        *(unsigned int*)(vendor + 4) = edx;
+        *(unsigned int*)(vendor + 8) = ecx;
+        vendor[12] = '\0';
+        if (strcmp(vendor, "AuthenticAMD") == 0) {
+            is_amd = true;
+        }
+    }
+#endif
+    bool use_pext = has_bmi2 && !is_amd;
+    rook_dispatch   = use_pext ? rook_attacks_pext   : rook_attacks_hq;
+    bishop_dispatch = use_pext ? bishop_attacks_pext : bishop_attacks_hq;
 }
 
 /* ──────────────────────────────────────────────

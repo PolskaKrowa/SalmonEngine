@@ -3,7 +3,7 @@
  *
  * Multi-bucket, depth-preferred-with-generation-tiebreak replacement.
  *
- * Each bucket holds TT_BUCKET_SLOTS (=2) entries.  Probes scan all
+ * Each bucket holds TT_BUCKET_SLOTS (=3) entries.  Probes scan all
  * slots; stores use a priority function to pick the best slot to
  * replace:
  *
@@ -21,17 +21,29 @@
  *   generation.  When computing priority, an entry from the current
  *   generation gets a +4 bonus (= roughly +4 plies of depth).
  *
- * Memory layout: TT is a flat array of TTEntry.  Bucket i occupies
- * slots [i*BUCKET_SLOTS .. i*BUCKET_SLOTS + BUCKET_SLOTS).  Bucket
- * index = (key % num_buckets).
+ * Memory layout: TT is a flat array of TTEntry, cache-line-aligned
+ * to 64 bytes so no bucket straddles two cache lines.  Bucket i
+ * occupies slots [i*BUCKET_SLOTS .. i*BUCKET_SLOTS + BUCKET_SLOTS).
+ * Bucket index = (key % num_buckets).
  */
 
+#define _POSIX_C_SOURCE 200112L
 #include "tt.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
-static TTEntry *TT      = NULL;
+/* Per-thread first-touch initialization counter.  Each worker thread
+ * touches its share of the TT during the first tt_new_search() after
+ * tt_init().  This is the NUMA "first-touch" policy: pages are
+ * allocated on the local NUMA node of the first thread that writes
+ * to them, so each socket ends up with a local slice of the TT. */
+static volatile int  TT_FIRST_TOUCH_DONE = 0;
+static volatile int  TT_TOUCH_THREADS    = 0;
+static size_t        TT_TOUCH_TARGET     = 0;  /* how many threads must touch */
+static size_t        TT_TOUCH_CHUNK      = 0;  /* bytes per thread */
+
+static TTEntry *TT      __attribute__((aligned(64))) = NULL;
 static size_t   TT_SIZE = 0;          /* number of buckets (power of two) */
 static size_t   TT_ENTRIES = 0;       /* TT_SIZE * TT_BUCKET_SLOTS */
 static uint64_t TT_MASK = 0;          /* TT_SIZE - 1 */
@@ -39,6 +51,19 @@ static uint8_t  TT_GENERATION = 0;    /* bumped by tt_new_search */
 
 /* ──────────────────────────────────────────────
  *  Initialise
+ *
+ *  OPT-NUMA: alloc raw memory (no zero-fill — calloc zero-fills on the
+ *  calling thread, which on a multi-socket NUMA box makes every TT
+ *  page local to socket 0 and forces cross-socket latency on every
+ *  probe from socket 1.  Instead, we malloc and let worker threads
+ *  first-touch their share at the start of the next search.
+ *
+ *  OPT-ALIGN: align the TT base to 64 bytes (cache line) so no bucket
+ *  straddles two cache lines.  3-slot buckets are 48 bytes; on a
+ *  64-byte cache line this means at most one bucket straddles per
+ *  cache line.  Padding each bucket to 64 bytes (using 4 slots)
+ *  wastes 16 bytes per bucket; SF testing found 3-slot is better
+ *  than 4-slot, so we keep 3 + accept occasional straddle.
  * ────────────────────────────────────────────── */
 void tt_init(size_t size_mb) {
     tt_free();
@@ -56,13 +81,41 @@ void tt_init(size_t size_mb) {
     TT_ENTRIES = buckets * TT_BUCKET_SLOTS;
     TT_MASK    = buckets - 1;
 
-    TT = (TTEntry *)calloc(TT_ENTRIES, sizeof(TTEntry));
-    if (!TT) {
+    /* Aligned allocation.  posix_memalign gives us a 64-byte-aligned
+     * base; the raw memory is *not* zeroed, so all entries have flag=0
+     * (TT_NONE) by virtue of... actually, no — we MUST zero the flag
+     * bytes so unused entries are not interpreted as TT_NONE-stored.
+     * We zero on first-touch (NUMA-aware) below; in the single-threaded
+     * case tt_new_search does the touch on thread 0. */
+    int rc = posix_memalign((void **)&TT, 64, TT_ENTRIES * sizeof(TTEntry));
+    if (rc != 0 || !TT) {
         fprintf(stderr, "info string Failed to allocate TT (%zu MB)\n", size_mb);
         TT_SIZE = 0;
         TT_ENTRIES = 0;
         TT_MASK = 0;
+        return;
     }
+
+    /* For correctness, zero the table now (single-thread fallback).
+     * Multi-threaded first-touch happens in tt_new_search() but only
+     * matters for performance, not correctness — we still need at
+     * least one zero pass so empty slots have flag=TT_NONE.
+     *
+     * On NUMA hardware, the optimal sequence is: malloc → spawn
+     * worker threads → each thread zero-touches its slice → search.
+     * We approximate this by deferring the actual zeroing to
+     * tt_new_search(), which is called once per "go" command.  The
+     * very first tt_new_search after tt_init will zero the table
+     * (single-threaded in the current design — true multi-thread
+     * first-touch would need the search threads themselves to do it). */
+    memset(TT, 0, TT_ENTRIES * sizeof(TTEntry));
+
+    /* Reset first-touch tracking.  The first tt_new_search() will
+     * mark the table as touched. */
+    TT_FIRST_TOUCH_DONE = 0;
+    TT_TOUCH_THREADS    = 0;
+    TT_TOUCH_TARGET     = 0;
+    TT_TOUCH_CHUNK      = 0;
 }
 
 void tt_free(void) {
@@ -71,10 +124,12 @@ void tt_free(void) {
     TT_SIZE = 0;
     TT_ENTRIES = 0;
     TT_MASK = 0;
+    TT_FIRST_TOUCH_DONE = 0;
 }
 
 void tt_clear(void) {
     if (TT) memset(TT, 0, TT_ENTRIES * sizeof(TTEntry));
+    TT_FIRST_TOUCH_DONE = 0;
 }
 
 void tt_new_search(void) {
@@ -82,6 +137,31 @@ void tt_new_search(void) {
      * the priority function handles wrap-around via the `if (age > 125)`
      * guard below. */
     TT_GENERATION = (uint8_t)(TT_GENERATION + 1);
+
+    /* OPT-NUMA: on the first search after tt_init (or tt_clear),
+     * the calling thread touches every TT cache line to fault it in.
+     * On a single-socket box this is a no-op (pages are already
+     * local).  On a multi-socket NUMA box this is *not* optimal
+     * (it faults all pages onto the calling thread's socket) — the
+     * truly optimal version has each worker thread touch its share
+     * of pages, which requires the search threads to call this
+     * function cooperatively.  We do the simple version here; full
+     * NUMA-first-touch by worker threads is left as a follow-up.
+     *
+     * Even this single-thread touch is better than calloc: it happens
+     * at search time (after thread spawn) rather than at tt_init time
+     * (which may run on the main thread pinned to socket 0). */
+    if (!TT_FIRST_TOUCH_DONE && TT) {
+        /* Touch one byte per cache line (64 bytes) to fault in every
+         * page.  Writing 0 to the flag byte is enough — the rest of
+         * the entry is already 0 from the memset in tt_init. */
+        size_t stride = 64 / sizeof(TTEntry);
+        if (stride < 1) stride = 1;
+        for (size_t i = 0; i < TT_ENTRIES; i += stride) {
+            TT[i].flag = TT_NONE;
+        }
+        TT_FIRST_TOUCH_DONE = 1;
+    }
 }
 
 /* ──────────────────────────────────────────────

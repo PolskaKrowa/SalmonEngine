@@ -2,6 +2,7 @@
 #include "uci.h"
 #include "movegen.h"
 #include "tt.h"
+#include "eval.h"
 #include "book.h"
 #include <stdio.h>
 #include <string.h>
@@ -236,6 +237,7 @@ static void handle_setoption(const char *line) {
         int mb = atoi(val);
         if (mb < 1) mb = 1;
         tt_init((size_t)mb);
+        eval_cache_clear();   /* OPT-EC: invalidate eval cache on TT resize */
         current_hash_mb = mb;  /* track user's manual setting */
     } else if (strncasecmp(name, "ownbook", 7) == 0
             || strncasecmp(name, "book", 4) == 0) {
@@ -254,6 +256,7 @@ static void handle_setoption(const char *line) {
         int recommended_mb = DEFAULT_HASH_MB * (n > 2 ? (n + 1) / 2 : 1);
         if (recommended_mb != current_hash_mb) {
             tt_init((size_t)recommended_mb);
+            eval_cache_clear();
             current_hash_mb = recommended_mb;
         }
     }
@@ -342,6 +345,7 @@ void uci_loop(Board *b) {
                 wait_for_search_thread();
             }
             tt_clear();
+            eval_cache_clear();   /* OPT-EC: invalidate eval cache on new game */
             board_start_pos(b);
         } else if (strncmp(line, "position", 8) == 0) {
             /* If a ponder search is running, stop it first (the GUI

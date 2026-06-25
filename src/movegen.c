@@ -215,6 +215,156 @@ bool is_legal(Board *b, Move m) {
 }
 
 /* ──────────────────────────────────────────────
+ *  Pin and checker computation (OPT-PIN)
+ *
+ *  compute_pinned: find pieces of the side-to-move that are pinned
+ *  to their king by an enemy slider.  A piece P on square `p_sq` is
+ *  pinned iff:
+ *    - There exists an enemy rook/queen on a rook line through ksq
+ *      (or bishop/queen on a diagonal line through ksq), AND
+ *    - P is the ONLY piece between the slider and the king.
+ *
+ *  Algorithm (standard "x-ray" pin detection):
+ *    1. Find candidate pinners = enemy sliders that, with the king's
+ *       square removed from occupancy, attack the king's square.
+ *       (Removing the king simulates "what would attack the king if
+ *       nothing were in the way" — sliders that *would* attack the
+ *       king if every blocker were removed.)
+ *    2. For each candidate pinner, the squares between it and the king
+ *       (BETWEEN_BB) hold the potential blockers.  If exactly one of
+ *       our pieces sits in that range, it's pinned.
+ *
+ *  Source: Peter Ellis Jones, "Generating Legal Chess Moves Efficiently";
+ *  chess.stackexchange.com q25137.
+ * ────────────────────────────────────────────── */
+Bitboard compute_pinned(const Board *b, Square ksq, Bitboard occ) {
+    Color us = b->side;
+    Color them = us ^ 1;
+
+    /* Remove ALL our pieces from occupancy — this exposes enemy sliders
+     * that sit behind our pieces on lines to the king.  These are the
+     * "candidate pinners" (x-ray attackers).
+     *
+     * Note: we do NOT remove the king itself.  The king is the origin
+     * of the attack computation, not a blocker on a ray.  Removing our
+     * pieces lets the slider attacks pass through where our pieces were,
+     * reaching enemy sliders that would attack the king if our pieces
+     * weren't there. */
+    Bitboard occ_no_us = occ & ~b->occ[us];
+
+    /* Candidate pinners: enemy sliders that attack ksq when our pieces
+     * are removed from occupancy.  This includes BOTH direct attackers
+     * (checkers — 0 of our pieces between) and x-ray attackers
+     * (pinners — 1+ of our pieces between).  The "exactly one between"
+     * check below filters to just the pinners. */
+    Bitboard rook_candidates =
+        (rook_attacks(ksq, occ_no_us)
+         & (b->pieces[them][ROOK] | b->pieces[them][QUEEN]));
+    Bitboard bishop_candidates =
+        (bishop_attacks(ksq, occ_no_us)
+         & (b->pieces[them][BISHOP] | b->pieces[them][QUEEN]));
+
+    Bitboard pinners = rook_candidates | bishop_candidates;
+    Bitboard pinned  = 0;
+
+    while (pinners) {
+        Square pinner_sq = (Square)bb_pop(&pinners);
+        /* Squares strictly between pinner and king. */
+        Bitboard between = BETWEEN_BB[ksq][pinner_sq];
+        /* Our pieces in the between range. */
+        Bitboard our_blockers = between & b->occ[us];
+        /* Pinned iff exactly one of our pieces is between (0 = direct
+         * check, 2+ = double-blocked, neither is a pin). */
+        if (our_blockers && !(our_blockers & (our_blockers - 1))) {
+            pinned |= our_blockers;
+        }
+    }
+    return pinned;
+}
+
+Bitboard compute_checkers(const Board *b, Square ksq, Bitboard occ) {
+    Color them = b->side ^ 1;
+    Bitboard checkers = 0;
+
+    /* Pawn checks: a pawn of `them` checks `ksq` iff ksq is attacked
+     * by a them-pawn.  PAWN_ATTACKS[us][ksq] gives the squares from
+     * which an us-pawn would attack ksq — but we want where THEM
+     * pawns sit that attack ksq, which is the same set by symmetry
+     * (pawn attacks are mutual along diagonals). */
+    checkers |= PAWN_ATTACKS[b->side][ksq] & b->pieces[them][PAWN];
+    checkers |= KNIGHT_ATTACKS[ksq]       & b->pieces[them][KNIGHT];
+    checkers |= KING_ATTACKS[ksq]         & b->pieces[them][KING];
+    checkers |= bishop_attacks(ksq, occ)  & (b->pieces[them][BISHOP]
+                                           | b->pieces[them][QUEEN]);
+    checkers |= rook_attacks(ksq, occ)    & (b->pieces[them][ROOK]
+                                           | b->pieces[them][QUEEN]);
+    return checkers;
+}
+
+/* ──────────────────────────────────────────────
+ *  is_legal_fast — pin-aware legality check (OPT-PIN)
+ *
+ *  Avoids the make/unmake of is_legal() in the common case (not in
+ *  check, not a king move, not EP).  Falls back to is_legal() for
+ *  the rare/complex cases.
+ * ────────────────────────────────────────────── */
+bool is_legal_fast(Board *b, Move m, Bitboard pinned, Bitboard checkers,
+                   Square ksq) {
+    Color us = b->side;
+    Square from = MOVE_FROM(m);
+    Square to   = MOVE_TO(m);
+    MoveType mt = MOVE_TYPE(m);
+
+    /* Castling: gen_castling already verified path squares are not
+     * attacked and the king isn't currently in check.  Accept any
+     * castle move the generator emitted. */
+    if (mt == MT_KCASTLE || mt == MT_QCASTLE) return true;
+
+    /* King moves (non-castle): test if `to` is attacked by the
+     * opponent, with the king removed from occupancy (so x-rays
+     * through the king's old square are detected).  For king
+     * CAPTURES, also remove the captured piece from occupancy so
+     * that x-rays THROUGH the captured piece are detected (e.g.
+     * enemy rook behind the captured piece would attack `to`). */
+    if (from == ksq) {
+        Bitboard occ_test = b->occ[2] ^ SQUARE_BB[ksq];
+        /* If `to` has an enemy piece, also remove it (it's being captured). */
+        if (b->mailbox[to] != NO_PIECE) {
+            occ_test ^= SQUARE_BB[to];
+        }
+        return !is_square_attacked_with_occ(b, to, us ^ 1, occ_test);
+    }
+
+    /* En-passant: rare and tricky (can expose discovered check along
+     * the rank of the captured pawn).  Fall back to make/unmake. */
+    if (mt == MT_EP) {
+        return is_legal(b, m);
+    }
+
+    /* In check: only check-evasions are legal.  The evasion rules
+     * (block check, capture checker, can't move a non-king piece
+     * that's also pinned) are complex enough that the make/unmake
+     * fallback is the safe choice. */
+    if (checkers) {
+        /* Single check: must capture the checker, block it, or move
+         * the king.  We could optimize this, but it's a rare case
+         * (typically <5% of nodes) and the make/unmake cost is
+         * amortized across the few evasion moves. */
+        return is_legal(b, m);
+    }
+
+    /* Common case: not in check, not a king move, not EP.
+     * Legal iff the moving piece is not pinned, OR it moves along
+     * the pin ray (i.e., `to` lies on the line through ksq and from). */
+    if (!(pinned & SQUARE_BB[from])) {
+        return true;  /* not pinned — free to move anywhere */
+    }
+    /* Pinned: legal only if `to` is on the same line as ksq and from.
+     * LINE_BB[ksq][from] is the full line through both squares. */
+    return (LINE_BB[ksq][from] & SQUARE_BB[to]) != 0;
+}
+
+/* ──────────────────────────────────────────────
  *  move_gives_check  (OPT-F)
  *
  *  Determine whether playing `m` puts the side-to-move's opponent in

@@ -101,8 +101,40 @@ void unmake_move(Board *b);
 void make_null_move  (Board *b);
 void unmake_null_move(Board *b);
 
+/*
+ * board_key_after — compute the Zobrist hash of the position AFTER
+ * playing move `m`, WITHOUT calling make_move.  Used for speculative
+ * TT prefetch (OPT-PF): the search calls this before make_move so the
+ * TT bucket for the child position is on its way to L1 while the
+ * parent makes the move and sets up the recursive call.
+ *
+ * The hash is computed incrementally by XOR-ing the same Zobrist keys
+ * that make_move would XOR — moving piece (from→to), captured piece,
+ * promotion, EP square, castle rights, side-to-move.
+ *
+ * For non-castling, non-EP, non-promotion quiet moves, this is 4 XORs.
+ * For captures, +2 XORs (remove captured).  For promotion, +2 (remove
+ * pawn, add promo).  For castling, +4 (also move rook).  For EP, +1
+ * (remove captured pawn from its actual square).
+ *
+ * NOTE: this function does NOT validate the move.  It assumes `m` is
+ * a pseudo-legal move in the current position.  Calling it on an
+ * illegal move produces a garbage hash — harmless because the prefetch
+ * is advisory, but the *real* TT probe (after make_move) uses the
+ * correct hash.
+ */
+uint64_t board_key_after(const Board *b, Move m);
+
 /* Utility */
 bool is_square_attacked(const Board *b, Square sq, Color attacker);
+
+/* OPT-PIN: same as is_square_attacked but with a caller-supplied
+ * occupancy bitboard.  Used by is_legal_fast() to test king moves
+ * with the king itself removed from occupancy (so x-rays through
+ * the king's old square are detected). */
+bool is_square_attacked_with_occ(const Board *b, Square sq, Color attacker,
+                                  Bitboard occ);
+
 bool in_check(const Board *b);
 
 /* Perft (for testing correctness) */

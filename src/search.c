@@ -1578,7 +1578,7 @@ static void *search_thread(void *arg) {
          * Thread 0 uses the standard delta (no offset) so its result
          * is the "canonical" search result for the position. */
         if (depth >= 4) {
-            int delta = 18 + depth;
+            int delta = 25 + depth;
             if (delta > 50) delta = 50;
             int asp_alpha = prev_score - delta;
             int asp_beta  = prev_score + delta;
@@ -1770,6 +1770,10 @@ void search(Board *b, SearchLimits *lim) {
         }
         fflush(stdout);
         free(arg);
+
+#ifdef EVAL_PROFILE
+        eval_profile_print();
+#endif
         return;
     }
 
@@ -1895,6 +1899,10 @@ void search(Board *b, SearchLimits *lim) {
     for (int i = 0; i < num_threads && i < 64; i++) {
         free(args[i]);
     }
+
+#ifdef EVAL_PROFILE
+    eval_profile_print();
+#endif
 }
 
 

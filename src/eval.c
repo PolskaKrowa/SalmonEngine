@@ -58,6 +58,17 @@
  * ────────────────────────────────────────────── */
 EvalWeights EW;
 
+/* OPT-PROF: Eval profiling counters (compile with -DEVAL_PROFILE to enable).
+ * These count cache hits/misses and lazy-eval exits so we can measure
+ * the effectiveness of the eval cache and lazy-eval guard. */
+#ifdef EVAL_PROFILE
+#include <stdatomic.h>
+uint64_t g_eval_cache_hits   = 0;
+uint64_t g_eval_cache_misses = 0;
+uint64_t g_eval_lazy_exits   = 0;
+uint64_t g_eval_full_calls   = 0;
+#endif
+
 void eval_weights_init(void) {
     /* Material */
     EW.material_mg[PAWN]   = 82;   EW.material_eg[PAWN]   = 94;
@@ -579,8 +590,14 @@ bool eval_cache_probe(uint64_t key, int *score) {
     EvalCacheEntry *e = &eval_cache[eval_cache_idx(key)];
     if (e->valid && e->key == key) {
         *score = e->score;
+#ifdef EVAL_PROFILE
+        g_eval_cache_hits++;
+#endif
         return true;
     }
+#ifdef EVAL_PROFILE
+    g_eval_cache_misses++;
+#endif
     return false;
 }
 
@@ -593,7 +610,39 @@ void eval_cache_store(uint64_t key, int score) {
 
 void eval_cache_clear(void) {
     memset(eval_cache, 0, sizeof(eval_cache));
+#ifdef EVAL_PROFILE
+    g_eval_cache_hits   = 0;
+    g_eval_cache_misses = 0;
+    g_eval_lazy_exits   = 0;
+    g_eval_full_calls   = 0;
+#endif
 }
+
+#ifdef EVAL_PROFILE
+void eval_profile_print(void) {
+    uint64_t total_probes = g_eval_cache_hits + g_eval_cache_misses;
+    double hit_rate = total_probes > 0
+        ? (100.0 * g_eval_cache_hits / total_probes) : 0.0;
+    double lazy_rate = g_eval_full_calls > 0
+        ? (100.0 * g_eval_lazy_exits / g_eval_full_calls) : 0.0;
+    fprintf(stderr,
+        "info string eval_profile: cache_hits=%llu cache_misses=%llu "
+        "hit_rate=%.1f%% full_evals=%llu lazy_exits=%llu lazy_rate=%.1f%%\n",
+        (unsigned long long)g_eval_cache_hits,
+        (unsigned long long)g_eval_cache_misses,
+        hit_rate,
+        (unsigned long long)g_eval_full_calls,
+        (unsigned long long)g_eval_lazy_exits,
+        lazy_rate);
+}
+
+void eval_profile_reset(void) {
+    g_eval_cache_hits   = 0;
+    g_eval_cache_misses = 0;
+    g_eval_lazy_exits   = 0;
+    g_eval_full_calls   = 0;
+}
+#endif
 
 /* ──────────────────────────────────────────────
  *  Pawn structure evaluation (one side)
@@ -2078,6 +2127,10 @@ int evaluate(const Board *b) {
         return cached_score;
     }
 
+#ifdef EVAL_PROFILE
+    g_eval_full_calls++;
+#endif
+
     int phase = game_phase(b);
 
     /*
@@ -2095,6 +2148,10 @@ int evaluate(const Board *b) {
     if (abs(proxy) > EW.lazy_threshold) {
         /* Still apply the side-to-move flip for consistency */
         int lazy_ret = (b->side == WHITE) ? proxy : -proxy;
+
+#ifdef EVAL_PROFILE
+        g_eval_lazy_exits++;
+#endif
 
 #ifdef EVAL_DEBUG
         /* Record the lazy position so we can spot if it skews the lists */

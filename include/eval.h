@@ -91,7 +91,19 @@ int game_phase(const Board *b);
  * `eval_cache_probe()` returns true and fills *score on hit; the
  * score is from the side-to-move perspective (same as evaluate()).
  */
-#define EVAL_CACHE_SIZE (1 << 16)   /* 64K entries × 12 bytes ≈ 768 KB */
+#define EVAL_CACHE_SIZE (1 << 18)   /* 256K entries × 12 bytes ≈ 3 MB */
 bool eval_cache_probe(uint64_t key, int *score);
 void eval_cache_store(uint64_t key, int score);
 void eval_cache_clear(void);
+
+/* OPT-PROF: Eval profiling — compile eval.c with -DEVAL_PROFILE to enable.
+ * When enabled, these counters track cache hit rate and lazy-eval exits.
+ * Call eval_profile_print() at the end of a search to see the stats. */
+#ifdef EVAL_PROFILE
+extern uint64_t g_eval_cache_hits;
+extern uint64_t g_eval_cache_misses;
+extern uint64_t g_eval_lazy_exits;
+extern uint64_t g_eval_full_calls;
+void eval_profile_print(void);
+void eval_profile_reset(void);
+#endif

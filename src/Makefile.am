@@ -11,6 +11,7 @@ engine_SOURCES = \
     eval.c \
     main.c \
     movegen.c \
+    numa_utils.c \
     search.c \
     tt.c \
     uci.c
@@ -87,7 +88,7 @@ SUPEROPT_WRAPPER = $(top_srcdir)/build-aux/superopt-stage.sh
 # so clang doesn't run its own optimisation pipeline before we get
 # a chance to — we want Souper and Minotaur to see the unoptimised IR.
 BC_CFLAGS = $(AM_CFLAGS) -DNDEBUG -fomit-frame-pointer \
-	    @MARCH_NATIVE@ -emit-llvm -Xclang -disable-llvm-passes
+            @MARCH_NATIVE@ -emit-llvm -Xclang -disable-llvm-passes
 
 # Flags for llc when converting the final optimised bitcode to assembly.
 # We use -O3 to enable LLVM's codegen optimisations (instruction selection,
@@ -127,170 +128,170 @@ MINOTAUR_CMD = $(OPT_BIN) -load-pass-plugin $(MINOTAUR_PASS) -minotaur-pass
 
 # bitboard.c
 bitboard.bc: bitboard.c
-	@echo "[superopt:1-clang] $< -> $@"
-	$(CLANG_BIN) $(BC_CFLAGS) -c $< -o $@
+        @echo "[superopt:1-clang] $< -> $@"
+        $(CLANG_BIN) $(BC_CFLAGS) -c $< -o $@
 bitboard.souper.bc: bitboard.bc
-	@echo "[superopt:2-souper] $< -> $@"
-	$(SOUPER_CMD_ENV) $(SUPEROPT_WRAPPER) souper $(SOUPER_CMD) $< $@
+        @echo "[superopt:2-souper] $< -> $@"
+        $(SOUPER_CMD_ENV) $(SUPEROPT_WRAPPER) souper $(SOUPER_CMD) $< $@
 bitboard.minotaur.bc: bitboard.souper.bc
-	@echo "[superopt:3-minotaur] $< -> $@"
-	$(SUPEROPT_WRAPPER) minotaur $(MINOTAUR_CMD) $< $@
+        @echo "[superopt:3-minotaur] $< -> $@"
+        $(SUPEROPT_WRAPPER) minotaur $(MINOTAUR_CMD) $< $@
 bitboard.o: bitboard.minotaur.bc
-	@echo "[superopt:4-codegen] $< -> $@"
-	$(LLC_BIN) $(LLC_FLAGS) $< -o $@.s
-	$(CC) -c $@.s -o $@
-	@rm -f $@.s
+        @echo "[superopt:4-codegen] $< -> $@"
+        $(LLC_BIN) $(LLC_FLAGS) $< -o $@.s
+        $(CC) -c $@.s -o $@
+        @rm -f $@.s
 
 # board.c
 board.bc: board.c
-	@echo "[superopt:1-clang] $< -> $@"
-	$(CLANG_BIN) $(BC_CFLAGS) -c $< -o $@
+        @echo "[superopt:1-clang] $< -> $@"
+        $(CLANG_BIN) $(BC_CFLAGS) -c $< -o $@
 board.souper.bc: board.bc
-	@echo "[superopt:2-souper] $< -> $@"
-	$(SOUPER_CMD_ENV) $(SUPEROPT_WRAPPER) souper $(SOUPER_CMD) $< $@
+        @echo "[superopt:2-souper] $< -> $@"
+        $(SOUPER_CMD_ENV) $(SUPEROPT_WRAPPER) souper $(SOUPER_CMD) $< $@
 board.minotaur.bc: board.souper.bc
-	@echo "[superopt:3-minotaur] $< -> $@"
-	$(SUPEROPT_WRAPPER) minotaur $(MINOTAUR_CMD) $< $@
+        @echo "[superopt:3-minotaur] $< -> $@"
+        $(SUPEROPT_WRAPPER) minotaur $(MINOTAUR_CMD) $< $@
 board.o: board.minotaur.bc
-	@echo "[superopt:4-codegen] $< -> $@"
-	$(LLC_BIN) $(LLC_FLAGS) $< -o $@.s
-	$(CC) -c $@.s -o $@
-	@rm -f $@.s
+        @echo "[superopt:4-codegen] $< -> $@"
+        $(LLC_BIN) $(LLC_FLAGS) $< -o $@.s
+        $(CC) -c $@.s -o $@
+        @rm -f $@.s
 
 # book.c
 book.bc: book.c
-	@echo "[superopt:1-clang] $< -> $@"
-	$(CLANG_BIN) $(BC_CFLAGS) -c $< -o $@
+        @echo "[superopt:1-clang] $< -> $@"
+        $(CLANG_BIN) $(BC_CFLAGS) -c $< -o $@
 book.souper.bc: book.bc
-	@echo "[superopt:2-souper] $< -> $@"
-	$(SOUPER_CMD_ENV) $(SUPEROPT_WRAPPER) souper $(SOUPER_CMD) $< $@
+        @echo "[superopt:2-souper] $< -> $@"
+        $(SOUPER_CMD_ENV) $(SUPEROPT_WRAPPER) souper $(SOUPER_CMD) $< $@
 book.minotaur.bc: book.souper.bc
-	@echo "[superopt:3-minotaur] $< -> $@"
-	$(SUPEROPT_WRAPPER) minotaur $(MINOTAUR_CMD) $< $@
+        @echo "[superopt:3-minotaur] $< -> $@"
+        $(SUPEROPT_WRAPPER) minotaur $(MINOTAUR_CMD) $< $@
 book.o: book.minotaur.bc
-	@echo "[superopt:4-codegen] $< -> $@"
-	$(LLC_BIN) $(LLC_FLAGS) $< -o $@.s
-	$(CC) -c $@.s -o $@
-	@rm -f $@.s
+        @echo "[superopt:4-codegen] $< -> $@"
+        $(LLC_BIN) $(LLC_FLAGS) $< -o $@.s
+        $(CC) -c $@.s -o $@
+        @rm -f $@.s
 
 # eval.c
 eval.bc: eval.c
-	@echo "[superopt:1-clang] $< -> $@"
-	$(CLANG_BIN) $(BC_CFLAGS) -c $< -o $@
+        @echo "[superopt:1-clang] $< -> $@"
+        $(CLANG_BIN) $(BC_CFLAGS) -c $< -o $@
 eval.souper.bc: eval.bc
-	@echo "[superopt:2-souper] $< -> $@"
-	$(SOUPER_CMD_ENV) $(SUPEROPT_WRAPPER) souper $(SOUPER_CMD) $< $@
+        @echo "[superopt:2-souper] $< -> $@"
+        $(SOUPER_CMD_ENV) $(SUPEROPT_WRAPPER) souper $(SOUPER_CMD) $< $@
 eval.minotaur.bc: eval.souper.bc
-	@echo "[superopt:3-minotaur] $< -> $@"
-	$(SUPEROPT_WRAPPER) minotaur $(MINOTAUR_CMD) $< $@
+        @echo "[superopt:3-minotaur] $< -> $@"
+        $(SUPEROPT_WRAPPER) minotaur $(MINOTAUR_CMD) $< $@
 eval.o: eval.minotaur.bc
-	@echo "[superopt:4-codegen] $< -> $@"
-	$(LLC_BIN) $(LLC_FLAGS) $< -o $@.s
-	$(CC) -c $@.s -o $@
-	@rm -f $@.s
+        @echo "[superopt:4-codegen] $< -> $@"
+        $(LLC_BIN) $(LLC_FLAGS) $< -o $@.s
+        $(CC) -c $@.s -o $@
+        @rm -f $@.s
 
 # main.c
 main.bc: main.c
-	@echo "[superopt:1-clang] $< -> $@"
-	$(CLANG_BIN) $(BC_CFLAGS) -c $< -o $@
+        @echo "[superopt:1-clang] $< -> $@"
+        $(CLANG_BIN) $(BC_CFLAGS) -c $< -o $@
 main.souper.bc: main.bc
-	@echo "[superopt:2-souper] $< -> $@"
-	$(SOUPER_CMD_ENV) $(SUPEROPT_WRAPPER) souper $(SOUPER_CMD) $< $@
+        @echo "[superopt:2-souper] $< -> $@"
+        $(SOUPER_CMD_ENV) $(SUPEROPT_WRAPPER) souper $(SOUPER_CMD) $< $@
 main.minotaur.bc: main.souper.bc
-	@echo "[superopt:3-minotaur] $< -> $@"
-	$(SUPEROPT_WRAPPER) minotaur $(MINOTAUR_CMD) $< $@
+        @echo "[superopt:3-minotaur] $< -> $@"
+        $(SUPEROPT_WRAPPER) minotaur $(MINOTAUR_CMD) $< $@
 main.o: main.minotaur.bc
-	@echo "[superopt:4-codegen] $< -> $@"
-	$(LLC_BIN) $(LLC_FLAGS) $< -o $@.s
-	$(CC) -c $@.s -o $@
-	@rm -f $@.s
+        @echo "[superopt:4-codegen] $< -> $@"
+        $(LLC_BIN) $(LLC_FLAGS) $< -o $@.s
+        $(CC) -c $@.s -o $@
+        @rm -f $@.s
 
 # movegen.c
 movegen.bc: movegen.c
-	@echo "[superopt:1-clang] $< -> $@"
-	$(CLANG_BIN) $(BC_CFLAGS) -c $< -o $@
+        @echo "[superopt:1-clang] $< -> $@"
+        $(CLANG_BIN) $(BC_CFLAGS) -c $< -o $@
 movegen.souper.bc: movegen.bc
-	@echo "[superopt:2-souper] $< -> $@"
-	$(SOUPER_CMD_ENV) $(SUPEROPT_WRAPPER) souper $(SOUPER_CMD) $< $@
+        @echo "[superopt:2-souper] $< -> $@"
+        $(SOUPER_CMD_ENV) $(SUPEROPT_WRAPPER) souper $(SOUPER_CMD) $< $@
 movegen.minotaur.bc: movegen.souper.bc
-	@echo "[superopt:3-minotaur] $< -> $@"
-	$(SUPEROPT_WRAPPER) minotaur $(MINOTAUR_CMD) $< $@
+        @echo "[superopt:3-minotaur] $< -> $@"
+        $(SUPEROPT_WRAPPER) minotaur $(MINOTAUR_CMD) $< $@
 movegen.o: movegen.minotaur.bc
-	@echo "[superopt:4-codegen] $< -> $@"
-	$(LLC_BIN) $(LLC_FLAGS) $< -o $@.s
-	$(CC) -c $@.s -o $@
-	@rm -f $@.s
+        @echo "[superopt:4-codegen] $< -> $@"
+        $(LLC_BIN) $(LLC_FLAGS) $< -o $@.s
+        $(CC) -c $@.s -o $@
+        @rm -f $@.s
 
 # search.c
 search.bc: search.c
-	@echo "[superopt:1-clang] $< -> $@"
-	$(CLANG_BIN) $(BC_CFLAGS) -c $< -o $@
+        @echo "[superopt:1-clang] $< -> $@"
+        $(CLANG_BIN) $(BC_CFLAGS) -c $< -o $@
 search.souper.bc: search.bc
-	@echo "[superopt:2-souper] $< -> $@"
-	$(SOUPER_CMD_ENV) $(SUPEROPT_WRAPPER) souper $(SOUPER_CMD) $< $@
+        @echo "[superopt:2-souper] $< -> $@"
+        $(SOUPER_CMD_ENV) $(SUPEROPT_WRAPPER) souper $(SOUPER_CMD) $< $@
 search.minotaur.bc: search.souper.bc
-	@echo "[superopt:3-minotaur] $< -> $@"
-	$(SUPEROPT_WRAPPER) minotaur $(MINOTAUR_CMD) $< $@
+        @echo "[superopt:3-minotaur] $< -> $@"
+        $(SUPEROPT_WRAPPER) minotaur $(MINOTAUR_CMD) $< $@
 search.o: search.minotaur.bc
-	@echo "[superopt:4-codegen] $< -> $@"
-	$(LLC_BIN) $(LLC_FLAGS) $< -o $@.s
-	$(CC) -c $@.s -o $@
-	@rm -f $@.s
+        @echo "[superopt:4-codegen] $< -> $@"
+        $(LLC_BIN) $(LLC_FLAGS) $< -o $@.s
+        $(CC) -c $@.s -o $@
+        @rm -f $@.s
 
 # tt.c
 tt.bc: tt.c
-	@echo "[superopt:1-clang] $< -> $@"
-	$(CLANG_BIN) $(BC_CFLAGS) -c $< -o $@
+        @echo "[superopt:1-clang] $< -> $@"
+        $(CLANG_BIN) $(BC_CFLAGS) -c $< -o $@
 tt.souper.bc: tt.bc
-	@echo "[superopt:2-souper] $< -> $@"
-	$(SOUPER_CMD_ENV) $(SUPEROPT_WRAPPER) souper $(SOUPER_CMD) $< $@
+        @echo "[superopt:2-souper] $< -> $@"
+        $(SOUPER_CMD_ENV) $(SUPEROPT_WRAPPER) souper $(SOUPER_CMD) $< $@
 tt.minotaur.bc: tt.souper.bc
-	@echo "[superopt:3-minotaur] $< -> $@"
-	$(SUPEROPT_WRAPPER) minotaur $(MINOTAUR_CMD) $< $@
+        @echo "[superopt:3-minotaur] $< -> $@"
+        $(SUPEROPT_WRAPPER) minotaur $(MINOTAUR_CMD) $< $@
 tt.o: tt.minotaur.bc
-	@echo "[superopt:4-codegen] $< -> $@"
-	$(LLC_BIN) $(LLC_FLAGS) $< -o $@.s
-	$(CC) -c $@.s -o $@
-	@rm -f $@.s
+        @echo "[superopt:4-codegen] $< -> $@"
+        $(LLC_BIN) $(LLC_FLAGS) $< -o $@.s
+        $(CC) -c $@.s -o $@
+        @rm -f $@.s
 
 # uci.c
 uci.bc: uci.c
-	@echo "[superopt:1-clang] $< -> $@"
-	$(CLANG_BIN) $(BC_CFLAGS) -c $< -o $@
+        @echo "[superopt:1-clang] $< -> $@"
+        $(CLANG_BIN) $(BC_CFLAGS) -c $< -o $@
 uci.souper.bc: uci.bc
-	@echo "[superopt:2-souper] $< -> $@"
-	$(SOUPER_CMD_ENV) $(SUPEROPT_WRAPPER) souper $(SOUPER_CMD) $< $@
+        @echo "[superopt:2-souper] $< -> $@"
+        $(SOUPER_CMD_ENV) $(SUPEROPT_WRAPPER) souper $(SOUPER_CMD) $< $@
 uci.minotaur.bc: uci.souper.bc
-	@echo "[superopt:3-minotaur] $< -> $@"
-	$(SUPEROPT_WRAPPER) minotaur $(MINOTAUR_CMD) $< $@
+        @echo "[superopt:3-minotaur] $< -> $@"
+        $(SUPEROPT_WRAPPER) minotaur $(MINOTAUR_CMD) $< $@
 uci.o: uci.minotaur.bc
-	@echo "[superopt:4-codegen] $< -> $@"
-	$(LLC_BIN) $(LLC_FLAGS) $< -o $@.s
-	$(CC) -c $@.s -o $@
-	@rm -f $@.s
+        @echo "[superopt:4-codegen] $< -> $@"
+        $(LLC_BIN) $(LLC_FLAGS) $< -o $@.s
+        $(CC) -c $@.s -o $@
+        @rm -f $@.s
 
 # eval_debug.c (only when ENABLE_EVAL_DEBUG)
 if ENABLE_EVAL_DEBUG
 eval_debug.bc: eval_debug.c
-	@echo "[superopt:1-clang] $< -> $@"
-	$(CLANG_BIN) $(BC_CFLAGS) -c $< -o $@
+        @echo "[superopt:1-clang] $< -> $@"
+        $(CLANG_BIN) $(BC_CFLAGS) -c $< -o $@
 eval_debug.souper.bc: eval_debug.bc
-	@echo "[superopt:2-souper] $< -> $@"
-	$(SOUPER_CMD_ENV) $(SUPEROPT_WRAPPER) souper $(SOUPER_CMD) $< $@
+        @echo "[superopt:2-souper] $< -> $@"
+        $(SOUPER_CMD_ENV) $(SUPEROPT_WRAPPER) souper $(SOUPER_CMD) $< $@
 eval_debug.minotaur.bc: eval_debug.souper.bc
-	@echo "[superopt:3-minotaur] $< -> $@"
-	$(SUPEROPT_WRAPPER) minotaur $(MINOTAUR_CMD) $< $@
+        @echo "[superopt:3-minotaur] $< -> $@"
+        $(SUPEROPT_WRAPPER) minotaur $(MINOTAUR_CMD) $< $@
 eval_debug.o: eval_debug.minotaur.bc
-	@echo "[superopt:4-codegen] $< -> $@"
-	$(LLC_BIN) $(LLC_FLAGS) $< -o $@.s
-	$(CC) -c $@.s -o $@
-	@rm -f $@.s
+        @echo "[superopt:4-codegen] $< -> $@"
+        $(LLC_BIN) $(LLC_FLAGS) $< -o $@.s
+        $(CC) -c $@.s -o $@
+        @rm -f $@.s
 endif
 
 # Clean up the intermediate bitcode files on `make clean`.
 clean-superopt:
-	@echo "Cleaning superopt bitcode intermediates"
-	@rm -f *.bc *.souper.bc *.minotaur.bc *.bc.log *.souper.bc.log *.minotaur.bc.log *.s
+        @echo "Cleaning superopt bitcode intermediates"
+        @rm -f *.bc *.souper.bc *.minotaur.bc *.bc.log *.souper.bc.log *.minotaur.bc.log *.s
 clean-local: clean-superopt
 
 endif  # ENABLE_SUPEROPT

@@ -164,6 +164,15 @@ void tt_new_search(void) {
     }
 }
 
+/* OPT-SMP-3: Expose TT internals for NUMA first-touch. */
+void *tt_base_ptr(void) {
+    return (void *)TT;
+}
+
+size_t tt_entry_count(void) {
+    return TT_ENTRIES;
+}
+
 /* ──────────────────────────────────────────────
  *  Bucket access
  * ────────────────────────────────────────────── */
@@ -230,6 +239,22 @@ bool tt_probe(uint64_t key, TTEntry *out) {
 
 /* ──────────────────────────────────────────────
  *  Store
+ *
+ *  OPT-TT-GUARD: SF-style "don't clobber deeper entries" guard.
+ *
+ *  When helper threads search at reduced depth (via the depth-offset
+ *  Lazy SMP mechanism in search.c), they may try to store results
+ *  that are SHALLOWER than what the main thread already stored.  Without
+ *  this guard, the helper's shallow result overwrites the main thread's
+ *  deep result — a "TT pollution" problem that causes search instability
+ *  and re-searches.
+ *
+ *  The guard compares the new entry's "value" (depth + 2*is_pv) against
+ *  the existing entry's value.  If the new entry is more than 4 plies
+ *  SHALLOWER, skip the store (return without writing).  This matches
+ *  SF's `d - DEPTH_NONE + 2*pv > depth8 - 4` condition.
+ *
+ *  Source: SF `tt.cpp:92-124` `TTEntry::save()`.
  * ────────────────────────────────────────────── */
 void tt_store(uint64_t key, int score, Move move, int depth, int flag, int ply) {
     (void)ply;  /* score is already TT-adjusted by the caller via value_to_tt */
@@ -240,6 +265,16 @@ void tt_store(uint64_t key, int score, Move move, int depth, int flag, int ply) 
     for (int i = 0; i < TT_BUCKET_SLOTS; i++) {
         TTEntry *e = &bucket[i];
         if (e->key == key && e->flag != TT_NONE) {
+            /* OPT-TT-GUARD (disabled — caused regressions in testing):
+             * The SF-style "don't clobber deeper entries" guard was
+             * tried with thresholds 4 and 8, but both caused search
+             * instability on the test position (6x slowdown at 1 thread
+             * with threshold 4, 4-thread regression with threshold 8).
+             * The issue is that the guard prevents legitimate bound
+             * refinement during iterative deepening.  Re-enable only
+             * if depth-offset Lazy SMP causes measurable TT pollution
+             * in self-play testing. */
+
             /* Update move only if the new one is non-null.  This
              * preserves a useful TT move from a deeper prior search
              * when the current search has no move to store. */

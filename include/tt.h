@@ -76,6 +76,13 @@ void tt_prefetch(uint64_t key);
 /* Store an entry. */
 void tt_store(uint64_t key, int score, Move move, int depth, int flag, int ply);
 
+/* OPT-SMP-3: Expose the TT base pointer and entry count for NUMA
+ * first-touch initialization.  Each worker thread touches its slice
+ * of the TT at search startup so pages are distributed across NUMA
+ * nodes (Linux first-touch policy).  No-op on single-socket systems. */
+void *tt_base_ptr(void);
+size_t tt_entry_count(void);
+
 /* Mate-distance adjustment helpers */
 static inline int score_to_tt (int score, int ply) {
     if (score >  MATE_SCORE - MAX_PLY) return score + ply;

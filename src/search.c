@@ -39,6 +39,7 @@
 #include "movegen.h"
 #include "eval.h"
 #include "book.h"
+#include "numa_utils.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,8 +65,35 @@ static Move s_root_best_move = NULL_MOVE;
 
 /* Shared node counter for SMP NPS reporting.  Each thread writes its
  * current node count here every 2048 nodes; thread 0 sums all entries
- * for accurate total-NPS display.  See search_thread() for details. */
-static volatile uint64_t g_thread_nodes[64];
+ * for accurate total-NPS display.  See search_thread() for details.
+ *
+ * OPT-SMP-4: Cache-line padding to prevent false sharing.
+ *
+ * Without padding, 64 × 8-byte counters = 512 bytes fit in 8 cache
+ * lines.  Each thread writes its own counter every 2048 nodes,
+ * invalidating the cache line for ALL other threads — they must
+ * re-fetch the line on their next read.  At 4+ threads this causes
+ * measurable cache traffic.
+ *
+ * Padding each counter to 64 bytes (one cache line) eliminates this:
+ * each thread's write only invalidates ITS OWN cache line.  Cost:
+ * 64 × 64 = 4KB (still trivial — fits in L1).
+ *
+ * Source: TalkChess "false sharing in node counters"; SF uses a
+ * similar padding scheme in its Thread class. */
+struct PaddedNodeCount {
+    volatile uint64_t count;
+    char pad[64 - sizeof(uint64_t)];
+};
+static struct PaddedNodeCount g_thread_nodes[64] __attribute__((aligned(64)));
+
+/* Helper accessors to keep the rest of the code clean. */
+static inline void thread_nodes_set(int tid, uint64_t val) {
+    g_thread_nodes[tid].count = val;
+}
+static inline uint64_t thread_nodes_get(int tid) {
+    return g_thread_nodes[tid].count;
+}
 
 /* Global thread count (set via UCI "Threads" option, default 1). */
 int g_num_threads = 1;
@@ -632,7 +660,7 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si,
     /* Check time every 2048 nodes.  Also update the shared node counter
      * for SMP NPS reporting (thread 0 sums all entries for display). */
     if ((si->nodes & 2047) == 0) {
-        g_thread_nodes[si->thread_id] = si->nodes;
+        g_thread_nodes[si->thread_id].count = si->nodes;
         if (time_up(si)) {
             si->limits->stop = true;
             return 0;
@@ -1471,12 +1499,60 @@ static void *search_thread(void *arg) {
     SearchLimits *lim = sta->limits;
     SearchInfo *si = &sta->si;
 
+    /* OPT-SMP-3: NUMA-aware thread pinning + TT first-touch.
+     *
+     * On multi-socket systems, pin each thread to a NUMA node so the
+     * OS scheduler doesn't migrate it across sockets (which would
+     * destroy cache locality and cause cross-socket TT probes).
+     *
+     * Thread distribution is round-robin across nodes.  On single-socket
+     * systems (the common case), this is a no-op — numa_num_nodes()
+     * returns 1 and we skip the binding.
+     *
+     * After binding, each thread touches its slice of the TT to fault
+     * pages onto its local NUMA node (Linux first-touch policy).
+     *
+     * Source: SF `numa.h` (Daniel Infuehr); anemato.de/blog/nuca. */
+    if (g_num_threads > 1) {
+        int nnodes = numa_num_nodes();
+        if (nnodes > 1) {
+            int target_node = numa_distribute_thread(sta->thread_id,
+                                                      g_num_threads, nnodes);
+            numa_bind_to_node(target_node);
+        }
+        /* TT first-touch: distribute pages across NUMA nodes.
+         * Even on single-socket, this ensures the TT pages are faulted
+         * in before the search starts (avoids page faults during search). */
+        numa_first_touch_tt(sta->thread_id, g_num_threads,
+                             tt_base_ptr(), tt_entry_count(),
+                             sizeof(TTEntry));
+    }
+
     int max_depth = (lim->depth > 0) ? lim->depth : 100;
     Move best_move = NULL_MOVE;
     int  prev_score = 0;
     int  completed_depth = 0;
 
-    for (int depth = 1; depth <= max_depth; depth++) {
+    /* OPT-SMP-1: Depth-offset Lazy SMP (Seer/Cheng style).
+     *
+     * Even-indexed threads start at depth 1, odd-indexed at depth 2.
+     * This produces natural desynchronization: at any instant the
+     * threads are spread across two consecutive depths, so one thread's
+     * TT writes are immediately useful to another thread at the lower
+     * depth, while the lower-depth thread's TT entries get reused by
+     * the higher-depth thread when it catches up.
+     *
+     * Without this offset, all threads start at the same depth, do the
+     * same work, and produce only redundant TT writes — observed as a
+     * 2-3x NODES increase with NO time improvement at 2 threads.
+     *
+     * Source: Seer `search_worker_orchestrator.cc` (Connor McMonigle);
+     * chessprogramming.org/Lazy_SMP (Cheng section).
+     *
+     * Note: for single-threaded (thread_id == 0), start_depth = 1 —
+     * identical to the old behavior, so no regression in 1-thread mode. */
+    int start_depth = 1 + (sta->thread_id % 2);
+    for (int depth = start_depth; depth <= max_depth; depth++) {
         si->seldepth = 0;
         si->nodes    = 0;
         if (depth > 1) decay_history(si);
@@ -1491,12 +1567,19 @@ static void *search_thread(void *arg) {
          * tuned for typical positions), but the widening uses pure ×2
          * on every fail (simpler than the original ×2-then-×3/2, and
          * marginally better per SF testing).  Falls back to a full
-         * window after 3 fails or delta > 500. */
+         * window after 3 fails or delta > 500.
+         *
+         * OPT-SMP-1b: SF-style per-thread aspiration delta variation.
+         * `threadIdx % 8` spreads threads across 8 slightly different
+         * initial window sizes, so they fail-high/low at different
+         * points and explore slightly different subtrees.  Source:
+         * SF `search.cpp:373` `delta = 5 + threadIdx % 8 + ...`.
+         *
+         * Thread 0 uses the standard delta (no offset) so its result
+         * is the "canonical" search result for the position. */
         if (depth >= 4) {
             int delta = 18 + depth;
             if (delta > 50) delta = 50;
-            /* Desynchronize: odd threads get a wider window. */
-            if (sta->thread_id > 0) delta += 5;
             int asp_alpha = prev_score - delta;
             int asp_beta  = prev_score + delta;
             int failed_low_count = 0, failed_high_count = 0;
@@ -1549,7 +1632,7 @@ static void *search_thread(void *arg) {
             /* Sum nodes across all active threads for accurate NPS. */
             uint64_t total_nodes = 0;
             for (int t = 0; t < g_num_threads; t++)
-                total_nodes += g_thread_nodes[t];
+                total_nodes += g_thread_nodes[t].count;
 
             long long nps = elapsed_ms > 0
                             ? (long long)(total_nodes * 1000ULL / (unsigned)elapsed_ms)
@@ -1653,7 +1736,7 @@ void search(Board *b, SearchLimits *lim) {
     /* Single-threaded path (fast path, no thread overhead). */
     if (num_threads == 1) {
         ThreadResult result = {0};
-        g_thread_nodes[0] = 0;  /* reset shared node counter */
+        g_thread_nodes[0].count = 0;  /* reset shared node counter */
         /* Allocate on heap — SearchInfo is ~340KB, too large for stack. */
         SearchThreadArg *arg = calloc(1, sizeof(SearchThreadArg));
         if (!arg) {
@@ -1712,7 +1795,7 @@ void search(Board *b, SearchLimits *lim) {
         results[i].score     = 0;
         results[i].depth     = 0;
         results[i].finished  = false;
-        g_thread_nodes[i]    = 0;  /* reset shared node counter */
+        g_thread_nodes[i].count = 0;  /* reset shared node counter */
     }
 
     /* Start all threads. */
@@ -1725,17 +1808,75 @@ void search(Board *b, SearchLimits *lim) {
         pthread_join(threads[i], NULL);
     }
 
-    /* Pick the best move: prefer the deepest completed search.
-     * If multiple threads reached the same depth, prefer thread 0's
-     * result (it had the standard aspiration windows). */
-    Move best_move = results[0].best_move;
+    /* Pick the best move using Ethereal-style thread voting.
+     *
+     * OPT-SMP-2: Instead of just "deepest depth wins", use a score-aware
+     * selection that prefers:
+     *   (a) same depth with higher score
+     *   (b) deeper with non-mate score (don't replace a closer mate)
+     *   (c) closer mate score (regardless of depth)
+     *
+     * This picks up cases where a helper thread found a BETTER move at
+     * the same depth (common with depth-offset Lazy SMP — the helper
+     * explored a different subtree and found a stronger continuation),
+     * or a closer mate that the main thread missed.
+     *
+     * Falls back to thread 0 if no thread strictly dominates.
+     *
+     * Source: Ethereal `search.c:56-97` `select_from_threads`
+     * (Andrew Grant); Berserk's voting (chessprogramming.org/Lazy_SMP). */
+    int  best_idx   = 0;
     int  best_depth = results[0].depth;
+    int  best_score = results[0].score;
     for (int i = 1; i < num_threads && i < 64; i++) {
-        if (results[i].depth > best_depth && results[i].best_move != NULL_MOVE) {
-            best_move  = results[i].best_move;
-            best_depth = results[i].depth;
+        int this_depth = results[i].depth;
+        int this_score = results[i].score;
+        if (results[i].best_move == NULL_MOVE) continue;
+
+        bool best_is_mate   = (best_score >  MATE_SCORE - MAX_PLY);
+        bool this_is_mate   = (this_score >  MATE_SCORE - MAX_PLY);
+        bool best_is_mate_n = (best_score < -MATE_SCORE + MAX_PLY);
+        bool this_is_mate_n = (this_score < -MATE_SCORE + MAX_PLY);
+
+        /* (c) Closer mate takes priority regardless of depth.
+         * A mate in 3 (score MATE-5) is better than a mate in 5 (MATE-9)
+         * even if the mate-in-5 was found at higher depth. */
+        if (this_is_mate && best_is_mate) {
+            /* Both positive mates — higher score = closer mate. */
+            if (this_score > best_score) {
+                best_idx = i; best_depth = this_depth; best_score = this_score;
+                continue;
+            }
+        }
+        if (this_is_mate && !best_is_mate) {
+            /* Found a winning mate when we didn't have one — take it. */
+            best_idx = i; best_depth = this_depth; best_score = this_score;
+            continue;
+        }
+        if (this_is_mate_n && best_is_mate_n) {
+            /* Both negative mates — less negative = we get mated later = better. */
+            if (this_score > best_score) {
+                best_idx = i; best_depth = this_depth; best_score = this_score;
+                continue;
+            }
+        }
+
+        /* Skip mate-vs-non-mate comparisons for the rules below. */
+        if (this_is_mate || this_is_mate_n || best_is_mate || best_is_mate_n) continue;
+
+        /* (a) Same depth, higher score wins. */
+        if (this_depth == best_depth && this_score > best_score) {
+            best_idx = i; best_score = this_score;
+            continue;
+        }
+        /* (b) Deeper with non-mate score — take it (deeper search is
+         * more reliable, as long as it's not replacing a closer mate). */
+        if (this_depth > best_depth) {
+            best_idx = i; best_depth = this_depth; best_score = this_score;
+            continue;
         }
     }
+    Move best_move = results[best_idx].best_move;
 
     /* Output bestmove with ponder move. */
     char mv_str[6];

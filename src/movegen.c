@@ -241,6 +241,14 @@ Bitboard compute_pinned(const Board *b, Square ksq, Bitboard occ) {
     Color us = b->side;
     Color them = us ^ 1;
 
+    /* OPT-SKIP-SLIDER: if enemy has no orthogonal sliders (no rooks,
+     * no queens) and no diagonal sliders (no bishops, no queens), there
+     * can be no pins — return 0 without doing any slider lookups.
+     * Common in KP endgames and K+minor endgames. */
+    Bitboard enemy_rq = b->pieces[them][ROOK]   | b->pieces[them][QUEEN];
+    Bitboard enemy_bq = b->pieces[them][BISHOP] | b->pieces[them][QUEEN];
+    if (!enemy_rq && !enemy_bq) return 0;
+
     /* Remove ALL our pieces from occupancy — this exposes enemy sliders
      * that sit behind our pieces on lines to the king.  These are the
      * "candidate pinners" (x-ray attackers).
@@ -257,16 +265,16 @@ Bitboard compute_pinned(const Board *b, Square ksq, Bitboard occ) {
      * (checkers — 0 of our pieces between) and x-ray attackers
      * (pinners — 1+ of our pieces between).  The "exactly one between"
      * check below filters to just the pinners. */
-    Bitboard rook_candidates =
-        (rook_attacks(ksq, occ_no_us)
-         & (b->pieces[them][ROOK] | b->pieces[them][QUEEN]));
-    Bitboard bishop_candidates =
-        (bishop_attacks(ksq, occ_no_us)
-         & (b->pieces[them][BISHOP] | b->pieces[them][QUEEN]));
+    Bitboard pinners = 0;
+    if (enemy_rq) {
+        pinners |= rook_attacks(ksq, occ_no_us) & enemy_rq;
+    }
+    if (enemy_bq) {
+        pinners |= bishop_attacks(ksq, occ_no_us) & enemy_bq;
+    }
+    if (!pinners) return 0;
 
-    Bitboard pinners = rook_candidates | bishop_candidates;
     Bitboard pinned  = 0;
-
     while (pinners) {
         Square pinner_sq = (Square)bb_pop(&pinners);
         /* Squares strictly between pinner and king. */
@@ -294,10 +302,16 @@ Bitboard compute_checkers(const Board *b, Square ksq, Bitboard occ) {
     checkers |= PAWN_ATTACKS[b->side][ksq] & b->pieces[them][PAWN];
     checkers |= KNIGHT_ATTACKS[ksq]       & b->pieces[them][KNIGHT];
     checkers |= KING_ATTACKS[ksq]         & b->pieces[them][KING];
-    checkers |= bishop_attacks(ksq, occ)  & (b->pieces[them][BISHOP]
-                                           | b->pieces[them][QUEEN]);
-    checkers |= rook_attacks(ksq, occ)    & (b->pieces[them][ROOK]
-                                           | b->pieces[them][QUEEN]);
+
+    /* OPT-SKIP-SLIDER: skip slider lookups when no enemy sliders exist. */
+    Bitboard enemy_bq = b->pieces[them][BISHOP] | b->pieces[them][QUEEN];
+    if (enemy_bq) {
+        checkers |= bishop_attacks(ksq, occ) & enemy_bq;
+    }
+    Bitboard enemy_rq = b->pieces[them][ROOK] | b->pieces[them][QUEEN];
+    if (enemy_rq) {
+        checkers |= rook_attacks(ksq, occ) & enemy_rq;
+    }
     return checkers;
 }
 

@@ -170,6 +170,14 @@ void board_print(const Board *b) {
 
 /* ──────────────────────────────────────────────
  *  Attack detection
+ *
+ *  OPT-SKIP-SLIDER: skip the expensive slider lookups when the attacker
+ *  has no sliders of the relevant type.  In endgames (K+P, K+minor+P)
+ *  this saves 2 slider lookups per is_square_attacked call — at 1.3M
+ *  calls per search, that's ~2.6M saved slider lookups.
+ *
+ *  In the middlegame the check is essentially free (one OR + non-zero
+ *  test) and the slider lookups proceed as before.
  * ────────────────────────────────────────────── */
 bool is_square_attacked(const Board *b, Square sq, Color attacker) {
     Bitboard occ = b->occ[2];
@@ -177,10 +185,13 @@ bool is_square_attacked(const Board *b, Square sq, Color attacker) {
     if (PAWN_ATTACKS[attacker ^ 1][sq] & b->pieces[attacker][PAWN])   return true;
     if (KNIGHT_ATTACKS[sq]             & b->pieces[attacker][KNIGHT])  return true;
     if (KING_ATTACKS[sq]               & b->pieces[attacker][KING])    return true;
-    if (bishop_attacks(sq, occ)        & (b->pieces[attacker][BISHOP]
-                                        | b->pieces[attacker][QUEEN])) return true;
-    if (rook_attacks(sq, occ)          & (b->pieces[attacker][ROOK]
-                                        | b->pieces[attacker][QUEEN])) return true;
+
+    /* Slider checks — gated on enemy material so we skip the slider
+     * lookup entirely when there's nothing to find. */
+    Bitboard diag_attackers = b->pieces[attacker][BISHOP] | b->pieces[attacker][QUEEN];
+    if (diag_attackers && (bishop_attacks(sq, occ) & diag_attackers)) return true;
+    Bitboard orth_attackers = b->pieces[attacker][ROOK]   | b->pieces[attacker][QUEEN];
+    if (orth_attackers && (rook_attacks(sq, occ)   & orth_attackers)) return true;
     return false;
 }
 
@@ -190,10 +201,11 @@ bool is_square_attacked_with_occ(const Board *b, Square sq, Color attacker,
     if (PAWN_ATTACKS[attacker ^ 1][sq] & b->pieces[attacker][PAWN])   return true;
     if (KNIGHT_ATTACKS[sq]             & b->pieces[attacker][KNIGHT])  return true;
     if (KING_ATTACKS[sq]               & b->pieces[attacker][KING])    return true;
-    if (bishop_attacks(sq, occ)        & (b->pieces[attacker][BISHOP]
-                                        | b->pieces[attacker][QUEEN])) return true;
-    if (rook_attacks(sq, occ)          & (b->pieces[attacker][ROOK]
-                                        | b->pieces[attacker][QUEEN])) return true;
+
+    Bitboard diag_attackers = b->pieces[attacker][BISHOP] | b->pieces[attacker][QUEEN];
+    if (diag_attackers && (bishop_attacks(sq, occ) & diag_attackers)) return true;
+    Bitboard orth_attackers = b->pieces[attacker][ROOK]   | b->pieces[attacker][QUEEN];
+    if (orth_attackers && (rook_attacks(sq, occ)   & orth_attackers)) return true;
     return false;
 }
 

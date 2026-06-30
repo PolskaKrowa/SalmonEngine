@@ -46,6 +46,10 @@ typedef struct {
     uint64_t black_to_move;
     uint64_t castle[16];      /* one key per rights combination */
     uint64_t ep[8];           /* one key per ep file */
+    uint64_t exclusion[64][64]; /* [from][to] — used for singular-extension
+                                   searches: hash ^ exclusion[f][t] makes the
+                                   child's TT slot distinct from the parent's
+                                   so the excluded move's bound is not found. */
 } ZobristKeys;
 
 extern ZobristKeys ZKEYS;

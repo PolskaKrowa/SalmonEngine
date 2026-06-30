@@ -13,7 +13,7 @@
 #                      implies --enable-tuner (shares object files)
 # -------------------------------------------------------------
 
-AC_INIT([salmon], [2.0], [], [salmon-engine])
+AC_INIT([salmon], [2.1], [], [salmon-engine])
 AC_CONFIG_MACRO_DIRS([m4])
 AC_CONFIG_SRCDIR([src/main.c])          # sanity-check: fails if this file is missing
 AC_CONFIG_HEADERS([include/config.h])   # generates a config.h with detected defines
@@ -24,15 +24,48 @@ AM_INIT_AUTOMAKE([foreign -Wall -Werror subdir-objects])
 
 AC_PROG_CC
 
-AX_CHECK_COMPILE_FLAG([-std=c2x],
-    [CFLAGS="$CFLAGS -std=c2x"],
-    [AC_MSG_ERROR([Your compiler does not support -std=c2x. GCC 9+ or Clang 9+ required.])])
+# Inline check for -std=c2x (replaces AX_CHECK_COMPILE_FLAG from autoconf-archive)
+AC_MSG_CHECKING([whether $CC accepts -std=c2x])
+save_CFLAGS="$CFLAGS"
+CFLAGS="$CFLAGS -std=c2x"
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM()],
+    [AC_MSG_RESULT([yes]); CFLAGS="$save_CFLAGS -std=c2x"],
+    [AC_MSG_RESULT([no])
+     CFLAGS="$save_CFLAGS"
+     AC_MSG_ERROR([Your compiler does not support -std=c2x. GCC 9+ or Clang 9+ required.])])
 
-AX_CHECK_COMPILE_FLAG([-march=native],
-    [MARCH_NATIVE="-march=native"],
-    [AC_MSG_WARN([-march=native not supported; CPU-specific optimisations disabled.])
+# Inline check for -march=native
+AC_MSG_CHECKING([whether $CC accepts -march=native])
+save_CFLAGS="$CFLAGS"
+CFLAGS="$CFLAGS -march=native"
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM()],
+    [AC_MSG_RESULT([yes]); MARCH_NATIVE="-march=native"],
+    [AC_MSG_RESULT([no])
+     AC_MSG_WARN([-march=native not supported; CPU-specific optimisations disabled.])
      MARCH_NATIVE=""])
+CFLAGS="$save_CFLAGS"
 AC_SUBST([MARCH_NATIVE])
+
+# Detect CPU SIMD support for NNUE optimisations
+AC_MSG_CHECKING([whether $CC accepts -mavx2])
+save_CFLAGS="$CFLAGS"
+CFLAGS="$CFLAGS -mavx2"
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM()],
+    [AC_MSG_RESULT([yes]); HAVE_AVX2=1],
+    [AC_MSG_RESULT([no]); HAVE_AVX2=0])
+CFLAGS="$save_CFLAGS"
+AC_DEFINE_UNQUOTED([HAVE_AVX2], [$HAVE_AVX2], [Define to 1 if AVX2 is available])
+AC_SUBST([HAVE_AVX2])
+
+AC_MSG_CHECKING([whether $CC accepts -mbmi2])
+save_CFLAGS="$CFLAGS"
+CFLAGS="$CFLAGS -mbmi2"
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM()],
+    [AC_MSG_RESULT([yes]); HAVE_BMI2=1],
+    [AC_MSG_RESULT([no]); HAVE_BMI2=0])
+CFLAGS="$save_CFLAGS"
+AC_DEFINE_UNQUOTED([HAVE_BMI2], [$HAVE_BMI2], [Define to 1 if BMI2 is available])
+AC_SUBST([HAVE_BMI2])
 
 # ── Required builtins ─────────────────────────────────────────────────────
 

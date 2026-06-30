@@ -25,6 +25,26 @@ AM_CFLAGS = \
     -Wall -Wextra -Wpedantic \
     -Wshadow -Wconversion -Wno-unused-parameter
 
+# ── Headers ───────────────────────────────────────────────────────────────
+# All headers in include/ are listed here so `make dist` includes them in
+# the distribution tarball. Without this, the tarball would contain only
+# the .c files and fail to compile for anyone who unpacks it.
+noinst_HEADERS = \
+    $(top_srcdir)/include/bitboard.h \
+    $(top_srcdir)/include/board.h \
+    $(top_srcdir)/include/book.h \
+    $(top_srcdir)/include/config.h \
+    $(top_srcdir)/include/dist_tune.h \
+    $(top_srcdir)/include/eval.h \
+    $(top_srcdir)/include/movegen.h \
+    $(top_srcdir)/include/nnue.h \
+    $(top_srcdir)/include/search.h \
+    $(top_srcdir)/include/tt.h \
+    $(top_srcdir)/include/tune.h \
+    $(top_srcdir)/include/tune_internal.h \
+    $(top_srcdir)/include/types.h \
+    $(top_srcdir)/include/uci.h
+
 # ── Shared engine sources ─────────────────────────────────────────────────
 #
 # Collected in a variable so each target below can reference it without

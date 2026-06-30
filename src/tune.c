@@ -29,7 +29,7 @@
 #include "board.h"
 #include "movegen.h"
 
-#include <cblas.h>
+#include <openblas/cblas.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>

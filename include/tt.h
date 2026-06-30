@@ -1,6 +1,7 @@
 #pragma once
 #include "types.h"
 #include <stddef.h>
+#include <stdint.h>
 
 /* ──────────────────────────────────────────────
  *  TT entry flags
@@ -40,6 +41,11 @@ bool tt_probe(uint64_t key, TTEntry *entry);
 
 /* Store an entry. */
 void tt_store(uint64_t key, int score, Move move, int depth, int flag, int ply);
+
+/* Prefetch the TT slot for `key` into the L1 cache before a recursive call.
+ * Hides the TT's memory latency — useful immediately before negamax() descends
+ * into a child node that will probe the same key. Implemented in tt.c. */
+void tt_prefetch(uint64_t key);
 
 /* Mate-distance adjustment helpers */
 static inline int score_to_tt (int score, int ply) {

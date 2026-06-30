@@ -68,18 +68,37 @@ bool tt_probe(uint64_t key, TTEntry *out) {
 }
 
 /* ──────────────────────────────────────────────
+ *  Prefetch — issue a non-temporal load hint for the TT slot.
+ *
+ *  Call this immediately before a recursive negamax() call so the L1 line is
+ *  warm by the time tt_probe() reads it. The hint is a no-op if TT is empty.
+ * ────────────────────────────────────────────── */
+void tt_prefetch(uint64_t key) {
+    if (!TT) return;
+    const TTEntry *e = &TT[key & TT_MASK];
+    __builtin_prefetch(e, 0, 1);  /* read, low temporal locality */
+}
+
+/* ──────────────────────────────────────────────
  *  Store (always-replace)
+ *
+ *  Bug fix: callers in search.c already call value_to_tt(score, ply) before
+ *  passing the score in. We must NOT call score_to_tt() again here — that
+ *  would double-adjust mate scores (off by ±ply on every store, compounding
+ *  across iterations and corrupting mate-distance reports to the GUI).
+ *  The ply parameter is kept for API stability but is no longer used.
  * ────────────────────────────────────────────── */
 void tt_store(uint64_t key, int score, Move move, int depth, int flag, int ply) {
+    (void)ply;  /* score is already mate-adjusted by callers */
     if (!TT) return;
     TTEntry *e = &TT[key & TT_MASK];
 
-    /* Preserve a good move from an earlier search if we have no move now */
+    /* Preserve a good move from an earlier search if we have no move now. */
     Move best_move = move;
     if (!best_move && e->key == key) best_move = e->move;
 
     e->key   = key;
-    e->score = (int32_t)score_to_tt(score, ply);
+    e->score = (int32_t)score;          /* already mate-adjusted by caller */
     e->move  = best_move;
     e->depth = (int8_t)depth;
     e->flag  = (uint8_t)flag;

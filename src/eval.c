@@ -47,9 +47,20 @@ int game_phase(const Board *b) {
  * Returns a score in centipawns from the perspective of the side to move
  * (positive = good for side to move).
  *
- * The NNUE forward pass already accounts for material, pawn structure,
- * mobility, king safety, and any other patterns captured during training.
+ * Uses the incremental NNUE accumulator stack maintained by make_move /
+ * unmake_move. This skips the ~60K-FADD feature-transformer refresh that
+ * the old nnue_eval() did on every call, leaving only the ~65K-FMA L1
+ * matmul (now SIMD-optimised) as the per-eval cost.
+ *
+ * Falls back to nnue_eval() (full refresh) if the incremental stack is
+ * not initialised — e.g. when evaluate() is called from outside search
+ * (tuner self-play goes through search, so this is rare).
  */
 int evaluate(const Board *b) {
-    return nnue_eval(g_nnue, b);
+    if (!g_nnue) return 0;
+    /* nnue_eval_positional returns 0 if the stack isn't allocated, in
+     * which case fall through to the full-refresh path. */
+    int v = nnue_eval_positional(b);
+    if (v == 0) v = nnue_eval(g_nnue, b);
+    return v;
 }

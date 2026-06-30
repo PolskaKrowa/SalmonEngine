@@ -8,6 +8,7 @@
 
 #include "board.h"
 #include "movegen.h"
+#include "nnue.h"
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
@@ -39,6 +40,12 @@ void board_init(void) {
 
     for (int i = 0; i < 8; i++)
         ZKEYS.ep[i] = xorshift64(&seed);
+
+    /* Exclusion keys — one per (from, to) move. Used by singular-extension
+     * searches to give the child a distinct TT key from the parent. */
+    for (int f = 0; f < 64; f++)
+        for (int t = 0; t < 64; t++)
+            ZKEYS.exclusion[f][t] = xorshift64(&seed);
 }
 
 /* ──────────────────────────────────────────────
@@ -289,6 +296,11 @@ void make_move(Board *b, Move m) {
     b->side  = them;
     b->ply++;
     if (us == BLACK) b->fullmove++;
+
+    /* NNUE incremental accumulator update — must be called AFTER b is
+     * fully updated (including b->ply increment) so the new accumulator
+     * lands at acc_stack[b->ply]. */
+    nnue_acc_make_move(b, m, us);
 }
 
 /* ──────────────────────────────────────────────
@@ -307,6 +319,10 @@ void unmake_move(Board *b) {
     b->hash      = u->hash;
     b->ply--;
     if (us == BLACK) b->fullmove--;
+
+    /* NNUE: the parent's accumulator is still on the stack — no work
+     * needed. Just notify the NNUE subsystem of the new ply. */
+    nnue_acc_unmake_move(b);
 
     Square from = MOVE_FROM(m);
     Square to   = MOVE_TO(m);
@@ -361,6 +377,9 @@ void make_null_move(Board *b) {
     b->side ^= 1;
     b->ply++;
     b->halfmove++;
+
+    /* NNUE: position unchanged, just push a copy of the current accumulator. */
+    nnue_acc_make_null_move(b);
 }
 
 void unmake_null_move(Board *b) {
@@ -371,6 +390,9 @@ void unmake_null_move(Board *b) {
     b->halfmove = u->halfmove;
     b->hash     = u->hash;
     b->ply--;
+
+    /* NNUE: parent accumulator still on the stack. */
+    nnue_acc_unmake_null_move(b);
 }
 
 /* ──────────────────────────────────────────────

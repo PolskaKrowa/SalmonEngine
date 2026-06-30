@@ -267,3 +267,41 @@ int nnue_eval_from_accum(const NNUENet *net, const NNUEAccum *acc, int stm);
  * Use for positions where no incremental accumulator is maintained.
  */
 int nnue_eval(const NNUENet *net, const Board *b);
+
+/* ── Incremental accumulator stack ──────────────────────────────────
+ *
+ * The search maintains a stack of NNUEAccum entries, one per ply, so that
+ * make_move can compute the child's accumulator from the parent's via a
+ * small delta (add/rem feature lists) instead of a full ~60K-FADD refresh.
+ * unmake_move is free — the parent's accumulator is still on the stack.
+ *
+ * King moves (including castling) invalidate the moving side's perspective
+ * and trigger a full refresh of that half only; the opponent's perspective
+ * is still incrementally updatable because the king's *own* square doesn't
+ * appear in the opponent's feature indices (it appears as an enemy piece,
+ * which is just a normal feature).
+ *
+ * Call sequence:
+ *   nnue_acc_init()                  — once at program startup
+ *   nnue_acc_reset(b)                — at the start of every search()
+ *   nnue_acc_make_move(b, m, mover)  — inside make_move, AFTER b is updated
+ *   nnue_acc_unmake_move(b)          — inside unmake_move (no-op besides accounting)
+ *   nnue_acc_make_null_move(b)       — inside make_null_move
+ *   nnue_acc_unmake_null_move(b)     — inside unmake_null_move
+ *   nnue_eval_positional(b)          — replaces nnue_eval() in the search path
+ */
+void nnue_acc_init(void);
+void nnue_acc_free(void);
+void nnue_acc_reset(const Board *b);
+void nnue_acc_deactivate(void);
+void nnue_acc_make_move(const Board *b, Move m, Color mover);
+void nnue_acc_unmake_move(const Board *b);
+void nnue_acc_make_null_move(const Board *b);
+void nnue_acc_unmake_null_move(const Board *b);
+
+/*
+ * Evaluate the current position using the incremental accumulator stack.
+ * Equivalent to nnue_eval() but skips the FT refresh (which is maintained
+ * incrementally by nnue_acc_make_move). Returns centipawns from STM's POV.
+ */
+int nnue_eval_positional(const Board *b);

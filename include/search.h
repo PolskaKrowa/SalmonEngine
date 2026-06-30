@@ -24,6 +24,7 @@ typedef struct {
     int  wtime, btime, winc, binc;
     int  movetime;
     int  depth;
+    int  threads;       /* number of helper threads (lazy-SMP); 0 = single-threaded */
     bool infinite;
     bool stop;
 } SearchLimits;
@@ -31,6 +32,11 @@ typedef struct {
 /* ── Per-search state ── */
 typedef struct {
     SearchLimits *limits;
+    /* Wall-clock start time (CLOCK_MONOTONIC). Using clock() would be wrong
+     * in multi-threaded mode because clock() sums CPU time across threads. */
+    struct timespec start_time_ts;
+    /* Backwards-compat: legacy clock() value, still used by perft/test paths
+     * that don't initialise start_time_ts. */
     clock_t       start_time;
     int           allotted_ms;
 
@@ -56,7 +62,14 @@ void search_init (void);
 void search      (Board *b, SearchLimits *lim);
 bool time_up     (SearchInfo *si);
 int  see         (const Board *b, Move m);
+
+/* negamax with optional `excluded` move — used for singular-extension
+ * verification. When excluded != NULL_MOVE, the TT probe uses an
+ * exclusion-keyed slot (b->hash ^ ZKEYS.exclusion[from][to]) so the
+ * bound stored for the parent's TT move doesn't short-circuit the
+ * singularity test. Callers passing excluded=NULL_MOVE get normal
+ * behaviour. */
 int  negamax     (Board *b, int depth, int alpha, int beta,
-                  int ply, SearchInfo *si);
+                  int ply, SearchInfo *si, Move excluded);
 int  quiesce     (Board *b, int alpha, int beta,
                   int ply, SearchInfo *si);

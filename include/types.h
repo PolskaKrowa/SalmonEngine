@@ -100,8 +100,13 @@ typedef enum {
 
 /* ──────────────────────────────────────────────
  *  Move list
+ *
+ *  The proven upper bound on legal moves in any chess position is 218
+ *  (verified by exhaustive analysis of constructed positions). 256 gives
+ *  a comfortable safety margin while halving stack usage vs the previous
+ *  512 (1 KB per MoveList + 1 KB per scores[] = 2 KB per search frame).
  * ────────────────────────────────────────────── */
-#define MAX_MOVES 512
+#define MAX_MOVES 256
 #define MAX_PLY   256
 
 typedef struct { Move moves[MAX_MOVES]; int count; } MoveList;

@@ -66,7 +66,7 @@
 #include "movegen.h"
 #include "uci.h"
 
-#include <cblas.h>
+#include <openblas/cblas.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>

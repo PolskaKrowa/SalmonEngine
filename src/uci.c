@@ -7,9 +7,16 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <strings.h>   /* strncasecmp */
+#include <pthread.h>
 
 /* Default TT size in MB */
 #define DEFAULT_HASH_MB 64
+/* Default thread count — 1 means single-threaded (no helper threads). */
+#define DEFAULT_THREADS 1
+
+/* Runtime-configurable options. */
+static int g_hash_mb   = DEFAULT_HASH_MB;
+static int g_threads   = DEFAULT_THREADS;
 
 /* ──────────────────────────────────────────────
  *  Move string helpers
@@ -86,6 +93,8 @@ static void handle_uci(void) {
     printf("id author %s\n",  ENGINE_AUTHOR);
     printf("option name Hash type spin default %d min 1 max 2048\n",
            DEFAULT_HASH_MB);
+    printf("option name Threads type spin default %d min 1 max 256\n",
+           DEFAULT_THREADS);
     printf("uciok\n");
     fflush(stdout);
 }
@@ -134,10 +143,47 @@ static void handle_position(Board *b, const char *line) {
 /* Parse a "go" command */
 static SearchLimits g_limits;  /* allocated once, avoids stack VLA */
 
+/* Worker thread state.
+ *
+ * The main UCI loop spawns a worker thread to run search(); while the
+ * worker is running, the main loop continues reading stdin so it can
+ * receive `stop` (or `quit`). `search_running` is set while the worker
+ * is active; the main loop joins it before processing any new command. */
+static pthread_t g_search_thread;
+static bool      g_search_running = false;
+static Board    *g_search_board   = NULL;
+
+static void *search_worker(void *arg) {
+    (void)arg;
+    search(g_search_board, &g_limits);
+    g_search_running = false;  /* signal completion to the main loop */
+    return NULL;
+}
+
+/* If a search is running, wait for it to finish. Called before processing
+ * any non-`stop` command (and before `quit`) so we don't race on the board
+ * state. */
+static void wait_for_search_done(void) {
+    if (g_search_running) {
+        /* Setting stop here is conservative — most callers already set it
+         * via the `stop` command, but if a `position`/`go` arrives mid-
+         * search we need to abort the in-flight search before touching
+         * the board. */
+        g_limits.stop = true;
+        pthread_join(g_search_thread, NULL);
+        g_search_running = false;
+    }
+}
+
 static void handle_go(Board *b, const char *line) {
+    /* If a search is somehow already running (shouldn't happen in a
+     * well-behaved GUI, but some test harnesses do this), abort it first. */
+    wait_for_search_done();
+
     memset(&g_limits, 0, sizeof(g_limits));
 
     g_limits.depth = 32; // default search limit to prevent overcomputation
+    g_limits.threads = g_threads;
 
     const char *p = line;
     while (*p) {
@@ -156,11 +202,30 @@ static void handle_go(Board *b, const char *line) {
         while (*p && *p != ' ') p++;
     }
 
-    search(b, &g_limits);
+    /* If infinite mode is requested, ignore the default depth=32 so the
+     * search truly runs until `stop` arrives. */
+    if (g_limits.infinite) g_limits.depth = 0;
+    /* If movetime is set, ignore depth so time is the only limit. */
+    if (g_limits.movetime > 0) g_limits.depth = 0;
+
+    /* Spawn the search in a worker thread so the main loop can keep
+     * reading stdin and process `stop` / `quit` while search runs.
+     * This fixes the long-standing UCI `stop` bug where the engine
+     * couldn't be interrupted mid-search — the main thread was blocked
+     * inside search() and couldn't process incoming commands. */
+    g_search_board = b;
+    g_search_running = true;
+    if (pthread_create(&g_search_thread, NULL, search_worker, NULL) != 0) {
+        /* Spawn failed — fall back to blocking search. */
+        g_search_running = false;
+        search(b, &g_limits);
+    }
+    /* NOTE: we do NOT join here. The main loop continues; it will join
+     * when stop arrives or before the next command. */
 }
 
 static void handle_setoption(const char *line) {
-    /* Only "Hash" is supported */
+    /* Supported options: Hash, Threads */
     const char *name = strstr(line, "name");
     const char *val  = strstr(line, "value");
     if (!name || !val) return;
@@ -170,7 +235,14 @@ static void handle_setoption(const char *line) {
     if (strncasecmp(name, "hash", 4) == 0) {
         int mb = atoi(val);
         if (mb < 1) mb = 1;
+        if (mb > 2048) mb = 2048;
+        g_hash_mb = mb;
         tt_init((size_t)mb);
+    } else if (strncasecmp(name, "threads", 7) == 0) {
+        int n = atoi(val);
+        if (n < 1) n = 1;
+        if (n > 256) n = 256;
+        g_threads = n;
     }
 }
 
@@ -186,6 +258,13 @@ static void handle_perft(Board *b, const char *line) {
 
 /* ──────────────────────────────────────────────
  *  Main UCI loop
+ *
+ *  While a search is running (in a worker thread), the main loop continues
+ *  to read stdin. Commands that would mutate the board (position, perft,
+ *  setoption, go, quit) first call wait_for_search_done() to abort and
+ *  join the worker. `stop` is handled immediately by setting the
+ *  SearchLimits.stop flag — the worker polls this flag every 2048 nodes
+ *  and will exit on the next check.
  * ────────────────────────────────────────────── */
 void uci_loop(Board *b) {
     tt_init(DEFAULT_HASH_MB);
@@ -204,25 +283,36 @@ void uci_loop(Board *b) {
             printf("readyok\n");
             fflush(stdout);
         } else if (strcmp(line, "ucinewgame") == 0) {
+            wait_for_search_done();
             tt_clear();
             board_start_pos(b);
         } else if (strncmp(line, "position", 8) == 0) {
+            wait_for_search_done();
             handle_position(b, line);
         } else if (strncmp(line, "go", 2) == 0) {
             handle_go(b, line);
         } else if (strcmp(line, "stop") == 0) {
+            /* Set the stop flag and wait for the search to finish. UCI
+             * semantics require that `bestmove` is printed before any
+             * subsequent command is processed, so we must join here. */
             g_limits.stop = true;
+            wait_for_search_done();
         } else if (strncmp(line, "setoption", 9) == 0) {
+            wait_for_search_done();
             handle_setoption(line);
         } else if (strncmp(line, "perft", 5) == 0) {
+            wait_for_search_done();
             handle_perft(b, line);
         } else if (strncmp(line, "d", 1) == 0) {
-            board_print(b); /* debug: print board */
+            wait_for_search_done();
+            board_print(b);
         } else if (strcmp(line, "quit") == 0) {
+            wait_for_search_done();
             tt_free();
             return;
         }
     }
 
+    wait_for_search_done();
     tt_free();
 }

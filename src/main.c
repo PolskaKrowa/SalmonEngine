@@ -33,11 +33,14 @@ int main(void) {
     }
 
     if (nnue_load(g_nnue, "nnue.bin") != 0) nnue_init_random(g_nnue);
+    nnue_acc_init();   /* allocate the incremental accumulator stack */
     search_init();
 
     /* Enter UCI command loop */
     Board b;
     uci_loop(&b);
 
+    nnue_acc_free();
+    nnue_free(g_nnue);
     return 0;
 }

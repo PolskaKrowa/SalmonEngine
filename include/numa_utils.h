@@ -3,6 +3,7 @@
  */
 #pragma once
 #include <stddef.h>
+#define _GNU_SOURCE
 #include <sched.h>
 
 /* Count the number of NUMA nodes.  Returns 1 if NUMA is not available. */

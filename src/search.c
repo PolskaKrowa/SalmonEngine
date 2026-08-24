@@ -250,15 +250,39 @@ static void init_mvv_lva(void) {
 
 static const int SEE_VAL[7] = { 100, 320, 330, 500, 900, 20000, 0 };
 
+/*
+ * attacks_to_sq — every slider-type enemy that attacks `sq`.
+ *
+ * gate the slider lookups on whether sliders exist on the
+ * board at all.  In endgames (K+P, K+minor+P, etc.) there are no
+ * rooks/bishops/queens to attack `sq`, so we can skip BOTH slider
+ * lookups.  The check is a single OR + non-zero test; the savings
+ * (2 slider lookups = ~10 cycles) matter because attacks_to_sq is
+ * called inside see()'s swap loop, where each iteration recomputes it.
+ *
+ * NOTE: the gating adds 2 branches.  On positions with sliders (most
+ * middlegames) the branches are perfectly predicted (always taken)
+ * and the cost is ~2 mispredict cycles amortized over millions of
+ * calls — a clear net win because the slider lookups we DO run are
+ * gated on having attackers, saving the & with an all-zero mask.
+ */
 static Bitboard attacks_to_sq(const Board *b, Square sq, Bitboard occ) {
-    return (PAWN_ATTACKS[WHITE][sq]  & b->pieces[BLACK][PAWN])
-         | (PAWN_ATTACKS[BLACK][sq]  & b->pieces[WHITE][PAWN])
-         | (KNIGHT_ATTACKS[sq]       & (b->pieces[WHITE][KNIGHT] | b->pieces[BLACK][KNIGHT]))
-         | (bishop_attacks(sq, occ)  & (b->pieces[WHITE][BISHOP] | b->pieces[BLACK][BISHOP]
-                                       | b->pieces[WHITE][QUEEN]  | b->pieces[BLACK][QUEEN]))
-         | (rook_attacks(sq, occ)    & (b->pieces[WHITE][ROOK]   | b->pieces[BLACK][ROOK]
-                                       | b->pieces[WHITE][QUEEN]  | b->pieces[BLACK][QUEEN]))
-         | (KING_ATTACKS[sq]         & (b->pieces[WHITE][KING]   | b->pieces[BLACK][KING]));
+    Bitboard atk = (PAWN_ATTACKS[WHITE][sq]  & b->pieces[BLACK][PAWN])
+                 | (PAWN_ATTACKS[BLACK][sq]  & b->pieces[WHITE][PAWN])
+                 | (KNIGHT_ATTACKS[sq]       & (b->pieces[WHITE][KNIGHT] | b->pieces[BLACK][KNIGHT]))
+                 | (KING_ATTACKS[sq]         & (b->pieces[WHITE][KING]   | b->pieces[BLACK][KING]));
+
+    Bitboard diag_attackers = b->pieces[WHITE][BISHOP] | b->pieces[BLACK][BISHOP]
+                            | b->pieces[WHITE][QUEEN]  | b->pieces[BLACK][QUEEN];
+    if (__builtin_expect(diag_attackers, 1))
+        atk |= bishop_attacks(sq, occ) & diag_attackers;
+
+    Bitboard orth_attackers = b->pieces[WHITE][ROOK]   | b->pieces[BLACK][ROOK]
+                            | b->pieces[WHITE][QUEEN]  | b->pieces[BLACK][QUEEN];
+    if (__builtin_expect(orth_attackers, 1))
+        atk |= rook_attacks(sq, occ) & orth_attackers;
+
+    return atk;
 }
 
 /* OPT-G: mark see() as hot — it's called from score_move on every
@@ -1225,25 +1249,33 @@ int negamax(Board *b, int depth, int alpha, int beta, int ply, SearchInfo *si,
 
         /* ── Make the move ──
          *
-         * OPT-F: compute gives_check BEFORE make_move, using the
+         * We compute gives_check BEFORE make_move, using the
          * pre-move board state (move_gives_check).  This replaces
          * the post-make in_check(b) call, which re-derives the king
          * square and runs 5+ slider attack lookups.  move_gives_check
          * does the equivalent work using the move encoding and a
          * couple of bitboard ANDs.
          *
-         * OPT-PF: speculatively prefetch the TT bucket for the child
+         * We speculatively prefetch the TT bucket for the child
          * position (after this move) BEFORE make_move.  The bucket
          * address is computed incrementally via board_key_after()
          * (cheap — a handful of XORs).  The prefetch is non-blocking;
          * the line is on its way to L1 while make_move + the recursive
          * call setup runs.  When the child's tt_probe runs, the line
          * is likely already in cache — hiding ~100 cycles of L2/L3
-         * latency per node. */
+         * latency per node.
+         *
+         * We issue the prefetch BEFORE move_gives_check, not
+         * after.  board_key_after() depends only on the move encoding
+         * and current board state, both available before the check
+         * test.  Issuing the prefetch one slider-lookup earlier gives
+         * the cache-fill ~30-50 cycles more headroom — meaningful on
+         * positions where move_gives_check's discovered-check shortcut
+         * falls through to a slider lookup. */
         si->move_stack[ply] = m;
         si->piece_stack[ply] = cur_pt;  /* save piece type for cont/counter hist */
+        tt_prefetch(board_key_after(b, m));   /* speculative, early */
         bool gives_check = move_gives_check(b, m);
-        tt_prefetch(board_key_after(b, m));   /* OPT-PF: speculative */
         make_move(b, m);
 
         int score;

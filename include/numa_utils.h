@@ -4,6 +4,11 @@
 #pragma once
 #include <stddef.h>
 #define _GNU_SOURCE
+
+#ifndef __GLIBC__
+typedef struct { unsigned long bits[16]; } cpu_set_t;
+#endif
+
 #include <sched.h>
 
 /* Count the number of NUMA nodes.  Returns 1 if NUMA is not available. */

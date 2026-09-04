@@ -222,7 +222,8 @@ jobs:
             --name-a   "branch" \
             --name-b   "main" \
             --time-control "inf" \
-            --rounds   30 \
+            --rounds    1 \
+            --games     30 \
             --history  "elo_history/${{ github.ref_name }}.jsonl" \
             --branch   "${{ github.ref_name }}" \
             --commit-sha    "${{ github.sha }}" \

@@ -79,8 +79,8 @@ def run_cutechess(engine_a: str, engine_b: str,
     cmd = [
         "cutechess-cli",
         "-concurrency", str(os.cpu_count() or 2),
-        "-rounds",      str(rounds),
-        "-games",       "2",                 # each opening, both colours
+        "-games",       str(rounds),
+        "-rounds",      "1",
         "-variant",     "standard",
         "-engine",      f"name={name_a}", f"cmd={engine_a}", "depth=15",
         "-engine",      f"name={name_b}", f"cmd={engine_b}", "depth=15",

@@ -182,7 +182,7 @@ jobs:
             --name-b   "main" \
             --time-control "10+0.1" \
             --rounds   1 \
-            --games    50
+            --games    50 \
             --history  "elo_history/${{ github.ref_name }}.jsonl" \
             --branch   "${{ github.ref_name }}" \
             --commit-sha    "${{ github.sha }}" \

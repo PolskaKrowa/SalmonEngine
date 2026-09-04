@@ -1,7 +1,7 @@
 AM_CFLAGS = -I$(top_srcdir)/include -Wall -Wextra -Wpedantic \
             -Wshadow -Wconversion -Wno-unused-parameter
 
-# ── Main engine binary ──────────────────────────────────────
+# ── Main engine binary ─────────────────────────────────────
 bin_PROGRAMS = engine
 
 engine_SOURCES = \
